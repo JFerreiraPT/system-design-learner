@@ -5,7 +5,7 @@ import {
   NotFoundException
 } from "@nestjs/common";
 import type { Difficulty } from "@sdl/shared";
-import { eq, isNull, or, sql } from "drizzle-orm";
+import { desc, eq, isNull, or, sql } from "drizzle-orm";
 import { AiService } from "../ai/ai.service.js";
 import { DB } from "../db/db.module.js";
 import { problems, solutions } from "../db/schema.js";
@@ -32,7 +32,33 @@ export class ProblemsService {
       }
     }
 
-    const generated = await this.aiService.generateProblem(input);
+    const existingRows = await this.db
+      .select({
+        title: problems.title,
+        tags: problems.tagsJson,
+        statement: problems.statement
+      })
+      .from(problems)
+      .where(eq(problems.difficulty, input.difficulty))
+      .orderBy(desc(problems.createdAt))
+      .limit(30);
+
+    const existingForPrompt = existingRows.map(
+      (r: { title: string; tags: unknown; statement: string }) => {
+        const tags = Array.isArray(r.tags) ? r.tags : [];
+        const firstSentence = (r.statement.split(/[.!?]/)[0] ?? "").trim();
+        return {
+          title: r.title,
+          tags,
+          gist: firstSentence.slice(0, 140)
+        };
+      }
+    );
+
+    const generated = await this.aiService.generateProblem({
+      ...input,
+      existingProblems: existingForPrompt
+    });
     const inserted = await this.db
       .insert(problems)
       .values({

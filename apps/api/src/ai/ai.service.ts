@@ -224,12 +224,15 @@ export class AiService {
     });
   }
 
-  async generateProblem(input: { difficulty: Difficulty; topic?: string }) {
+  async generateProblem(input: {
+    difficulty: Difficulty;
+    topic?: string;
+    existingProblems?: Array<{ title: string; tags: string[]; gist: string }>;
+  }) {
     const result = await generateObject({
       model: this.openai("gpt-4o-mini"),
       schema: GeneratedProblemSchema,
-      prompt: buildProblemPrompt(input.difficulty, input.topic),
-      ...GRADING_OBJECT_SETTINGS
+      prompt: buildProblemPrompt(input.difficulty, input.topic, input.existingProblems)
     });
 
     return result.object;
@@ -286,12 +289,17 @@ export class AiService {
     title: string;
     statement: string;
     seedConstraints: string[];
+    existingCriteria?: Array<{
+      id: string;
+      text: string;
+      visibility: "visible" | "hidden";
+      importance: "core" | "expected" | "stretch";
+    }>;
   }): Promise<RubricCriterion[]> {
     const result = await generateObject({
       model: this.openai("gpt-4o-mini"),
       schema: GeneratedCriteriaSchema,
-      prompt: buildCriteriaPrompt(input),
-      ...GRADING_OBJECT_SETTINGS
+      prompt: buildCriteriaPrompt(input)
     });
     return result.object.criteria;
   }

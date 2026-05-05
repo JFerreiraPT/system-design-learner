@@ -29,7 +29,11 @@ messaging, storage, consistency, replication, sharding, observability, security,
 cost-optimization, mobile, api-design, data-pipeline, batch, leader-election, cdn,
 event-sourcing, multi-tenant, compliance`;
 
-export const buildProblemPrompt = (difficulty: Difficulty, topic?: string) => {
+export const buildProblemPrompt = (
+  difficulty: Difficulty,
+  topic?: string,
+  existingProblems?: Array<{ title: string; tags: string[]; gist: string }>
+) => {
   const phaseBudgetNote =
     difficulty === "beginner"
       ? "Typical TOTAL interview stays light — sum durationSec roughly 540-1260 seconds (~9-21 minutes) across three forgiving phases."
@@ -57,11 +61,25 @@ export const buildProblemPrompt = (difficulty: Difficulty, topic?: string) => {
       "Topic hint: pick a wholesome tiny system aligned with the beginner guidance above."
     : "Topic hint: pick any realistic, modern system that fits the chosen difficulty. Vary it from common defaults (avoid URL shorteners and pastebins unless explicitly relevant).";
 
+  const existingBlock =
+    existingProblems && existingProblems.length > 0
+      ? [
+          "",
+          `Avoid near-duplicates of these existing problems already generated at difficulty="${difficulty}" (adjacent topics or small twists are OK; do NOT repeat the same title, tag combo, or gist-level scope):`,
+          ...existingProblems.map(
+            (p) =>
+              `- "${p.title}" :: tags=[${p.tags.join(", ")}] :: ${p.gist || "(no gist)"}`
+          ),
+          ""
+        ].join("\n")
+      : "";
+
   return `
 Generate one system design interview problem.
 Difficulty: ${difficulty}
 ${difficultyContextBlock(difficulty)}
 ${topicLine}
+${existingBlock}
 ${TAG_VOCABULARY_SNIPPET}
 
 Return:
@@ -88,24 +106,33 @@ ${derivedHintsLine}
 
 const CRITERIA_BUDGET_BY_DIFFICULTY: Record<
   Difficulty,
-  { total: [number, number]; coreMax: number; hiddenCoreMax: number; stretchMax: number }
+  {
+    total: [number, number];
+    coreMax: number;
+    hiddenMin: number;
+    hiddenCoreMax: number;
+    stretchMax: number;
+  }
 > = {
-  beginner: { total: [4, 6], coreMax: 2, hiddenCoreMax: 1, stretchMax: 1 },
-  easy: { total: [5, 8], coreMax: 3, hiddenCoreMax: 2, stretchMax: 1 },
-  medium: { total: [6, 10], coreMax: 4, hiddenCoreMax: 3, stretchMax: 2 },
-  hard: { total: [7, 12], coreMax: 5, hiddenCoreMax: 4, stretchMax: 2 },
-  expert: { total: [8, 14], coreMax: 6, hiddenCoreMax: 5, stretchMax: 3 }
+  beginner: { total: [4, 6], coreMax: 2, hiddenMin: 1, hiddenCoreMax: 1, stretchMax: 1 },
+  easy: { total: [5, 8], coreMax: 3, hiddenMin: 2, hiddenCoreMax: 2, stretchMax: 1 },
+  medium: { total: [6, 10], coreMax: 4, hiddenMin: 3, hiddenCoreMax: 3, stretchMax: 2 },
+  hard: { total: [7, 12], coreMax: 5, hiddenMin: 4, hiddenCoreMax: 4, stretchMax: 2 },
+  expert: { total: [8, 14], coreMax: 6, hiddenMin: 5, hiddenCoreMax: 5, stretchMax: 3 }
 };
 
+/** Per-level guidance MUST set firm minimums (no "0-1" wording). The
+ * candidate-facing UX depends on at least some hidden objectives existing
+ * for them to discover; an empty hidden set defeats the discovery loop. */
 const LEVEL_HIDDEN_GUIDANCE: Record<InterviewerLevel, string> = {
   guided:
-    "Guided level: keep the rubric short and forgiving. Bias toward `visibility: visible` so the candidate sees most expectations on the Problem rail; only 0-1 `hidden` criteria, none of them `core`.",
+    "Guided level: forgiving rubric. Bias toward `visibility: visible` for most criteria, but you MUST include at least the difficulty's hiddenMin floor of `hidden` criteria so the discovery loop has something to surface. Hidden cores are allowed at this level (up to hiddenCoreMax) when the difficulty supports it.",
   standard:
-    "Standard level: a balanced split between visible and hidden expectations. About a third of criteria can be hidden; at most one of those may be `core`.",
+    "Standard level: a balanced split. About a third of criteria are hidden (never below the difficulty's hiddenMin floor). At most one of those may be `core`.",
   hard:
-    "Hard level: most non-trivial expectations are hidden. The candidate is expected to discover them by asking. About half of `core` items should be hidden.",
+    "Hard level: most non-trivial expectations are hidden. About half of `core` items should be hidden, and total hiddens stay above the difficulty's hiddenMin floor.",
   staff:
-    "Staff level: aggressive hiding. Treat seed constraints as a thin starting point — the bulk of `core` criteria should be hidden, including failure-mode and operational concerns. The candidate is expected to drive the entire scope conversation."
+    "Staff level: aggressive hiding. Treat seed constraints as a thin starting point — the bulk of `core` criteria should be hidden, including failure-mode and operational concerns. Hidden count must stay above the difficulty's hiddenMin floor."
 };
 
 /** Generates a tight, structured rubric for a single interview session.
@@ -127,6 +154,12 @@ export function buildCriteriaPrompt(input: {
   title: string;
   statement: string;
   seedConstraints: string[];
+  existingCriteria?: Array<{
+    id: string;
+    text: string;
+    visibility?: "visible" | "hidden";
+    importance?: "core" | "expected" | "stretch";
+  }>;
 }): string {
   const budget = CRITERIA_BUDGET_BY_DIFFICULTY[input.difficulty];
   const hiddenGuidance = LEVEL_HIDDEN_GUIDANCE[input.interviewerLevel];
@@ -134,6 +167,21 @@ export function buildCriteriaPrompt(input: {
     input.seedConstraints.length > 0
       ? input.seedConstraints.map((c) => `- ${c}`).join("\n")
       : "(none)";
+  const existingCriteriaBlock =
+    input.existingCriteria && input.existingCriteria.length > 0
+      ? [
+          "",
+          "Criteria already used in past sessions on this exact problem (prefer fresh angles; similar emphasis on a different facet is OK — avoid copying the same wording or id themes). The (visibility, importance) tag tells you what category each was; bias your divergence ESPECIALLY on hidden ones, since repeating a hidden objective the candidate has already had a chance to discover is the worst kind of duplicate:",
+          ...input.existingCriteria.map((c) => {
+            const tag =
+              c.visibility || c.importance
+                ? ` [${c.visibility ?? "?"}, ${c.importance ?? "?"}]`
+                : "";
+            return `- ${c.id}${tag} :: ${c.text}`;
+          }),
+          ""
+        ].join("\n")
+      : "";
   return [
     "You design grading rubrics for system-design mock interviews.",
     "Produce a structured rubric of evaluation criteria for THIS interview.",
@@ -146,9 +194,11 @@ export function buildCriteriaPrompt(input: {
     "",
     "Seed constraints already shown to the candidate on the Problem rail:",
     seedBlock,
+    existingCriteriaBlock,
     "",
     "Rubric shape:",
     `- Total criteria: ${budget.total[0]}-${budget.total[1]}.`,
+    `- At LEAST ${budget.hiddenMin} criteria MUST have visibility="hidden" (this is the discovery floor — without it the candidate has nothing to surface).`,
     `- At most ${budget.coreMax} of them may be importance="core". Of those cores, at most ${budget.hiddenCoreMax} may be visibility="hidden".`,
     `- At most ${budget.stretchMax} criteria may be importance="stretch" (bonus only).`,
     "- The remaining criteria should be importance=\"expected\" (should appear at this difficulty).",
@@ -159,7 +209,8 @@ export function buildCriteriaPrompt(input: {
     "- A `visible` criterion should overlap a seed constraint above (e.g. seed says 'support up to 100 users' → visible criterion in `requirements` for that user scope). The candidate already sees the bullet so they don't need to ASK about it; we still grade whether their design addresses it.",
     "- A `hidden` criterion is a latent expectation not on the Problem rail. The candidate must DISCOVER it by asking the interviewer about it, by committing to it on the board, or by explicitly stating an assumption. If they never surface it, they take a discovery penalty AND an addressed/covered penalty if the design also misses it.",
     "",
-    "Quality bars (REJECT yourself if any of these are violated):",
+    "Quality bars (REJECT yourself and start over if any of these are violated):",
+    `- The rubric MUST contain at least ${budget.hiddenMin} criteria with visibility="hidden". Zero hidden criteria is NEVER acceptable.`,
     "- Each criterion `text` is one specific, verifiable expectation (\"Per-user task isolation in the data model\", NOT \"good data model\").",
     "- Hidden criteria must be discoverable through reasonable clarifying questions a candidate at this difficulty could plausibly think to ask. Do not hide things that require knowing the answer in advance.",
     "- Match the difficulty's surface area. Do NOT introduce multi-region, sharding, or compliance criteria for beginner/easy unless the statement explicitly invites them.",

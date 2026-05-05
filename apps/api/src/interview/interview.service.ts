@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { ForbiddenException, Inject, Injectable, NotFoundException } from "@nestjs/common";
-import { asc, eq, isNull } from "drizzle-orm";
+import { and, asc, desc, eq, isNotNull, isNull } from "drizzle-orm";
 import { buildInterviewerWelcome } from "@sdl/ai-prompts";
 import {
   DEFAULT_INTERVIEW_PLAN,
@@ -78,6 +78,7 @@ export class InterviewService {
     // extra latency; if the LLM call fails we degrade gracefully and keep
     // criteria=null (legacy interviews already work that way).
     const criteria = await this.generateCriteriaSafely({
+      problemId: input.problemId,
       problemTitle: problem.title,
       problemStatement: problem.statement,
       difficulty: problem.difficulty as Difficulty,
@@ -115,6 +116,7 @@ export class InterviewService {
    * `/interviews POST`. Returns `null` on failure — the validator and
    * interviewer prompt both already tolerate null criteria. */
   private async generateCriteriaSafely(input: {
+    problemId: string;
     problemTitle: string;
     problemStatement: string;
     difficulty: Difficulty;
@@ -122,12 +124,14 @@ export class InterviewService {
     seedConstraints: string[];
   }): Promise<RubricCriterion[] | null> {
     try {
+      const existingCriteria = await this.collectExistingCriteriaForProblem(input.problemId);
       const generated = await this.aiService.generateCriteria({
         title: input.problemTitle,
         statement: input.problemStatement,
         difficulty: input.difficulty,
         interviewerLevel: input.interviewerLevel,
-        seedConstraints: input.seedConstraints
+        seedConstraints: input.seedConstraints,
+        existingCriteria: existingCriteria.length > 0 ? existingCriteria : undefined
       });
       // Pre-mark `visible` criteria as discovered (origin=seed) so the rail's
       // discovery indicator doesn't claim the candidate needs to "find"
@@ -141,6 +145,50 @@ export class InterviewService {
     } catch {
       return null;
     }
+  }
+
+  /** Flatten criteria from prior interviews on the same problem (dedupe by id, cap 50).
+   *
+   * Hidden criteria are emitted FIRST so the prompt's most important dedup
+   * signal (don't repeat hidden objectives the candidate has already had a
+   * chance to discover) is never truncated by the cap. */
+  private async collectExistingCriteriaForProblem(
+    problemId: string
+  ): Promise<
+    Array<{
+      id: string;
+      text: string;
+      visibility: "visible" | "hidden";
+      importance: "core" | "expected" | "stretch";
+    }>
+  > {
+    const rows = await this.db
+      .select({ criteriaJson: interviews.criteriaJson })
+      .from(interviews)
+      .where(and(eq(interviews.problemId, problemId), isNotNull(interviews.criteriaJson)))
+      .orderBy(desc(interviews.startedAt));
+
+    const byId = new Map<
+      string,
+      { text: string; visibility: "visible" | "hidden"; importance: "core" | "expected" | "stretch" }
+    >();
+    for (const row of rows) {
+      const list = row.criteriaJson as RubricCriterion[] | null;
+      if (!Array.isArray(list)) continue;
+      for (const c of list) {
+        if (c?.id && c?.text && !byId.has(c.id)) {
+          byId.set(c.id, {
+            text: c.text,
+            visibility: c.visibility,
+            importance: c.importance
+          });
+        }
+      }
+    }
+    const all = [...byId.entries()].map(([id, v]) => ({ id, ...v }));
+    const hidden = all.filter((c) => c.visibility === "hidden");
+    const visible = all.filter((c) => c.visibility === "visible");
+    return [...hidden, ...visible].slice(0, 50);
   }
 
   async updateLevel(interviewId: string, interviewerLevel: InterviewerLevel) {
@@ -441,6 +489,7 @@ export class InterviewService {
         continue;
       }
       const criteria = await this.generateCriteriaSafely({
+        problemId: row.problemId,
         problemTitle: problem.title,
         problemStatement: problem.statement,
         difficulty: problem.difficulty as Difficulty,
@@ -475,6 +524,7 @@ export class InterviewService {
     if (!problem) throw new NotFoundException("Problem not found");
 
     const criteria = await this.generateCriteriaSafely({
+      problemId: session.problemId,
       problemTitle: problem.title,
       problemStatement: problem.statement,
       difficulty: problem.difficulty as Difficulty,
