@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { ForbiddenException, Inject, Injectable, NotFoundException } from "@nestjs/common";
 import { and, asc, desc, eq, isNotNull, isNull } from "drizzle-orm";
-import { buildInterviewerWelcome } from "@sdl/ai-prompts";
+import { buildInterviewerWelcome, getCriteriaHiddenMin } from "@sdl/ai-prompts";
 import {
   DEFAULT_INTERVIEW_PLAN,
   InterviewPlanSchema,
@@ -125,14 +125,29 @@ export class InterviewService {
   }): Promise<RubricCriterion[] | null> {
     try {
       const existingCriteria = await this.collectExistingCriteriaForProblem(input.problemId);
-      const generated = await this.aiService.generateCriteria({
+      const baseInput = {
         title: input.problemTitle,
         statement: input.problemStatement,
         difficulty: input.difficulty,
         interviewerLevel: input.interviewerLevel,
         seedConstraints: input.seedConstraints,
         existingCriteria: existingCriteria.length > 0 ? existingCriteria : undefined
-      });
+      };
+
+      const hiddenMin = getCriteriaHiddenMin(input.difficulty);
+      let generated = await this.aiService.generateCriteria(baseInput);
+
+      // Safety net: if the model under-delivered on the discovery floor,
+      // retry exactly once with an explicit correction. Without this, prompt
+      // wording alone is sometimes ignored under structured-output schemas.
+      const hiddenCount = generated.filter((c) => c.visibility === "hidden").length;
+      if (hiddenCount < hiddenMin) {
+        generated = await this.aiService.generateCriteria({
+          ...baseInput,
+          regenerationReason: `Your previous attempt produced only ${hiddenCount} criteria with visibility="hidden", but this difficulty requires AT LEAST ${hiddenMin}. Generate a fresh rubric and ensure visibility="hidden" appears on at least ${hiddenMin} criteria.`
+        });
+      }
+
       // Pre-mark `visible` criteria as discovered (origin=seed) so the rail's
       // discovery indicator doesn't claim the candidate needs to "find"
       // things they can already read on the Problem rail.
@@ -142,7 +157,17 @@ export class InterviewService {
           ? { ...c, discoveredVia: { kind: "seed" as const, at: now } }
           : c
       );
-    } catch {
+    } catch (err) {
+      const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      console.error("[generateCriteriaSafely] LLM failure:", msg);
+      const anyErr = err as { cause?: unknown; text?: unknown };
+      if (anyErr?.cause) console.error("[generateCriteriaSafely] cause:", anyErr.cause);
+      if (typeof anyErr?.text === "string") {
+        console.error(
+          "[generateCriteriaSafely] raw text (first 4kb):",
+          anyErr.text.slice(0, 4000)
+        );
+      }
       return null;
     }
   }

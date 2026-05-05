@@ -104,6 +104,10 @@ ${derivedHintsLine}
 `;
 };
 
+export function getCriteriaHiddenMin(difficulty: Difficulty): number {
+  return CRITERIA_BUDGET_BY_DIFFICULTY[difficulty].hiddenMin;
+}
+
 const CRITERIA_BUDGET_BY_DIFFICULTY: Record<
   Difficulty,
   {
@@ -160,8 +164,17 @@ export function buildCriteriaPrompt(input: {
     visibility?: "visible" | "hidden";
     importance?: "core" | "expected" | "stretch";
   }>;
+  regenerationReason?: string;
 }): string {
   const budget = CRITERIA_BUDGET_BY_DIFFICULTY[input.difficulty];
+  const regenerationBlock = input.regenerationReason
+    ? [
+        "REGENERATION REQUIRED — your previous attempt was rejected:",
+        input.regenerationReason,
+        "Fix the issue and emit a fresh, fully-compliant rubric.",
+        ""
+      ].join("\n")
+    : "";
   const hiddenGuidance = LEVEL_HIDDEN_GUIDANCE[input.interviewerLevel];
   const seedBlock =
     input.seedConstraints.length > 0
@@ -183,6 +196,7 @@ export function buildCriteriaPrompt(input: {
         ].join("\n")
       : "";
   return [
+    regenerationBlock,
     "You design grading rubrics for system-design mock interviews.",
     "Produce a structured rubric of evaluation criteria for THIS interview.",
     "",
@@ -203,6 +217,16 @@ export function buildCriteriaPrompt(input: {
     `- At most ${budget.stretchMax} criteria may be importance="stretch" (bonus only).`,
     "- The remaining criteria should be importance=\"expected\" (should appear at this difficulty).",
     "- Every criterion targets exactly ONE dimension from: requirements, scalability, reliability, consistency, latencyPerformance, cost, security, operability.",
+    "",
+    "AXIS DISTINCTION (do NOT confuse these — they are independent fields):",
+    "- `importance` is HOW MUCH IT MATTERS. Allowed values: \"core\", \"expected\", \"stretch\". NEVER \"hidden\", NEVER \"critical\", NEVER \"required\", NEVER \"bonus\".",
+    "- `visibility` is WHETHER THE CANDIDATE SEES IT UPFRONT. Allowed values: \"visible\", \"hidden\". NEVER \"core\", NEVER \"expected\".",
+    "- These ARE NOT exclusive. A criterion has BOTH an importance AND a visibility. Examples of valid combinations:",
+    "    importance=\"core\",     visibility=\"visible\"  → required and shown on the Problem rail",
+    "    importance=\"core\",     visibility=\"hidden\"   → required and the candidate must DISCOVER it",
+    "    importance=\"expected\", visibility=\"hidden\"   → moderate, must be discovered",
+    "    importance=\"stretch\",  visibility=\"visible\"  → nice-to-have, shown",
+    "  Mixing them up (e.g. importance=\"hidden\") will fail validation and the rubric will be rejected.",
     "",
     "Visibility split:",
     `- ${hiddenGuidance}`,

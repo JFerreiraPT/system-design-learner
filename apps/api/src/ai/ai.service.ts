@@ -184,9 +184,140 @@ const ValidationSchema = z.object({
 /** Stable structured-output settings for grading-related LLM calls. */
 const GRADING_OBJECT_SETTINGS = { temperature: 0, seed: 42 } as const;
 
-const GeneratedCriteriaSchema = z.object({
-  criteria: z.array(RubricCriterionSchema).min(3).max(20)
+/** Lenient model-side schema. The strict `RubricCriterionSchema` is enforced
+ * AFTER a server-side repair pass — gpt-4o-mini regularly emits one of:
+ * - importance="hidden" / "critical" (conflating the two axes),
+ * - dimension="performance" instead of "latencyPerformance",
+ * - id with hyphens / capitals,
+ * - hint strings over the 200-char cap.
+ * Any of those would normally drop the whole rubric (criteria=null), so we
+ * accept ANY string for the open-text fields and repair them in code. */
+const LooseRubricCriterionSchema = z.object({
+  id: z.string().min(1).max(200),
+  text: z.string().min(2).max(1500),
+  dimension: z.string().min(1).max(60),
+  importance: z.string().min(1).max(60),
+  visibility: z.string().min(1).max(60),
+  discoveryHints: z.array(z.string()).max(12).optional(),
+  satisfiedBy: z.array(z.string()).max(12).optional(),
+  scaleNote: z.string().max(1000).optional()
 });
+
+const GeneratedCriteriaSchema = z.object({
+  criteria: z.array(LooseRubricCriterionSchema).min(3).max(20)
+});
+
+const SCORE_DIMENSIONS = [
+  "requirements",
+  "scalability",
+  "reliability",
+  "consistency",
+  "latencyPerformance",
+  "cost",
+  "security",
+  "operability"
+] as const;
+type ScoreDim = (typeof SCORE_DIMENSIONS)[number];
+
+const DIMENSION_ALIASES: Record<string, ScoreDim> = {
+  requirements: "requirements",
+  functional: "requirements",
+  feature: "requirements",
+  features: "requirements",
+  scalability: "scalability",
+  scale: "scalability",
+  capacity: "scalability",
+  throughput: "scalability",
+  reliability: "reliability",
+  availability: "reliability",
+  durability: "reliability",
+  consistency: "consistency",
+  correctness: "consistency",
+  isolation: "consistency",
+  latencyperformance: "latencyPerformance",
+  latency: "latencyPerformance",
+  performance: "latencyPerformance",
+  speed: "latencyPerformance",
+  cost: "cost",
+  efficiency: "cost",
+  security: "security",
+  privacy: "security",
+  authn: "security",
+  authz: "security",
+  operability: "operability",
+  observability: "operability",
+  monitoring: "operability",
+  ops: "operability",
+  operations: "operability",
+  maintainability: "operability"
+};
+
+/** Coerce a possibly-loose LLM criterion into the strict schema. Any
+ * unrecoverable shape returns `null` and the caller drops the entry. */
+function repairCriterion(
+  raw: z.infer<typeof LooseRubricCriterionSchema>,
+  index: number,
+  used: Set<string>
+): RubricCriterion | null {
+  const importance: "core" | "expected" | "stretch" = (() => {
+    const v = raw.importance.trim().toLowerCase();
+    if (v === "core" || v === "expected" || v === "stretch") return v;
+    if (v === "critical" || v === "required" || v === "must") return "core";
+    if (v === "bonus" || v === "optional" || v === "nice-to-have") return "stretch";
+    return "expected";
+  })();
+
+  const visibility: "visible" | "hidden" = (() => {
+    const v = raw.visibility.trim().toLowerCase();
+    if (v === "visible" || v === "hidden") return v;
+    if (v === "shown" || v === "explicit" || v === "seed") return "visible";
+    if (v === "latent" || v === "implicit" || v === "discovery") return "hidden";
+    return "visible";
+  })();
+
+  const dimensionKey = raw.dimension.trim().toLowerCase().replace(/[\s_-]+/g, "");
+  const dimensionMatch = DIMENSION_ALIASES[dimensionKey];
+  const dimension: ScoreDim = dimensionMatch
+    ? dimensionMatch
+    : (SCORE_DIMENSIONS as readonly string[]).includes(dimensionKey)
+      ? (dimensionKey as ScoreDim)
+      : "requirements";
+
+  const baseSlug = raw.id
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .replace(/^[^a-z]/, "c_$&");
+  let slug = baseSlug.length > 0 ? baseSlug.slice(0, 80) : `criterion_${index + 1}`;
+  if (used.has(slug)) {
+    let n = 2;
+    while (used.has(`${slug}_${n}`) && n < 100) n += 1;
+    slug = `${slug}_${n}`;
+  }
+  used.add(slug);
+
+  const text = raw.text.trim().slice(0, 400);
+  if (text.length < 4) return null;
+
+  const truncStrings = (xs?: string[], maxLen = 200, maxCount = 4) =>
+    xs && xs.length > 0
+      ? xs.map((s) => s.trim().slice(0, maxLen)).filter((s) => s.length > 0).slice(0, maxCount)
+      : undefined;
+
+  const candidate = {
+    id: slug,
+    text,
+    dimension,
+    importance,
+    visibility,
+    discoveryHints: truncStrings(raw.discoveryHints),
+    satisfiedBy: truncStrings(raw.satisfiedBy),
+    scaleNote: raw.scaleNote ? raw.scaleNote.trim().slice(0, 300) : undefined
+  };
+  const parsed = RubricCriterionSchema.safeParse(candidate);
+  return parsed.success ? parsed.data : null;
+}
 
 const DiscoveryMatchSchema = z.object({
   discoveries: z
@@ -295,13 +426,52 @@ export class AiService {
       visibility: "visible" | "hidden";
       importance: "core" | "expected" | "stretch";
     }>;
+    /** If set, prepended to the prompt as a hard correction (used by the
+     * server-side retry when the first attempt produced too few hiddens). */
+    regenerationReason?: string;
   }): Promise<RubricCriterion[]> {
-    const result = await generateObject({
-      model: this.openai("gpt-4o-mini"),
-      schema: GeneratedCriteriaSchema,
-      prompt: buildCriteriaPrompt(input)
+    const prompt = buildCriteriaPrompt({
+      difficulty: input.difficulty,
+      interviewerLevel: input.interviewerLevel,
+      title: input.title,
+      statement: input.statement,
+      seedConstraints: input.seedConstraints,
+      existingCriteria: input.existingCriteria,
+      regenerationReason: input.regenerationReason
     });
-    return result.object.criteria;
+
+    // Retry once on stochastic schema failure. Even with a fully-loose
+    // model-side schema, gpt-4o-mini occasionally emits malformed JSON or
+    // omits required fields entirely. A single re-roll fixes ~all of those.
+    const callModel = () =>
+      generateObject({
+        model: this.openai("gpt-4o-mini"),
+        schema: GeneratedCriteriaSchema,
+        prompt
+      });
+
+    let result;
+    try {
+      result = await callModel();
+    } catch (err) {
+      const name = err instanceof Error ? err.name : "";
+      if (name === "AI_NoObjectGeneratedError" || name === "AI_TypeValidationError") {
+        result = await callModel();
+      } else {
+        throw err;
+      }
+    }
+
+    const used = new Set<string>();
+    const repaired = result.object.criteria
+      .map((c, i) => repairCriterion(c, i, used))
+      .filter((c): c is RubricCriterion => c !== null);
+    if (repaired.length === 0) {
+      throw new Error(
+        "generateCriteria: every emitted criterion failed strict validation after repair"
+      );
+    }
+    return repaired;
   }
 
   /** After each interview turn, detect which undiscovered hidden criteria
@@ -339,8 +509,7 @@ export class AiService {
     const result = await generateObject({
       model: this.openai("gpt-4o"),
       schema: ReferenceSolutionSchema,
-      prompt: buildReferenceSolutionPrompt(input),
-      ...GRADING_OBJECT_SETTINGS
+      prompt: buildReferenceSolutionPrompt(input)
     });
     return result.object;
   }
