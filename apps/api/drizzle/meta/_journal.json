@@ -29,6 +29,13 @@
       "when": 1777980700000,
       "tag": "0003_interview_criteria",
       "breakpoints": false
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1777980800000,
+      "tag": "0004_solutions_input_hash",
+      "breakpoints": false
     }
   ]
 }

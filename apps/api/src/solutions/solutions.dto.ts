@@ -6,7 +6,6 @@ export class ValidateSolutionDto extends ValidatedDto<typeof ValidateSolutionInp
   declare problemId: string;
   declare sceneJson: string;
   declare notes?: string;
-  declare imageBase64?: string;
   declare estimation?: Record<string, unknown>;
   declare interviewId?: string;
 }

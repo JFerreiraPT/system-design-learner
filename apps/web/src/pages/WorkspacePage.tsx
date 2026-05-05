@@ -200,12 +200,10 @@ export function WorkspacePage() {
 
   const validateMutation = useMutation({
     mutationFn: async () => {
-      const imageBase64 = captureSceneImage ? await captureSceneImage() : undefined;
       const result = (
         await api.post("/solutions", {
           problemId: id,
           sceneJson,
-          imageBase64,
           notes: "Candidate whiteboard solution",
           estimation:
             Object.keys(estimationPayload).length > 0 ? estimationPayload : undefined,

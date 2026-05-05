@@ -308,12 +308,12 @@ export function buildValidationPrompt(
           groupByImportance(criteria),
           "",
           undiscoveredHidden.length > 0
-            ? "Hidden criteria the candidate FAILED to surface in the conversation. Penalize discoveryScore for each missing one (weighted: core > expected > stretch). For coverage, also report whether the design happens to address them anyway — sometimes a candidate solves something without ever naming it:\n" +
+            ? "Hidden criteria the candidate FAILED to surface in the conversation are listed below. Judge whether the design still addresses them (`covered`). Discovery credit for hiddens is computed **on the server** from each criterion's `discoveredVia` field (whether the interview surfaced that expectation) — do not invent numeric discovery scores.\n" +
               undiscoveredHidden.map(formatCriterion).join("\n")
-            : "All hidden criteria were surfaced in the conversation — discoveryScore should be high.",
+            : "All hidden criteria were surfaced in the conversation (per `discoveredVia`). Discovery scoring is computed on the server.",
           "",
           visibleCriteria.length > 0
-            ? "Visible criteria are pre-marked as 'discovered' since the candidate could see them on the Problem rail; only their `covered` outcome affects designScore."
+            ? "Visible criteria are pre-marked as `discovered` in rubric data since the candidate saw them on the Problem rail; still judge `covered` from the diagram/notes."
             : "",
           outOfScopeDims.length > 0
             ? `Out-of-scope dimensions for this rubric: ${outOfScopeDims.join(", ")}. Set these to null in the dimensions object — DO NOT invent a score and DO NOT generate gaps for them.`
@@ -335,26 +335,19 @@ export function buildValidationPrompt(
     estimationBlock,
     "",
     "Scoring rules:",
+    "- **Do not compute numeric scores.** The server derives `score`, `designScore`, `discoveryScore`, `coreCovered`, and `coreMissed` deterministically from your per-criterion judgments.",
     "- For EACH criterion, decide:",
     "    covered: did the diagram, notes, or estimation actually address it? Use satisfiedBy as guidance.",
-    "    discovered: did the candidate surface it in dialogue? `visible` criteria are pre-discovered (true). `hidden` criteria with discoveredVia set are also true. Otherwise false.",
+    "    discovered: did the candidate surface it in dialogue? For `visible` criteria this must be true. For `hidden`, use true only when the rubric already marks it discovered (`discoveredVia` set) OR the candidate clearly committed to it on the board / in notes — align with how interview discovery is recorded.",
     "    severity: 'high' for missing core, 'medium' for missing expected, 'low' for missing stretch. Only set when covered=false.",
-    "- Compute `designScore` (0-100): weighted by importance — missing core ≈ -25 each, missing expected ≈ -10 each, missing stretch is bonus-only (don't penalize). Start at 100 and subtract; floor at 0.",
-    "- Compute `discoveryScore` (0-100): fraction of HIDDEN criteria that were discovered, weighted by importance (core hidden weighs more than expected hidden). 100 if there were no hidden criteria.",
-    "- Set the overall `score` ≈ 0.7 × designScore + 0.3 × discoveryScore (round to integer). The caller may re-blend on its side; produce a sensible value here regardless.",
-    "- Dimensions object: for each axis, score 0-100 based on how the design fared on the criteria targeting that axis. If no criterion targets a dimension AND no active constraint hints at it, return null for that dimension — DO NOT guess and DO NOT show a bar. dimensionNotes (optional) gives a one-line rationale per non-null dimension.",
+    "- Dimensions object: for each axis, score 0-100 based on how the design fared on the criteria targeting that axis. If no criterion targets a dimension AND no active constraint hints at it, return null for that dimension — DO NOT guess and DO NOT generate gaps for them.",
     "- gaps: each gap MUST cite a criterion id in parentheses (e.g. \"(per_user_isolation) Tasks table has no user_id foreign key\"). For legacy rubric mode, cite the constraint or rubric bullet text.",
     "- strengths and nextSteps: short bullets; specific to the diagram.",
-    "- coreCovered / coreMissed: list criterion ids of importance='core' partitioned by covered status.",
     "",
     "Return strict JSON with:",
-    "- score (0-100) overall blended",
-    "- designScore (0-100), discoveryScore (0-100)",
     "- dimensions: object with the 8 dimension keys; each value is integer 0-100 OR null",
     "- dimensionNotes (optional): map from dimension key to one-line rationale",
-    "- criteriaEvaluations: array of { criterionId, covered, discovered, severity?, evidence? } — one entry per criterion",
-    "- coreCovered: array of criterion ids (importance='core' AND covered=true)",
-    "- coreMissed: array of criterion ids (importance='core' AND covered=false)",
+    "- criteriaEvaluations: array of { criterionId, covered, discovered, severity?, evidence? } — **exactly one entry per rubric criterion id**, omit only when no structured criteria were provided (legacy rubric mode)",
     "- strengths (array of strings)",
     "- gaps (array of strings, each citing a criterion id or constraint phrase in parens)",
     "- nextSteps (array of strings)"

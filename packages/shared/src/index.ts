@@ -35,7 +35,6 @@ export const ValidateSolutionInputSchema = z.object({
   problemId: z.string().uuid(),
   sceneJson: z.string().min(2),
   notes: z.string().optional(),
-  imageBase64: z.string().optional(),
   estimation: z.record(z.string(), z.unknown()).optional(),
   /** Optional: when present, the validator scores against the live constraint
    * set of this interview instead of the seed `problems.constraints_json`. */
@@ -297,6 +296,8 @@ export const SceneSummarySchema = z.object({
   summaryText: z.string().max(2000).optional()
 });
 export type SceneSummary = z.infer<typeof SceneSummarySchema>;
+
+export { projectSceneJson } from "./sceneProjection.js";
 
 /** Importance tier for rubric criteria and live constraints. Drives both
  * scoring weight in validation and how aggressively the interviewer probes. */

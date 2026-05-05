@@ -120,6 +120,27 @@ function formatWorkspaceContextText(
   return lines.length > 0 ? `\n\n${lines.join("\n")}` : "";
 }
 
+/** Compact scene projection → validator-facing text (replaces raw scene JSON). */
+function formatSceneSummaryForValidation(summary: SceneSummary): string {
+  const lines: string[] = [
+    "Structured whiteboard projection (canonical graph — grade against this, not raw geometry JSON):"
+  ];
+  if (summary.summaryText) lines.push(summary.summaryText);
+  if (summary.nodes.length > 0) {
+    lines.push(
+      `Nodes: ${summary.nodes.map((n) => `${n.id}=${n.label}${n.kind ? `[${n.kind}]` : ""}`).join("; ")}`
+    );
+  }
+  if (summary.edges.length > 0) {
+    lines.push(
+      `Edges: ${summary.edges
+        .map((e) => `${e.from}->${e.to}${e.label ? `(${e.label})` : ""}`)
+        .join("; ")}`
+    );
+  }
+  return lines.join("\n");
+}
+
 const GeneratedProblemSchema = z.object({
   title: z.string(),
   statement: z.string(),
@@ -152,18 +173,16 @@ const CriterionEvaluationSchema = z.object({
 });
 
 const ValidationSchema = z.object({
-  score: z.number().min(0).max(100),
-  designScore: z.number().min(0).max(100),
-  discoveryScore: z.number().min(0).max(100),
   dimensions: ValidationDimensionsSchema,
   dimensionNotes: z.record(z.string(), z.string()).optional(),
   criteriaEvaluations: z.array(CriterionEvaluationSchema).optional(),
-  coreCovered: z.array(z.string()).optional(),
-  coreMissed: z.array(z.string()).optional(),
   strengths: z.array(z.string()),
   gaps: z.array(z.string()),
   nextSteps: z.array(z.string())
 });
+
+/** Stable structured-output settings for grading-related LLM calls. */
+const GRADING_OBJECT_SETTINGS = { temperature: 0, seed: 42 } as const;
 
 const GeneratedCriteriaSchema = z.object({
   criteria: z.array(RubricCriterionSchema).min(3).max(20)
@@ -209,7 +228,8 @@ export class AiService {
     const result = await generateObject({
       model: this.openai("gpt-4o-mini"),
       schema: GeneratedProblemSchema,
-      prompt: buildProblemPrompt(input.difficulty, input.topic)
+      prompt: buildProblemPrompt(input.difficulty, input.topic),
+      ...GRADING_OBJECT_SETTINGS
     });
 
     return result.object;
@@ -217,9 +237,8 @@ export class AiService {
 
   async validateSolution(input: {
     difficulty: Difficulty;
-    sceneJson: string;
+    sceneSummary: SceneSummary;
     notes?: string;
-    imageBase64?: string;
     estimation?: Record<string, unknown>;
     constraints: string[];
     /** Structured criteria for THIS interview. When provided, drives both
@@ -232,30 +251,27 @@ export class AiService {
       input.estimation && Object.keys(input.estimation).length > 0
         ? `\nCandidate back-of-envelope estimation (JSON):\n${JSON.stringify(input.estimation, null, 2)}`
         : "";
-    const contentParts: Array<{ type: "text"; text: string } | { type: "image"; image: string }> = [
-      {
-        type: "text",
-        text: buildValidationPrompt(input.difficulty, estimationText, {
-          constraints: input.constraints,
-          criteria: input.criteria,
-          legacyRubric: input.legacyRubric
-        })
-      },
-      { type: "text", text: `Scene JSON:\n${input.sceneJson}` },
+    const sortedCriteria = input.criteria
+      ? [...input.criteria].sort((a, b) => a.id.localeCompare(b.id))
+      : undefined;
+
+    const promptText = buildValidationPrompt(input.difficulty, estimationText, {
+      constraints: input.constraints,
+      criteria: sortedCriteria,
+      legacyRubric: input.legacyRubric
+    });
+
+    const contentParts: Array<{ type: "text"; text: string }> = [
+      { type: "text", text: promptText },
+      { type: "text", text: formatSceneSummaryForValidation(input.sceneSummary) },
       { type: "text", text: `Candidate notes:\n${input.notes ?? ""}` }
     ];
-
-    if (input.imageBase64) {
-      contentParts.push({
-        type: "image",
-        image: `data:image/png;base64,${input.imageBase64}`
-      });
-    }
 
     const result = await generateObject({
       model: this.openai("gpt-4o"),
       schema: ValidationSchema,
-      messages: [{ role: "user", content: contentParts }]
+      messages: [{ role: "user", content: contentParts }],
+      ...GRADING_OBJECT_SETTINGS
     });
 
     return result.object;
@@ -274,7 +290,8 @@ export class AiService {
     const result = await generateObject({
       model: this.openai("gpt-4o-mini"),
       schema: GeneratedCriteriaSchema,
-      prompt: buildCriteriaPrompt(input)
+      prompt: buildCriteriaPrompt(input),
+      ...GRADING_OBJECT_SETTINGS
     });
     return result.object.criteria;
   }
@@ -295,7 +312,8 @@ export class AiService {
       const result = await generateObject({
         model: this.openai("gpt-4o-mini"),
         schema: DiscoveryMatchSchema,
-        prompt: buildDiscoveryMatchPrompt(input)
+        prompt: buildDiscoveryMatchPrompt(input),
+        ...GRADING_OBJECT_SETTINGS
       });
       const valid = new Set(input.undiscovered.map((c) => c.id));
       return result.object.discoveries.filter((d) => valid.has(d.id));
@@ -313,7 +331,8 @@ export class AiService {
     const result = await generateObject({
       model: this.openai("gpt-4o"),
       schema: ReferenceSolutionSchema,
-      prompt: buildReferenceSolutionPrompt(input)
+      prompt: buildReferenceSolutionPrompt(input),
+      ...GRADING_OBJECT_SETTINGS
     });
     return result.object;
   }
@@ -414,6 +433,7 @@ ${input.statement}`
       const result = await generateObject({
         model: this.openai("gpt-4o-mini"),
         schema: ProposalSchema,
+        ...GRADING_OBJECT_SETTINGS,
         prompt: [
           "You watch a system-design interview and extract proposed updates to the SCOPE/CONSTRAINT list.",
           "Be conservative — empty `proposals` is the right answer most of the time.",

@@ -27,6 +27,8 @@ export const solutions = pgTable("solutions", {
   score: integer("score"),
   feedbackJson: jsonb("feedback_json").$type<Record<string, unknown> | null>(),
   estimationJson: jsonb("estimation_json").$type<Record<string, unknown> | null>(),
+  /** Canonical hash of validation inputs for idempotent cache hits. */
+  inputHash: text("input_hash"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull()
 });
 
