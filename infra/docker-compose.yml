@@ -1,0 +1,58 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: sdl
+      POSTGRES_PASSWORD: sdl
+      POSTGRES_DB: sdl
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    volumes:
+      - redis_data:/data
+
+  api:
+    build:
+      context: ..
+      dockerfile: infra/api.Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: postgresql://sdl:sdl@postgres:5432/sdl
+      REDIS_URL: redis://redis:6379
+    working_dir: /workspace
+    volumes:
+      - ../:/workspace
+      - /workspace/node_modules
+    command: sh -c "corepack enable && pnpm install && pnpm db:migrate && pnpm --filter @sdl/api dev"
+    ports:
+      - "3001:3001"
+    depends_on:
+      - postgres
+      - redis
+
+  web:
+    build:
+      context: ..
+      dockerfile: infra/web.Dockerfile
+    env_file:
+      - ../.env
+    working_dir: /workspace
+    volumes:
+      - ../:/workspace
+      - /workspace/node_modules
+    command: sh -c "corepack enable && pnpm install && pnpm --filter @sdl/web dev --host 0.0.0.0"
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  redis_data:

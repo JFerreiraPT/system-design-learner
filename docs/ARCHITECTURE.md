@@ -1,0 +1,319 @@
+# Architecture
+
+System Design Learner is a single-user web app for practicing system design with an Excalidraw whiteboard, an AI problem generator, AI solution validation, an AI interviewer, and a tutor chat.
+
+This document describes the runtime architecture, data model, request flows, and caching strategy.
+
+## High-level diagram
+
+```text
+                ┌──────────────────────────────────────┐
+                │           Browser (React)            │
+                │  Excalidraw board · chat · dashboard │
+                └──────────────┬───────────────────────┘
+                               │ HTTP + SSE (axios, AI SDK)
+                               ▼
+                ┌──────────────────────────────────────┐
+                │        NestJS API  (port 3001)       │
+                │  problems · solutions · interview ·  │
+                │  tutor · ai · db · redis             │
+                └─────┬───────────┬───────────────┬────┘
+                      │           │               │
+                      ▼           ▼               ▼
+              PostgreSQL 16    Redis 7      OpenAI API
+              (Drizzle ORM)    (cache)      (Vercel AI SDK)
+```
+
+## Monorepo layout
+
+Driven by `pnpm-workspace.yaml` and Turborepo (`turbo.json`).
+
+| Path | Package | Description |
+|---|---|---|
+| `apps/web` | `@sdl/web` | React 19 + Vite + Tailwind + shadcn/ui frontend |
+| `apps/api` | `@sdl/api` | NestJS 11 backend |
+| `packages/shared` | `@sdl/shared` | Shared TypeScript types and Zod schemas |
+| `packages/ai-prompts` | `@sdl/ai-prompts` | Prompt templates / vocabularies for OpenAI |
+| `infra/` | — | `docker-compose.yml`, `api.Dockerfile`, `web.Dockerfile` |
+
+Turbo orchestrates `dev`, `build`, `lint`, and Drizzle DB tasks (`db:generate`, `db:migrate`, `db:push`).
+
+## Frontend (`apps/web`)
+
+- **Framework:** React 19 + Vite + TypeScript, Tailwind + shadcn/ui
+- **Whiteboard:** `@excalidraw/excalidraw`
+- **Routing:** `react-router-dom` v7
+- **Server state:** `@tanstack/react-query` (in-memory cache of REST responses)
+- **Client state:** `zustand` (`apps/web/src/lib/store.ts`)
+- **HTTP:** `axios` instance in `apps/web/src/lib/api.ts`
+- **Streaming chat:** `@ai-sdk/react` (SSE) for interviewer/tutor chat
+
+### Pages
+
+- `DashboardPage.tsx` — list problems, generate new ones
+- `WorkspacePage.tsx` — main practice surface (board + chat + estimation + phase ribbon)
+- `TutorPage.tsx` — standalone tutor chat
+
+### Key components
+
+- `Board.tsx` — Excalidraw scene
+- `ChatPanel.tsx` — interviewer/tutor streaming chat
+- `PhaseRibbon.tsx` — interview phase progress
+- `EstimationPanel.tsx`, `DimensionBreakdown.tsx`
+- `WorkspaceProblemRail.tsx`, `ConfirmDialog.tsx`
+
+## Backend (`apps/api`)
+
+NestJS 11 application. `src/main.ts` bootstraps with CORS enabled, listens on port `3001`, and registers a global `ZodValidationPipe`.
+
+### Modules (registered in `app.module.ts`)
+
+| Module | Path | Responsibility |
+|---|---|---|
+| `DbModule` | `src/db` | Drizzle ORM + `pg` Pool, exposes `DB` injection token |
+| `RedisModule` | `src/redis` | `ioredis` client, exposes `REDIS` injection token (`@Global`) |
+| `AiModule` | `src/ai` | OpenAI integration via `@ai-sdk/openai` + `ai` SDK |
+| `ProblemsModule` | `src/problems` | Problem generation, listing, reference solutions, backfills |
+| `SolutionsModule` | `src/solutions` | Save and score user solutions |
+| `InterviewModule` | `src/interview` | Interview sessions and streamed messages |
+| `TutorModule` | `src/tutor` | Tutor sessions and streamed messages |
+
+### REST surface
+
+```text
+GET  /health
+POST /problems/generate
+POST /problems/backfill-tags
+POST /problems/backfill-estimation-specs
+POST /problems/backfill-interview-plans
+GET  /problems
+GET  /problems/:id
+GET  /problems/:id/reference
+POST /solutions
+GET  /solutions
+POST /interview
+PATCH /interview/:id
+POST /interview/:id/messages         (SSE stream)
+GET  /interview/:id/messages
+POST /tutor/sessions
+GET  /tutor/sessions
+GET  /tutor/sessions/:id/messages
+POST /tutor/sessions/:id/messages    (SSE stream)
+```
+
+### AI integration (`apps/api/src/ai/ai.service.ts`)
+
+Single integration point with OpenAI; all prompts live in `@sdl/ai-prompts`.
+
+| Method | Model | Purpose |
+|---|---|---|
+| `generateProblem` | `gpt-4o-mini` | Full problem (title, statement, constraints, rubric, tags, estimation spec, interview plan) |
+| `validateSolution` | `gpt-4o` (multimodal) | Score scene JSON + notes + optional board PNG across 8 dimensions |
+| `generateReference` | `gpt-4o` | Reference architecture for a problem |
+| `inferTags` | `gpt-4o-mini` | Backfill 2–5 tags |
+| `inferEstimationSpec` | `gpt-4o-mini` | Per-problem estimation field spec |
+| `inferInterviewPlan` | `gpt-4o-mini` | Per-problem interview phase plan |
+| `streamInterviewer` | `gpt-4o` (multimodal) | Streamed interviewer chat (SSE) with optional board PNG + scene projection |
+| `streamTutor` | `gpt-4o-mini` (multimodal) | Streamed tutor chat (SSE) with optional board PNG + scene projection |
+
+`generateObject` is used with Zod schemas to guarantee structured output; `streamText` powers the chat endpoints.
+
+## Data layer
+
+### PostgreSQL 16 (Drizzle ORM)
+
+Schema lives in `apps/api/src/db/schema.ts`. Migrations are tracked in `apps/api/drizzle/`.
+
+#### Tables
+
+**`problems`**
+- `id` (uuid, pk), `title`, `statement`, `difficulty`
+- `constraints_json` (jsonb, `string[]`)
+- `evaluation_rubric_json` (jsonb, `string[]`)
+- `tags_json` (jsonb, `string[] | null`)
+- `reference_json` (jsonb) — lazily filled with the AI reference solution
+- `estimation_spec_json` (jsonb) — per-problem back-of-envelope field spec
+- `interview_plan_json` (jsonb) — per-problem ordered interview phases
+- `generated_by_ai` (bool), `created_at` (timestamptz)
+
+**`solutions`**
+- `id` (uuid, pk), `problem_id` → `problems.id`
+- `scene_json` (text, Excalidraw scene), `notes` (text)
+- `score` (int), `feedback_json` (jsonb), `estimation_json` (jsonb)
+- `created_at`
+
+> The PNG screenshot is sent to the AI for validation but **not** persisted; the diagram can always be re-rendered from `scene_json`. The legacy `image_b64` column was dropped.
+
+**`interviews`**
+- `id` (uuid, pk), `problem_id` → `problems.id`
+- `interviewer_level`, `status` (default `active`)
+- `started_at`, `ended_at`
+
+**`interview_messages`**
+- `id` (uuid, pk), `interview_id` → `interviews.id`
+- `role`, `content`, `created_at`
+
+**`tutor_sessions`**
+- `id` (uuid, pk), `title` (default `"Tutor Session"`), `created_at`
+
+**`tutor_messages`**
+- `id` (uuid, pk), `session_id` → `tutor_sessions.id`
+- `role`, `content`, `created_at`
+
+#### Relationships
+
+```text
+problems 1───* solutions
+problems 1───* interviews 1───* interview_messages
+tutor_sessions 1───* tutor_messages
+```
+
+#### Migrations
+
+Managed by `drizzle-kit`:
+
+- `pnpm db:generate` — diff schema → SQL
+- `pnpm db:push` — apply schema directly (dev)
+- `pnpm db:migrate` — apply tracked migrations
+
+### Redis 7
+
+Wired in `apps/api/src/redis/redis.module.ts` as a `@Global` provider exposing the `REDIS` token. Used today only by `ProblemsService`.
+
+## Whiteboard pipeline
+
+The Excalidraw board is the central artifact. Three things happen with it.
+
+### 1. Scene projection (compact graph for LLMs)
+
+`apps/web/src/lib/sceneProjection.ts` walks the raw Excalidraw scene and produces a compact `SceneSummary` (defined in `@sdl/shared`):
+
+```text
+{
+  nodes: [{ id: "n0", label: "API Gateway", kind: "rectangle" }, …],
+  edges: [{ from: "n0", to: "n3", label: "writes" }, …],
+  summaryText: "5 components: ... 4 connections: API Gateway → Auth Service; …"
+}
+```
+
+Why: raw Excalidraw scene JSON is huge (`appState`, `files`, version stamps, group ids…) and forces the model to reason about geometry. The projection is ~10–50× smaller and gives the model a clean nodes/edges graph instead of pixel coordinates.
+
+The projection resolves text labels for shapes via three strategies in order:
+1. text element with `containerId === shape.id`
+2. text in `shape.boundElements`
+3. nearest standalone text overlapping the shape's bbox
+
+Edges come from `arrow` elements with `startBinding` / `endBinding`; arrow text labels propagate into `edges[].label`.
+
+### 2. Lazy screenshot capture (resolution-capped)
+
+`Board.tsx` no longer takes a screenshot on every Excalidraw `onChange`. It registers a `captureSceneImage()` function on the Zustand store; consumers (validate, chat send) call it on demand:
+
+```ts
+const imageBase64 = captureSceneImage ? await captureSceneImage() : undefined;
+```
+
+The capture runs `exportToBlob` with a `getDimensions` callback that clamps the longest side to 1280px before base64-encoding, so a busy board can't produce a multi-MB payload.
+
+### 3. Server-side scene-diff per session
+
+When the browser sends a message to the interviewer or tutor, it includes the latest `sceneSummary` (and optionally an `imageBase64`). On the API, `InterviewService` / `TutorService` compute a SHA-1 of the canonical `(nodes, edges)` and compare it to the previous turn's hash stored in Redis under `interview:<id>:sceneHash` / `tutor:<id>:sceneHash` (TTL 4h).
+
+If the hash matches, `sceneUnchanged: true` is passed to `AiService`, which **omits the whiteboard description and image from the prompt for that turn**. This avoids re-sending hundreds to thousands of tokens of board context every chat turn when the candidate is just talking.
+
+## Caching
+
+Five places where caching happens.
+
+### 1. Redis: generated problems (only when a topic is supplied)
+
+Location: `apps/api/src/problems/problems.service.ts` in `generate()`.
+
+- **Key:** `problem:<difficulty>:<topic-trimmed-lowercased>`
+- **Value:** the full DB row of the inserted problem (JSON-stringified)
+- **TTL:** 900 seconds (15 minutes), via `SET ... EX 900`
+- **Trigger condition:** only when `topic` is provided. Topic-less generations skip the cache entirely (every call goes to OpenAI and inserts a new row).
+- **Read path:** on cache hit, the cached row is returned without calling OpenAI and **without** inserting a new row in `problems`.
+- **Write path:** on miss, OpenAI generates the problem, the row is inserted into `problems`, then the row is cached.
+- **Invalidation:** TTL only.
+
+> Caveat: because the topic is normalized but the difficulty is not, two consecutive `(difficulty, topic)` requests within 15 minutes return the **same** problem row.
+
+### 2. Redis: per-session scene hash (interviewer / tutor)
+
+- **Keys:** `interview:<id>:sceneHash`, `tutor:<id>:sceneHash`
+- **Value:** SHA-1 of the compact `(nodes, edges)` projection
+- **TTL:** 4 hours
+- **Effect:** if the current turn's hash matches the stored one, the API skips re-sending the board description and PNG to the model.
+
+### 3. Postgres: reference solutions (durable lazy cache)
+
+- The first call to `GET /problems/:id/reference` (after at least one validation attempt exists) generates the reference via OpenAI and writes it to `problems.reference_json`.
+- Subsequent calls short-circuit and return the stored JSON without calling OpenAI.
+- No TTL — invalidated only by clearing the column.
+
+### 4. Frontend: scene-unchanged validate guard
+
+`WorkspacePage.tsx` keeps the `sceneJson` of the last successful validation in component state. The Validate button is disabled until the diagram changes, preventing accidental re-spend on identical multimodal calls.
+
+### 5. Frontend: TanStack Query in-memory cache
+
+Standard client-side cache for REST responses (problem list, problem detail, solutions list, etc.).
+
+### What is **not** cached
+
+- Validation results (`POST /solutions`) — every call goes to OpenAI and writes a new row.
+- Interview and tutor messages — streamed every time; only the scene-hash is cached, not the response.
+- Problem listings (`GET /problems`) and detail fetches — direct Postgres reads.
+- The PNG screenshot — sent to OpenAI for validation but no longer persisted in Postgres.
+
+The `Cache-Control: no-cache` headers on the SSE endpoints are about HTTP intermediaries, not Redis caching.
+
+## Multimodal inputs
+
+| Surface | PNG sent to OpenAI? | Scene representation in prompt | Model |
+|---|---|---|---|
+| Validation (`POST /solutions`) | Yes (always when scene non-empty) | Raw `scene_json` + notes + estimation | `gpt-4o` |
+| Interviewer chat | Yes (when scene changed since last turn) | Compact `sceneSummary` (nodes / edges / summaryText) | `gpt-4o` |
+| Tutor chat | Yes (when scene changed since last turn) | Compact `sceneSummary` | `gpt-4o-mini` |
+
+The PNG is captured lazily by `Board.tsx` via `captureSceneImage()` on demand, scaled to a max of 1280px on the longest side before base64-encoding.
+
+## End-to-end flow (typical session)
+
+1. Open dashboard → `GET /problems` (Postgres).
+2. Generate problem → `POST /problems/generate` →
+   - if a topic is given and cached in Redis: return cached row;
+   - else `AiService.generateProblem` (gpt-4o-mini) → insert into `problems` → cache in Redis (15 min) when topic was given.
+3. Open workspace → load problem, draw on Excalidraw, fill the AI-generated estimation fields, optionally chat with the AI interviewer.
+4. Interviewer/tutor chat:
+   - Browser builds the payload: compact `sceneSummary` + (lazy) `imageBase64` + estimation + phase.
+   - API hashes the scene; if unchanged from last turn, the board context + image are omitted to save tokens.
+   - Tokens stream back via the Vercel AI SDK to `ChatPanel.tsx`.
+   - Both user and assistant messages are persisted in `interview_messages` / `tutor_messages`.
+5. Validate → `POST /solutions` with `scene_json` + notes + base64 board PNG → `AiService.validateSolution` (gpt-4o, multimodal) returns scored dimensions + feedback; persisted in `solutions`. The PNG is **not** persisted. The Validate button is then disabled until the diagram is edited.
+6. Reference solution → `GET /problems/:id/reference` → returns `problems.reference_json` if present; otherwise generates with `gpt-4o`, stores it on the row, then returns it. Requires at least one prior validation attempt for that problem.
+
+## Infrastructure (`infra/`)
+
+`docker-compose.yml` defines four services:
+
+| Service | Image / Build | Ports | Notes |
+|---|---|---|---|
+| `postgres` | `postgres:16` | `${POSTGRES_PORT:-5433}:5432` | Volume `postgres_data` |
+| `redis` | `redis:7` | `${REDIS_PORT:-6380}:6379` | Volume `redis_data` |
+| `api` | `infra/api.Dockerfile` | `3001:3001` | Runs `pnpm db:migrate && pnpm --filter @sdl/api dev`; depends on `postgres` + `redis` |
+| `web` | `infra/web.Dockerfile` | `5173:5173` | Vite dev server; depends on `api` |
+
+### Environment variables (`.env`)
+
+- `OPENAI_API_KEY`
+- `DATABASE_URL` (e.g. `postgresql://sdl:sdl@postgres:5432/sdl`)
+- `REDIS_URL` (e.g. `redis://redis:6379`)
+- `POSTGRES_PORT`, `REDIS_PORT` — host port overrides for local conflicts
+
+## Notes and possible extensions
+
+- Redis is currently underused — it could also cache problem listings, gate AI calls with rate limiting, or stash interview transcripts for resume.
+- The cache key for problem generation is per `(difficulty, topic)`; if you want multiple distinct problems for the same topic, either include a nonce in the topic, drop the cache, or wait out the 15-minute TTL.
+- There is no auth layer — the app is designed for single-user local use.
