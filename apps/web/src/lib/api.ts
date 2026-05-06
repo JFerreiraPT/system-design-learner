@@ -30,6 +30,8 @@ export type CriteriaProgress = {
   hidden: { total: number; discovered: number; core: number; coreDiscovered: number };
   visible: { total: number };
   discoveredCriterionIds: string[];
+  /** Hidden criteria already discovered — safe to render as plain text. */
+  surfacedHidden: Array<{ id: string; text: string; importance: Importance }>;
 };
 
 export type CriteriaProgressResponse = CriteriaProgress | { criteria: null };

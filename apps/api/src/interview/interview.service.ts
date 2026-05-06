@@ -37,8 +37,8 @@ type WorkspaceContext = {
   };
 };
 
-/** Progress view returned by `getCriteriaProgress`. Counts only — no text or
- * hint leak. The Problem rail's discovery indicator binds to this. */
+/** Progress view returned by `getCriteriaProgress`. Counts + **surfaced**
+ * hidden texts only (safe once discovered — still no leak for undiscovered). */
 type CriteriaProgressView = {
   totals: { total: number; core: number; expected: number; stretch: number };
   hidden: { total: number; discovered: number; core: number; coreDiscovered: number };
@@ -47,6 +47,8 @@ type CriteriaProgressView = {
    * / candidate / match for hidden). The rail uses this to mark live
    * constraints with `discoveredFromCriterionId` as "discovery" pills. */
   discoveredCriterionIds: string[];
+  /** Hidden criteria already discovered this interview — text is OK to show. */
+  surfacedHidden: Array<{ id: string; text: string; importance: RubricCriterion["importance"] }>;
 };
 
 const SCENE_HASH_TTL_SECONDS = 60 * 60 * 4;
@@ -315,9 +317,16 @@ export class InterviewService {
   /** Candidate-driven manual add. Returns the updated full state. */
   async addConstraint(interviewId: string, text: string, origin: "candidate" | "interviewer" = "candidate") {
     const { constraints, proposals } = await this.getConstraintState(interviewId);
+    const trimmed = text.trim();
+    const norm = trimmed.toLowerCase();
+    const dupActive = constraints.some(
+      (c) => c.status === "active" && c.text.toLowerCase().trim() === norm
+    );
+    if (dupActive) return { constraints, proposals };
+
     const next: LiveConstraint = {
       id: randomUUID(),
-      text: text.trim(),
+      text: trimmed,
       origin,
       status: "active",
       addedAt: new Date().toISOString()
@@ -409,23 +418,24 @@ export class InterviewService {
       role: "assistant",
       content
     });
-    // Two best-effort post-turn jobs run in parallel; both must NOT break
-    // the chat turn if they fail.
-    //  1. Free-text proposal extraction (Apply/Dismiss workflow for
-    //     commitments that don't map to any pre-defined criterion).
-    //  2. Criterion discovery match (auto-promotes hidden criteria to
-    //     LiveConstraint rows when surfaced — no Apply step needed since
-    //     discovery is pre-defined work, not new scope).
-    void this.deriveConstraintProposals(interviewId, content).catch(() => {});
-    void this.detectDiscoveries(interviewId, content).catch(() => {});
+    // Run sequentially after the assistant row is persisted so:
+    //  1. Discovery promotes criteria → live constraints before proposals run.
+    //  2. The interview SSE finishes only after DB reflects discoveries, so a
+    //     client refetch right after streaming sees new constraints immediately.
+    try {
+      await this.detectDiscoveries(interviewId, content);
+      await this.deriveConstraintProposals(interviewId, content);
+    } catch (err) {
+      const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      console.error("[saveAssistantMessage] post-turn jobs:", msg);
+    }
   }
 
-  /** Progress-only view of the per-interview rubric — safe to call any time.
+  /** Progress-only view of the per-interview rubric — mostly counts.
    *
-   * The Problem rail uses this to render "X / Y expectations explored"
-   * without leaking the hidden criterion texts. Discovered criteria are
-   * already exposed via the live constraints rail (with `discoveredFromCriterionId`),
-   * so callers don't need full criterion bodies for normal UI rendering.
+   * Includes **`surfacedHidden`**: full text of hidden criteria already
+   * discovered this session (safe to show). Undiscovered hidden texts are never
+   * returned. The Problem rail binds its discovery indicator here.
    *
    * Returns `null` when the interview row predates per-interview criteria
    * (criteria_json IS NULL) — the UI hides the indicator in that case. */
@@ -441,6 +451,7 @@ export class InterviewService {
     const hidden = { total: 0, discovered: 0, core: 0, coreDiscovered: 0 };
     const visible = { total: 0 };
     const discoveredIds: string[] = [];
+    const surfacedHidden: CriteriaProgressView["surfacedHidden"] = [];
     for (const c of criteria) {
       totals[c.importance] += 1;
       if (c.visibility === "hidden") {
@@ -450,13 +461,14 @@ export class InterviewService {
           hidden.discovered += 1;
           if (c.importance === "core") hidden.coreDiscovered += 1;
           discoveredIds.push(c.id);
+          surfacedHidden.push({ id: c.id, text: c.text, importance: c.importance });
         }
       } else {
         visible.total += 1;
         if (c.discoveredVia) discoveredIds.push(c.id);
       }
     }
-    return { totals, hidden, visible, discoveredCriterionIds: discoveredIds };
+    return { totals, hidden, visible, discoveredCriterionIds: discoveredIds, surfacedHidden };
   }
 
   /** Full criteria payload — call only after the candidate has submitted at
@@ -629,7 +641,9 @@ export class InterviewService {
     //    surfacing it — no additional gating needed.
     const liveConstraints: LiveConstraint[] =
       (session.liveConstraintsJson as LiveConstraint[] | null) ?? [];
-    const activeTexts = new Set(
+    // Track texts already taken so we never insert two identical bullets in one
+    // batch (e.g. duplicate rubric rows with different ids).
+    const takenTexts = new Set(
       liveConstraints
         .filter((c) => c.status === "active")
         .map((c) => c.text.toLowerCase().trim())
@@ -638,7 +652,9 @@ export class InterviewService {
     for (const m of matches) {
       const criterion = criteria.find((c) => c.id === m.id);
       if (!criterion) continue;
-      if (activeTexts.has(criterion.text.toLowerCase().trim())) continue;
+      const norm = criterion.text.toLowerCase().trim();
+      if (takenTexts.has(norm)) continue;
+      takenTexts.add(norm);
       newConstraints.push({
         id: randomUUID(),
         text: criterion.text,

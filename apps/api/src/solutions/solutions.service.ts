@@ -1,4 +1,9 @@
-import { Inject, Injectable, NotFoundException } from "@nestjs/common";
+import {
+  BadRequestException,
+  Inject,
+  Injectable,
+  NotFoundException
+} from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import type { Difficulty, LiveConstraint, RubricCriterion, ValidationDimensions } from "@sdl/shared";
 import { projectSceneJson } from "@sdl/shared";
@@ -6,7 +11,7 @@ import { and, asc, desc, eq } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import { AiService } from "../ai/ai.service.js";
 import { DB } from "../db/db.module.js";
-import { interviews, problems, solutions } from "../db/schema.js";
+import { interviewMessages, interviews, problems, solutions } from "../db/schema.js";
 
 /** Default 0-100 dimension scores used in stub/empty/error evaluations. We
  * use a low-but-not-null value (5) so the bar still renders, signalling
@@ -30,6 +35,32 @@ const DEFAULT_DESIGN_WEIGHT = 0.7;
 const SEVERITY_PENALTY = { high: 25, medium: 10, low: 0 } as const;
 
 const IMPORTANCE_WEIGHT = { core: 3, expected: 2, stretch: 1 } as const;
+
+/** Hard cap keeps validation prompts inside practical context limits. */
+const MAX_INTERVIEW_TRANSCRIPT_CHARS = 120_000;
+
+function formatInterviewTranscript(
+  rows: Array<{ role: string; content: string }>
+): string {
+  const parts: string[] = [];
+  for (const m of rows) {
+    if (m.role !== "user" && m.role !== "assistant") continue;
+    const label = m.role === "user" ? "Candidate" : "Interviewer";
+    parts.push(`[${label}]\n${m.content.trim()}`);
+  }
+  return parts.join("\n\n---\n\n");
+}
+
+function truncateInterviewTranscript(text: string): string {
+  const t = text.trim();
+  if (t.length === 0) return "";
+  if (t.length <= MAX_INTERVIEW_TRANSCRIPT_CHARS) return t;
+  const omitted = t.length - MAX_INTERVIEW_TRANSCRIPT_CHARS;
+  return (
+    `[Earlier transcript truncated (~${omitted} characters omitted)]\n\n` +
+    t.slice(-MAX_INTERVIEW_TRANSCRIPT_CHARS)
+  );
+}
 
 type ValidatorLlmOutput = {
   dimensions: ValidationDimensions;
@@ -66,6 +97,8 @@ function computeSolutionInputHash(input: {
   criteria: RubricCriterion[] | null;
   estimation: Record<string, unknown> | null;
   difficulty: string;
+  /** When validating with an interview, transcript text included in grading. */
+  interviewTranscript: string | null;
 }): string {
   const sortedCriteria =
     input.criteria === null ?
@@ -77,7 +110,8 @@ function computeSolutionInputHash(input: {
     activeConstraints: [...input.activeConstraints].sort((a, b) => a.localeCompare(b)),
     criteria: sortedCriteria,
     estimation: input.estimation,
-    difficulty: input.difficulty
+    difficulty: input.difficulty,
+    interviewTranscript: input.interviewTranscript
   });
 
   return createHash("sha1").update(JSON.stringify(payload)).digest("hex");
@@ -120,17 +154,37 @@ export class SolutionsService {
 
     let scoringConstraints: string[] = problem.constraintsJson ?? [];
     let criteria: RubricCriterion[] | null = null;
+    let interviewTranscript: string | null = null;
+
     if (input.interviewId) {
       const interviewRows = await this.db
         .select()
         .from(interviews)
         .where(eq(interviews.id, input.interviewId));
       const interview = interviewRows[0];
-      const live = (interview?.liveConstraintsJson as LiveConstraint[] | null) ?? null;
+      if (!interview) throw new NotFoundException("Interview not found");
+      if (interview.problemId !== input.problemId) {
+        throw new BadRequestException("Interview does not belong to this problem");
+      }
+
+      const live = (interview.liveConstraintsJson as LiveConstraint[] | null) ?? null;
       if (live) {
         scoringConstraints = live.filter((c) => c.status === "active").map((c) => c.text);
       }
-      criteria = (interview?.criteriaJson as RubricCriterion[] | null) ?? null;
+      criteria = (interview.criteriaJson as RubricCriterion[] | null) ?? null;
+
+      const msgRows = await this.db
+        .select({
+          role: interviewMessages.role,
+          content: interviewMessages.content
+        })
+        .from(interviewMessages)
+        .where(eq(interviewMessages.interviewId, input.interviewId))
+        .orderBy(asc(interviewMessages.createdAt));
+
+      const rawTx = formatInterviewTranscript(msgRows);
+      const clipped = truncateInterviewTranscript(rawTx);
+      interviewTranscript = clipped.length > 0 ? clipped : null;
     }
 
     const sceneSummary = projectSceneJson(input.sceneJson);
@@ -142,7 +196,8 @@ export class SolutionsService {
       activeConstraints: scoringConstraints,
       criteria,
       estimation: estimationNorm,
-      difficulty: problem.difficulty
+      difficulty: problem.difficulty,
+      interviewTranscript
     });
 
     const cachedRows = await this.db
@@ -167,7 +222,8 @@ export class SolutionsService {
           estimation: input.estimation,
           constraints: scoringConstraints,
           criteria: criteria ?? undefined,
-          legacyRubric: criteria ? undefined : (problem.evaluationRubricJson ?? [])
+          legacyRubric: criteria ? undefined : (problem.evaluationRubricJson ?? []),
+          interviewTranscript: interviewTranscript ?? undefined
         });
 
     const evaluation = this.computeServerScores(rawEvaluation, criteria);
@@ -317,6 +373,7 @@ export class SolutionsService {
     constraints: string[];
     criteria?: RubricCriterion[];
     legacyRubric?: string[];
+    interviewTranscript?: string;
   }) {
     try {
       return await this.aiService.validateSolution(input);

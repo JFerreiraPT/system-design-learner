@@ -87,9 +87,8 @@ export class InterviewController {
     return this.interviewService.dismissProposal(id, proposalId);
   }
 
-  /** Progress-only snapshot of the per-interview rubric (counts + discovered
-   * IDs). Safe to call any time — does NOT leak hidden criterion text. The
-   * Problem rail's discovery indicator binds to this. */
+  /** Progress-only snapshot of the per-interview rubric (counts + surfaced
+   * hidden texts once discovered). Undiscovered expectations stay opaque. */
   @Get(":id/criteria")
   getCriteriaProgress(@Param("id") id: string) {
     return this.interviewService.getCriteriaProgress(id);

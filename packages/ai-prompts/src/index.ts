@@ -324,6 +324,8 @@ export function buildValidationPrompt(
     criteria?: RubricCriterion[];
     /** Free-text legacy rubric for problems that predate criteria. */
     legacyRubric?: string[];
+    /** Full interviewer ↔ candidate chat for this attempt (when present). */
+    interviewTranscript?: string;
   }
 ): string {
   const constraintsBlock =
@@ -401,6 +403,17 @@ export function buildValidationPrompt(
           scope.legacyRubric.map((r) => `- ${r}`).join("\n")
         : "";
 
+  const transcriptBlock =
+    scope.interviewTranscript?.trim().length ?
+      [
+        "Interview transcript (chronological — candidate ↔ interviewer):",
+        "Treat this as binding scope context alongside the diagram and notes: interviewer commitments, candidate assumptions stated aloud, and agreed trade-offs count even when not drawn.",
+        "",
+        scope.interviewTranscript.trim(),
+        ""
+      ].join("\n")
+    : "";
+
   return [
     "You are a senior system design reviewer.",
     `Evaluate the candidate whiteboard solution for ${difficulty} level.`,
@@ -408,12 +421,13 @@ export function buildValidationPrompt(
     constraintsBlock,
     criteriaBlock,
     estimationBlock,
+    transcriptBlock,
     "",
     "Scoring rules:",
     "- **Do not compute numeric scores.** The server derives `score`, `designScore`, `discoveryScore`, `coreCovered`, and `coreMissed` deterministically from your per-criterion judgments.",
     "- For EACH criterion, decide:",
-    "    covered: did the diagram, notes, or estimation actually address it? Use satisfiedBy as guidance.",
-    "    discovered: did the candidate surface it in dialogue? For `visible` criteria this must be true. For `hidden`, use true only when the rubric already marks it discovered (`discoveredVia` set) OR the candidate clearly committed to it on the board / in notes — align with how interview discovery is recorded.",
+    "    covered: did the diagram, notes, estimation, **or interview transcript** actually address it? Use satisfiedBy as guidance — verbal commitments in chat can satisfy scope when they are specific.",
+    "    discovered: did the candidate surface it in dialogue? For `visible` criteria this must be true. For `hidden`, use true only when the rubric already marks it discovered (`discoveredVia` set) OR the candidate clearly committed to it in the interview transcript, on the board, or in notes — align with how interview discovery is recorded.",
     "    severity: 'high' for missing core, 'medium' for missing expected, 'low' for missing stretch. Only set when covered=false.",
     "- Dimensions object: for each axis, score 0-100 based on how the design fared on the criteria targeting that axis. If no criterion targets a dimension AND no active constraint hints at it, return null for that dimension — DO NOT guess and DO NOT generate gaps for them.",
     "- gaps: each gap MUST cite a criterion id in parentheses (e.g. \"(per_user_isolation) Tasks table has no user_id foreign key\"). For legacy rubric mode, cite the constraint or rubric bullet text.",

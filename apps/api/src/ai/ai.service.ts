@@ -380,6 +380,8 @@ export class AiService {
     criteria?: RubricCriterion[];
     /** Free-text rubric for problems that predate criteria — soft guide only. */
     legacyRubric?: string[];
+    /** Chronological interviewer chat when validating with an active interview. */
+    interviewTranscript?: string;
   }) {
     const estimationText =
       input.estimation && Object.keys(input.estimation).length > 0
@@ -392,7 +394,8 @@ export class AiService {
     const promptText = buildValidationPrompt(input.difficulty, estimationText, {
       constraints: input.constraints,
       criteria: sortedCriteria,
-      legacyRubric: input.legacyRubric
+      legacyRubric: input.legacyRubric,
+      interviewTranscript: input.interviewTranscript
     });
 
     const contentParts: Array<{ type: "text"; text: string }> = [

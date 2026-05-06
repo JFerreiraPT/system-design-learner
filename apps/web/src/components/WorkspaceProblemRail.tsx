@@ -132,37 +132,58 @@ export function WorkspaceProblemRail({
           <p className="text-[12px] leading-snug text-fg-muted">{statement}</p>
 
           {criteriaProgress && criteriaProgress.hidden.total > 0 ? (
-            <div
-              className="flex items-center gap-2 rounded-md border border-violet-400/30 bg-violet-400/5 px-2 py-1 text-[11px] text-fg-muted"
-              title="Some expectations are hidden — ask clarifying questions to discover them. They're revealed in full after you Validate."
-            >
-              <span className="text-[10px] uppercase tracking-wider text-violet-600 dark:text-violet-400">
-                Discovery
-              </span>
-              <span className="tabular-nums">
-                {criteriaProgress.hidden.discovered} / {criteriaProgress.hidden.total} explored
-                {criteriaProgress.hidden.core > 0 ? (
-                  <span className="ml-1 text-fg-faint">
-                    ({criteriaProgress.hidden.coreDiscovered}/{criteriaProgress.hidden.core} core)
-                  </span>
-                ) : null}
-              </span>
-              <div className="ml-auto h-1 w-16 overflow-hidden rounded-full bg-surface-inset">
-                <div
-                  className="h-full rounded-full bg-gradient-to-r from-violet-400 to-fuchsia-400"
-                  style={{
-                    width: `${
-                      criteriaProgress.hidden.total === 0
-                        ? 0
-                        : Math.round(
-                            (criteriaProgress.hidden.discovered /
-                              criteriaProgress.hidden.total) *
-                              100
-                          )
-                    }%`
-                  }}
-                />
+            <div className="space-y-1.5 rounded-md border border-violet-400/30 bg-violet-400/5 px-2 py-1.5 text-[11px] text-fg-muted">
+              <div
+                className="flex items-center gap-2"
+                title="Some expectations start hidden — ask clarifying questions to surface them. Count updates as soon as each reply finishes."
+              >
+                <span className="text-[10px] uppercase tracking-wider text-violet-600 dark:text-violet-400">
+                  Discovery
+                </span>
+                <span className="tabular-nums">
+                  {criteriaProgress.hidden.discovered} / {criteriaProgress.hidden.total} explored
+                  {criteriaProgress.hidden.core > 0 ? (
+                    <span className="ml-1 text-fg-faint">
+                      ({criteriaProgress.hidden.coreDiscovered}/{criteriaProgress.hidden.core} core)
+                    </span>
+                  ) : null}
+                </span>
+                <div className="ml-auto h-1 w-16 shrink-0 overflow-hidden rounded-full bg-surface-inset">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-violet-400 to-fuchsia-400"
+                    style={{
+                      width: `${
+                        criteriaProgress.hidden.total === 0
+                          ? 0
+                          : Math.round(
+                              (criteriaProgress.hidden.discovered /
+                                criteriaProgress.hidden.total) *
+                                100
+                            )
+                      }%`
+                    }}
+                  />
+                </div>
               </div>
+              {criteriaProgress.surfacedHidden.length > 0 ? (
+                <div className="border-t border-violet-400/20 pt-1.5">
+                  <p className="mb-1 text-[10px] uppercase tracking-wider text-emerald-700 dark:text-emerald-400">
+                    Surfaced
+                  </p>
+                  <ul className="space-y-1 border-l-2 border-emerald-400/40 pl-2">
+                    {criteriaProgress.surfacedHidden.map((row) => (
+                      <li key={row.id} className="flex flex-wrap items-start gap-1.5 leading-snug">
+                        <span className="flex-1 break-words text-fg-muted">{row.text}</span>
+                        <span
+                          className={`shrink-0 rounded-full px-1.5 py-0 text-[9px] font-semibold ${IMPORTANCE_BADGE_CLASS[row.importance]}`}
+                        >
+                          {IMPORTANCE_LABEL[row.importance]}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
             </div>
           ) : null}
 

@@ -1,0 +1,3 @@
+# Run `docker compose up -d` from repo root (includes infra/docker-compose.yml).
+include:
+  - path: infra/docker-compose.yml

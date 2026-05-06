@@ -25,11 +25,13 @@ If ports are already used locally, keep defaults `POSTGRES_PORT=5433` and `REDIS
 
 ## Local dev (API + web on host, DB in Docker)
 
-1. `docker compose -f infra/docker-compose.yml up postgres redis -d`
-2. `cp .env.example .env` — use `DATABASE_URL` and `REDIS_URL` pointing at localhost (`REDIS_PORT` controls host mapping).
+1. `docker compose up postgres redis -d` (from repo root; uses `compose.yaml`, which includes `infra/docker-compose.yml`) — or `docker compose -f infra/docker-compose.yml up postgres redis -d`.
+2. `cp .env.example .env` — use `DATABASE_URL` and `REDIS_URL` pointing at localhost (`REDIS_PORT` controls host mapping). The API and Drizzle load this file from the **repo root** (not `apps/api/.env`).
 3. `pnpm install`
 4. `pnpm db:push` (or `pnpm db:migrate` after generate)
 5. `pnpm dev`
+
+If `db:push` reports **password authentication failed for user "sdl"**, you are usually connecting to the wrong Postgres (for example port **5432** on the host while Compose maps **5433**) or an old volume still has a different password. Fix `DATABASE_URL` to match `.env.example`, or reset the DB volume: `docker compose down -v` (destructive) then bring Postgres up again.
 
 ## Scripts
 
