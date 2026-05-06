@@ -1,5 +1,7 @@
 # System Design Learner
 
+<!-- Smoke task E -->
+
 Single-user platform to practice system design with an Excalidraw board, AI-generated problems, solution validation, AI interviewer, and a tutor chat.
 
 ## Stack
