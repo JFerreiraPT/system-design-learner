@@ -3,6 +3,14 @@
     "context7": {
       "command": "npx",
       "args": ["-y", "@upstash/context7-mcp"]
+    },
+    "io.github.github/github-mcp-server": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "ghcr.io/github/github-mcp-server:1.0.3"]
+    },
+    "io.github.wonderwhy-er/desktop-commander": {
+      "command": "npx",
+      "args": ["-y", "@wonderwhy-er/desktop-commander"]
     }
   }
 }

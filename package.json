@@ -6,9 +6,19 @@
     "dev": "turbo dev",
     "build": "turbo build",
     "lint": "turbo lint",
+    "typecheck": "turbo typecheck",
+    "test": "turbo test",
     "db:generate": "pnpm --filter @sdl/api db:generate",
     "db:migrate": "pnpm --filter @sdl/api db:migrate",
-    "db:push": "pnpm --filter @sdl/api db:push"
+    "db:push": "pnpm --filter @sdl/api db:push",
+    "agent:login": "bash scripts/agent-login.sh",
+    "agent:status": "bash scripts/agent-login.sh --status",
+    "agent:logout": "bash scripts/agent-login.sh --logout",
+    "task:start": "bash scripts/start.sh",
+    "task:run": "bash scripts/run-task.sh",
+    "task:status": "bash scripts/status-tasks.sh",
+    "task:cleanup": "bash scripts/cleanup-task.sh",
+    "task:labels": "bash scripts/gh-create-agent-labels.sh"
   },
   "devDependencies": {
     "turbo": "^2.3.3",

@@ -60,3 +60,7 @@ Desktop.ini
 # Drizzle generated SQL migrations (kept ignored to match existing repo convention;
 # consider tracking these so schema history lives in git).
 apps/api/drizzle/*.sql
+.agent-runs/
+.devcontainer/.env
+AGENTS.md
+apm_modules/

@@ -42,6 +42,39 @@ If `db:push` reports **password authentication failed for user "sdl"**, you are 
 | `pnpm db:generate` | Drizzle generate migrations |
 | `pnpm db:push` | Push schema to DB (dev) |
 | `pnpm db:migrate` | Run migrations |
+| `pnpm task:start` | Pick `agent-ready` issues and run them autonomously in parallel |
+| `pnpm task:run <N>` | Run a single issue by number (add `--bg` to background it) |
+| `pnpm task:status` | Show running task slots, branches, and last log line |
+| `pnpm task:cleanup <N>` | Tear down container, worktree, branch, and locks for issue N |
+| `pnpm agent:login` | One-time Cursor login inside a container (persists creds to `cursor-auth` volume) |
+| `pnpm agent:status` | Verify the persisted Cursor credentials are still valid |
+| `pnpm agent:logout` | Sign the persisted credentials out |
+
+## Autonomous task runner
+
+Fully local agent pipeline. Each task runs in its own Git worktree + isolated Docker Compose stack (Postgres + Redis per task). The headless `cursor-agent` inside the container authenticates via `CURSOR_API_KEY` — generated from your Cursor dashboard, uses the same quota as your existing subscription (no extra billing).
+
+```bash
+# One-time host setup
+# 1) Generate a user API key at https://cursor.com/dashboard/integrations (under "API Keys")
+# 2) Put it in .devcontainer/.env
+cp .devcontainer/.env.example .devcontainer/.env
+# edit .devcontainer/.env and set CURSOR_API_KEY=cursor_xxxxx
+gh auth login                     # GitHub CLI auth for issues + PRs
+pnpm task:labels                  # create the agent-ready / agent-in-progress / agent-blocked labels
+
+# Trigger autonomous work
+pnpm task:start                   # picks up to MAX_PARALLEL_TASKS open `agent-ready` issues
+pnpm task:start 12 14 19          # run a specific list of issue numbers in parallel
+pnpm task:start --max 2           # cap concurrency
+
+# Monitor / clean up
+pnpm task:status
+tail -f .agent-runs/issue-12/run.log
+pnpm task:cleanup 12              # only needed if a task hung
+```
+
+The runner picks each issue, creates `feat/issue-<N>` worktree, spins up a per-task `sdl-task-<N>` compose stack with private Postgres/Redis (no host port bindings), boots `cursor-agent --print --force --trust`, runs lint/typecheck/tests, and on green commits + pushes + opens a PR via `gh`. Concurrency is bounded by `MAX_PARALLEL_TASKS` (default `3`).
 
 ## Project layout
 
