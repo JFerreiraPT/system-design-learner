@@ -70,18 +70,24 @@ export function App() {
 
 function ThemeToggle() {
   const { theme, toggle } = useTheme();
-  const isDark = theme === "dark";
+  const label =
+    theme === "dark"
+      ? "Cycle theme: dark (next: light)"
+      : theme === "light"
+        ? "Cycle theme: light (next: summer)"
+        : "Cycle theme: summer (next: dark)";
   return (
-    <button
-      type="button"
-      onClick={toggle}
-      className="btn-icon"
-      aria-label={isDark ? "Switch to light theme" : "Switch to dark theme"}
-      title={isDark ? "Switch to light theme" : "Switch to dark theme"}
-    >
+    <button type="button" onClick={toggle} className="btn-icon" aria-label={label} title={label}>
       <span className="relative grid h-4 w-4 place-items-center">
-        <SunIcon className={`absolute transition ${isDark ? "scale-0 opacity-0 rotate-90" : "scale-100 opacity-100 rotate-0"}`} />
-        <MoonIcon className={`absolute transition ${isDark ? "scale-100 opacity-100 rotate-0" : "scale-0 opacity-0 -rotate-90"}`} />
+        <SunIcon
+          className={`absolute transition ${theme === "light" ? "scale-100 opacity-100 rotate-0" : "scale-0 opacity-0 rotate-90"}`}
+        />
+        <MoonIcon
+          className={`absolute transition ${theme === "dark" ? "scale-100 opacity-100 rotate-0" : "scale-0 opacity-0 -rotate-90"}`}
+        />
+        <SummerIcon
+          className={`absolute transition ${theme === "summer" ? "scale-100 opacity-100 rotate-0" : "scale-0 opacity-0 rotate-90"}`}
+        />
       </span>
     </button>
   );
@@ -127,6 +133,32 @@ function MoonIcon({ className = "" }: { className?: string }) {
       className={className}
     >
       <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+    </svg>
+  );
+}
+
+/** Sun over horizon — summer cycle step */
+function SummerIcon({ className = "" }: { className?: string }) {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={`text-amber-600 ${className}`}
+    >
+      <path d="M12 2v2" />
+      <path d="M12 16v2" />
+      <path d="m4.93 4.93 1.41 1.41" />
+      <path d="m17.66 17.66 1.41 1.41" />
+      <path d="M2 12h2" />
+      <path d="M20 12h2" />
+      <circle cx="12" cy="10" r="4" />
+      <path d="M3 20h18" />
     </svg>
   );
 }

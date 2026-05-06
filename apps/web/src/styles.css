@@ -49,6 +49,50 @@
   --ambient-3: rgba(34, 211, 238, 0.08);
 }
 
+/* Summer — bright warm daylight palette (still uses light Tailwind / non-dark UI) */
+html[data-theme="summer"] {
+  --bg: #fffbeb;
+  --bg-elevated: #fffdf5;
+  --text: #292524;
+  --text-muted: #78716c;
+  --text-faint: #a8a29e;
+
+  --surface: rgba(255, 253, 245, 0.82);
+  --surface-strong: rgba(255, 255, 255, 0.94);
+  --surface-inset: rgba(251, 191, 36, 0.08);
+
+  --border: rgba(180, 83, 9, 0.14);
+  --border-strong: rgba(180, 83, 9, 0.24);
+
+  --header-bg-from: rgba(255, 251, 235, 0.92);
+  --header-bg-to: rgba(254, 243, 199, 0.65);
+  --header-border: rgba(217, 119, 6, 0.12);
+
+  --shadow-panel:
+    0 1px 0 rgba(255, 255, 255, 0.85) inset,
+    0 18px 44px -22px rgba(217, 119, 6, 0.18),
+    0 0 0 1px rgba(251, 191, 36, 0.12);
+
+  --shadow-panel-strong:
+    0 1px 0 rgba(255, 255, 255, 0.95) inset,
+    0 26px 64px -28px rgba(234, 88, 12, 0.22);
+
+  --scroll-thumb: linear-gradient(
+    180deg,
+    rgba(251, 191, 36, 0.45),
+    rgba(249, 115, 22, 0.35)
+  );
+  --scroll-thumb-hover: linear-gradient(
+    180deg,
+    rgba(245, 158, 11, 0.65),
+    rgba(234, 88, 12, 0.5)
+  );
+
+  --ambient-1: rgba(251, 191, 36, 0.35);
+  --ambient-2: rgba(56, 189, 248, 0.14);
+  --ambient-3: rgba(251, 113, 133, 0.12);
+}
+
 .dark {
   --bg: #07070b;
   --bg-elevated: #0d0d14;

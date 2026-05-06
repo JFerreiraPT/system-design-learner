@@ -6,6 +6,8 @@
     "dev": "turbo dev",
     "build": "turbo build",
     "lint": "turbo lint",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
     "db:generate": "pnpm --filter @sdl/api db:generate",
     "db:migrate": "pnpm --filter @sdl/api db:migrate",
     "db:push": "pnpm --filter @sdl/api db:push"

@@ -1,0 +1,19 @@
+{
+  "issue": 1,
+  "title": "feat: Implement new theme",
+  "validation": {
+    "validateDoneCli": "not present in repository; equivalent gates executed manually",
+    "lintOk": true,
+    "typecheckOk": true,
+    "testsOk": true,
+    "webBuildOk": true,
+    "deterministicChecks": [
+      "pnpm lint (turbo)",
+      "pnpm typecheck (turbo)",
+      "pnpm test (turbo, vitest theme.test.ts)",
+      "pnpm --filter @sdl/web build"
+    ]
+  },
+  "confidence": 96,
+  "summary": "Summer theme added as third cycle step with CSS tokens, persistence, Excalidraw light mapping, and unit tests for theme helpers."
+}
