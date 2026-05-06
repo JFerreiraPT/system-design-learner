@@ -182,7 +182,9 @@ const ValidationSchema = z.object({
 });
 
 /** Stable structured-output settings for grading-related LLM calls. */
-const GRADING_OBJECT_SETTINGS = { temperature: 0, seed: 42 } as const;
+/** Structured grading calls: temperature 0 for steadier outputs. OpenAI models
+ * used here do not honor `seed` (AI SDK logs a warning if passed), so we omit it. */
+const GRADING_OBJECT_SETTINGS = { temperature: 0 } as const;
 
 /** Lenient model-side schema. The strict `RubricCriterionSchema` is enforced
  * AFTER a server-side repair pass — gpt-4o-mini regularly emits one of:
