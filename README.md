@@ -78,3 +78,5 @@ Each interview now generates a structured rubric of evaluation criteria scoped t
 - **Reveal**: after the candidate submits at least one validation, the full rubric (including hidden bodies) is shown in the Validate panel, with covered / missed / never-asked status per criterion.
 
 Out-of-scope dimensions return `null` instead of a fake middling 60 — the UI hides those bars rather than misleading the candidate into thinking they were graded on something irrelevant to the rubric.
+
+agent runner e2e ok
