@@ -1,0 +1,20 @@
+name: system-design-learner
+version: 0.1.0
+description: Local APM wiring for agent task runner
+dependencies:
+  apm:
+    - ./apm_modules/_local/monorepo-core
+    - ./apm_modules/_local/backend
+    - ./apm_modules/_local/frontend
+    - ./apm_modules/_local/devops
+compilation:
+  output: AGENTS.md
+  target: all
+  strategy: distributed
+  source_attribution: true
+  resolve_links: true
+  exclude:
+    - "apm_modules/**"
+    - "node_modules/**"
+    - "dist/**"
+    - ".agent-runs/**"
