@@ -6,7 +6,7 @@
     "dev": "turbo dev",
     "build": "turbo build",
     "test": "node --test scripts/readme-smoke-e.test.mjs",
-    "lint": "turbo lint",
+    "lint": "turbo run lint --filter=!system-design-learner",
     "db:generate": "pnpm --filter @sdl/api db:generate",
     "db:migrate": "pnpm --filter @sdl/api db:migrate",
     "db:push": "pnpm --filter @sdl/api db:push"

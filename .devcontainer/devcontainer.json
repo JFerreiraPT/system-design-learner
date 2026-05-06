@@ -1,0 +1,42 @@
+{
+  "name": "SDL Agent Worker",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspace",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "biomejs.biome",
+        "eamodio.gitlens",
+        "ms-vscode.vscode-typescript-next",
+        "ms-azuretools.vscode-docker",
+        "usernamehw.errorlens"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "editor.tabSize": 2,
+        "editor.rulers": [
+          80,
+          120
+        ],
+        "typescript.preferences.importModuleSpecifier": "relative",
+        "files.trimTrailingWhitespace": true,
+        "files.insertFinalNewline": true
+      }
+    }
+  },
+  "postCreateCommand": {
+    "deps": "pnpm install --frozen-lockfile || pnpm install",
+    "apm": "command -v apm >/dev/null 2>&1 && [ -f apm.yml ] && apm install && apm compile || echo 'APM skipped'",
+    "cursor-cli": "command -v cursor-agent >/dev/null 2>&1 || (mkdir -p /home/node/.local/share/cursor-agent && curl -fsSL https://cursor.com/install -o /tmp/cursor-install.sh && bash /tmp/cursor-install.sh) || echo 'cursor-agent install failed; install manually'"
+  },
+  "postStartCommand": "git fetch --all --prune 2>/dev/null || true",
+  "remoteUser": "node",
+  "runArgs": [
+    "--memory=4g",
+    "--cpus=2"
+  ]
+}

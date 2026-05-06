@@ -1,0 +1,68 @@
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+    user: root
+    env_file:
+      - .env
+    volumes:
+      - ..:/workspace:cached
+      - node-modules:/workspace/node_modules
+      - pnpm-store:/home/node/.local/share/pnpm/store
+      - turbo-cache:/workspace/.turbo
+      # Bind-mount the host repo's .git at the same absolute host path so the
+      # worktree's `.git` file pointer (`gitdir: <HOST_REPO_GIT_DIR>/worktrees/...`)
+      # resolves inside the container. Required for git/gh in agent-bootstrap.sh.
+      # The runner (scripts/run-task.sh) sets HOST_REPO_GIT_DIR via .devcontainer/.env.
+      - ${HOST_REPO_GIT_DIR:?HOST_REPO_GIT_DIR must be set (e.g. /abs/path/to/repo/.git); set it in .devcontainer/.env}:${HOST_REPO_GIT_DIR}:cached
+      # Each task gets its own ephemeral ~/.cursor so the agent CLI can
+      # write workspace state without colliding with sibling parallel runs.
+      # Auth comes from CURSOR_API_KEY (env) — no need to share OAuth state.
+    command: >
+      bash -lc "mkdir -p /workspace/node_modules /workspace/.turbo
+      /home/node/.local/share/pnpm/store /home/node/.local/share/cursor-agent
+      /home/node/.cursor;
+      chown -R node:node /workspace/node_modules /workspace/.turbo /home/node/.local /home/node/.cursor 2>/dev/null || true;
+      exec sleep infinity"
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://sdl:sdl@db:5432/sdl_dev
+      REDIS_URL: redis://redis:6379
+      GH_TOKEN: ${GITHUB_TOKEN:-}
+      CURSOR_API_KEY: ${CURSOR_API_KEY:-}
+      CURSOR_MODEL: ${CURSOR_MODEL:-auto}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sdl
+      POSTGRES_PASSWORD: sdl
+      POSTGRES_DB: sdl_dev
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sdl -d sdl_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+
+volumes:
+  node-modules:
+  pnpm-store:
+  turbo-cache:
+  postgres-data:
+  redis-data:
