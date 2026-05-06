@@ -1,13 +1,17 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
+import {
+  type Theme,
+  cycleTheme,
+  parseStoredTheme
+} from "./theme";
 
-export type Theme = "light" | "dark";
+export type { Theme } from "./theme";
 
 const KEY = "theme";
 
 function getStored(): Theme | null {
   if (typeof window === "undefined") return null;
-  const value = window.localStorage.getItem(KEY);
-  return value === "light" || value === "dark" ? value : null;
+  return parseStoredTheme(window.localStorage.getItem(KEY));
 }
 
 function getSystem(): Theme {
@@ -72,6 +76,6 @@ export function useTheme() {
     theme,
     mounted,
     setTheme,
-    toggle: () => setTheme(theme === "dark" ? "light" : "dark")
+    toggle: () => setTheme(cycleTheme(theme))
   };
 }

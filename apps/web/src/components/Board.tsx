@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef } from "react";
 import { Excalidraw, exportToBlob } from "@excalidraw/excalidraw";
 import { useWorkspaceStore } from "../lib/store";
+import { excalidrawAppearance } from "../lib/theme";
 import { useTheme } from "../lib/useTheme";
 
 /** Largest dimension (px) we send to the multimodal model. The Excalidraw scene
@@ -84,7 +85,7 @@ export function Board({ initialSceneJson }: Props) {
   return (
     <div className="h-[calc(100vh-112px)] min-h-[640px]">
       <Excalidraw
-        theme={theme}
+        theme={excalidrawAppearance(theme)}
         initialData={initialData}
         excalidrawAPI={(api) => {
           excalidrawRef.current = api;
