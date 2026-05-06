@@ -1,5 +1,6 @@
 {
   "$schema": "https://turbo.build/schema.json",
+  "cacheDir": ".turbo/cache",
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
@@ -10,6 +11,12 @@
       "persistent": true
     },
     "lint": {
+      "dependsOn": ["^build"]
+    },
+    "typecheck": {
+      "dependsOn": ["^build"]
+    },
+    "test": {
       "dependsOn": ["^build"]
     },
     "db:generate": {
