@@ -1,4 +1,13 @@
-import { Body, Controller, Get, Inject, NotFoundException, Param, Post } from "@nestjs/common";
+import {
+  Body,
+  Controller,
+  Get,
+  Inject,
+  NotFoundException,
+  Param,
+  Post,
+  Query
+} from "@nestjs/common";
 import { GenerateProblemDto } from "./problems.dto.js";
 import { ProblemsService } from "./problems.service.js";
 
@@ -16,9 +25,12 @@ export class ProblemsController {
     return this.problemsService.backfillTags();
   }
 
+  /** `?force=true` also refreshes problems that already have a spec — needed
+   * after the spec shape gains fields (units, expected magnitudes), since the
+   * default only fills in NULLs. */
   @Post("backfill-estimation-specs")
-  backfillEstimationSpecs() {
-    return this.problemsService.backfillEstimationSpecs();
+  backfillEstimationSpecs(@Query("force") force?: string) {
+    return this.problemsService.backfillEstimationSpecs({ force: force === "true" });
   }
 
   @Post("backfill-interview-plans")

@@ -154,11 +154,11 @@ export class ProblemsService {
     return { updated };
   }
 
-  async backfillEstimationSpecs() {
-    const rows = await this.db
-      .select()
-      .from(problems)
-      .where(isNull(problems.estimationSpecJson));
+  async backfillEstimationSpecs(options: { force?: boolean } = {}) {
+    const baseQuery = this.db.select().from(problems);
+    const rows = options.force
+      ? await baseQuery
+      : await baseQuery.where(isNull(problems.estimationSpecJson));
 
     let updated = 0;
     for (const row of rows) {

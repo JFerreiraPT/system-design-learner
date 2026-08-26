@@ -3,18 +3,22 @@ import type {
   ConstraintProposal,
   CriterionEvaluation,
   Difficulty,
+  FlagObservation,
   Importance,
   LiveConstraint,
   RubricCriterion,
+  ScoreBand,
   ScoreDimension
 } from "@sdl/shared";
 
 export type {
   ConstraintProposal,
   CriterionEvaluation,
+  FlagObservation,
   Importance,
   LiveConstraint,
   RubricCriterion,
+  ScoreBand,
   ScoreDimension
 } from "@sdl/shared";
 
@@ -58,6 +62,7 @@ export type FeedbackDimensions = {
   cost?: number | null;
   security?: number | null;
   operability?: number | null;
+  capacityEstimation?: number | null;
 };
 
 export type ValidationFeedback = {
@@ -69,6 +74,12 @@ export type ValidationFeedback = {
   /** Score for how much of the hidden scope the candidate surfaced via
    * clarifying questions or commitments. */
   discoveryScore?: number;
+  /** Which regime produced `designScore` — `rubric` (weighted criteria
+   * coverage) or the `dimensions` fallback. Absent on legacy rows. */
+  scoringMode?: "rubric" | "dimensions";
+  /** 1-4 band for the overall score, with the interview playbook's calibrated
+   * description (or a generic fallback). Absent on legacy rows. */
+  scoreBand?: { band: ScoreBand; label: string };
   dimensions?: FeedbackDimensions;
   dimensionNotes?: Record<string, string>;
   /** Per-criterion outcomes — present when the validator was given criteria. */
@@ -77,6 +88,9 @@ export type ValidationFeedback = {
   coreCovered?: string[];
   /** Convenience: criterion ids of importance="core" that the design missed. */
   coreMissed?: string[];
+  /** Playbook green/red flags judged against this attempt. Reported only —
+   * these never move the score. Absent when the interview has no playbook. */
+  flagObservations?: FlagObservation[];
   strengths?: string[];
   gaps?: string[];
   nextSteps?: string[];

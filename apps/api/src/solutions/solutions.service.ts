@@ -5,13 +5,28 @@ import {
   NotFoundException
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
-import type { Difficulty, LiveConstraint, RubricCriterion, ValidationDimensions } from "@sdl/shared";
-import { projectSceneJson } from "@sdl/shared";
+import type {
+  Difficulty,
+  InterviewerPlaybook,
+  LiveConstraint,
+  RubricCriterion,
+  ValidationDimensions
+} from "@sdl/shared";
+import { getRubricCriteria, getRubricPlaybook, projectSceneJson } from "@sdl/shared";
 import { and, asc, desc, eq } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import { AiService } from "../ai/ai.service.js";
 import { DB } from "../db/db.module.js";
 import { interviewMessages, interviews, problems, solutions } from "../db/schema.js";
+import { buildEstimationDigest } from "./estimationDigest.js";
+import { sanitizeFlagObservations } from "./flagObservations.js";
+import {
+  blendScore,
+  computeDesignScore,
+  computeDiscoveryScore,
+  estimateScoreFromDimensions,
+  resolveScoreBand
+} from "./scoring.js";
 
 /** Default 0-100 dimension scores used in stub/empty/error evaluations. We
  * use a low-but-not-null value (5) so the bar still renders, signalling
@@ -24,17 +39,14 @@ const DEFAULT_DIMENSIONS = {
   latencyPerformance: 5,
   cost: 5,
   security: 5,
-  operability: 5
+  operability: 5,
+  capacityEstimation: 5
 } as const satisfies ValidationDimensions;
 
 /** Default blend used when computing the overall score from designScore +
  * discoveryScore. Tunable via env so we can recalibrate without a redeploy
  * once we have feel for the scoring. */
 const DEFAULT_DESIGN_WEIGHT = 0.7;
-
-const SEVERITY_PENALTY = { high: 25, medium: 10, low: 0 } as const;
-
-const IMPORTANCE_WEIGHT = { core: 3, expected: 2, stretch: 1 } as const;
 
 /** Hard cap keeps validation prompts inside practical context limits. */
 const MAX_INTERVIEW_TRANSCRIPT_CHARS = 120_000;
@@ -70,6 +82,14 @@ type ValidatorLlmOutput = {
     covered: boolean;
     discovered: boolean;
     severity?: "high" | "medium" | "low";
+    evidence?: string;
+  }>;
+  flagObservations?: Array<{
+    areaId: string;
+    kind: "green" | "red";
+    index: number;
+    text?: string;
+    fired: boolean;
     evidence?: string;
   }>;
   strengths: string[];
@@ -117,15 +137,6 @@ function computeSolutionInputHash(input: {
   return createHash("sha1").update(JSON.stringify(payload)).digest("hex");
 }
 
-function estimateScoreFromDimensions(dimensions: ValidationDimensions | undefined): number {
-  if (!dimensions) return 0;
-  const values = Object.values(dimensions).filter(
-    (v): v is number => typeof v === "number" && v !== null
-  );
-  if (values.length === 0) return 0;
-  return Math.round(values.reduce((a, b) => a + b, 0) / values.length);
-}
-
 @Injectable()
 export class SolutionsService {
   private readonly designWeight: number;
@@ -154,6 +165,7 @@ export class SolutionsService {
 
     let scoringConstraints: string[] = problem.constraintsJson ?? [];
     let criteria: RubricCriterion[] | null = null;
+    let playbook: InterviewerPlaybook | null = null;
     let interviewTranscript: string | null = null;
 
     if (input.interviewId) {
@@ -171,7 +183,8 @@ export class SolutionsService {
       if (live) {
         scoringConstraints = live.filter((c) => c.status === "active").map((c) => c.text);
       }
-      criteria = (interview.criteriaJson as RubricCriterion[] | null) ?? null;
+      criteria = getRubricCriteria(interview.criteriaJson);
+      playbook = getRubricPlaybook(interview.criteriaJson);
 
       const msgRows = await this.db
         .select({
@@ -223,10 +236,15 @@ export class SolutionsService {
           constraints: scoringConstraints,
           criteria: criteria ?? undefined,
           legacyRubric: criteria ? undefined : (problem.evaluationRubricJson ?? []),
-          interviewTranscript: interviewTranscript ?? undefined
+          interviewTranscript: interviewTranscript ?? undefined,
+          playbook: playbook ?? undefined,
+          estimationDigest: buildEstimationDigest({
+            estimationSpecJson: problem.estimationSpecJson,
+            estimation: estimationNorm
+          })
         });
 
-    const evaluation = this.computeServerScores(rawEvaluation, criteria);
+    const evaluation = this.computeServerScores(rawEvaluation, criteria, playbook);
 
     const inserted = await this.db
       .insert(solutions)
@@ -246,81 +264,50 @@ export class SolutionsService {
 
   /**
    * Derives numeric scores and core coverage lists from per-criterion LLM
-   * judgments (deterministic).
+   * judgments (deterministic — the model is explicitly told not to score).
+   *
+   * `designScore` is a weighted COVERAGE RATIO, not a penalty subtraction, so
+   * a rubric with 14 criteria and one with 6 grade on the same scale. See
+   * `./scoring.js` for the formula and the partial-credit table.
    */
   private computeServerScores(
     raw: ValidatorLlmOutput & { score?: number; designScore?: number; discoveryScore?: number },
-    criteria: RubricCriterion[] | null
+    criteria: RubricCriterion[] | null,
+    playbook: InterviewerPlaybook | null = null
   ) {
-    const est = estimateScoreFromDimensions(raw.dimensions);
+    const dimensionEstimate = estimateScoreFromDimensions(raw.dimensions);
+    const discoveryScore = computeDiscoveryScore(criteria);
 
-    if (!criteria?.length || !raw.criteriaEvaluations?.length) {
-      const discoveryScore =
-        criteria?.length ?
-          (() => {
-            const hiddens = criteria.filter((c) => c.visibility === "hidden");
-            const totalHiddenWeight = hiddens.reduce(
-              (s, c) => s + IMPORTANCE_WEIGHT[c.importance],
-              0
-            );
-            if (totalHiddenWeight === 0) return 100;
-            const discoveredHiddenWeight = hiddens
-              .filter((c) => c.discoveredVia)
-              .reduce((s, c) => s + IMPORTANCE_WEIGHT[c.importance], 0);
-            return Math.round((discoveredHiddenWeight / totalHiddenWeight) * 100);
-          })()
-        : 100;
+    const { designScore, scoringMode, coreCovered, coreMissed } = computeDesignScore({
+      criteria,
+      evaluations: raw.criteriaEvaluations,
+      dimensionEstimate
+    });
 
-      const designScore = est;
+    // Stub evaluations (empty scene, unparseable model output) carry their own
+    // authoritative `score` — an empty board is a 0 regardless of what the
+    // placeholder dimension bars would average out to. Only the fallback path
+    // can produce one; the rubric path never sets `raw.score`.
+    const score =
+      scoringMode === "dimensions" && typeof raw.score === "number"
+        ? raw.score
+        : blendScore(designScore, discoveryScore, this.designWeight);
 
-      const score =
-        typeof raw.score === "number"
-          ? raw.score
-          : Math.round(this.designWeight * designScore + (1 - this.designWeight) * discoveryScore);
+    // Flags are descriptive only: they are resolved against the stored
+    // playbook and reported, but never fold into any of the numbers above.
+    const flagObservations = sanitizeFlagObservations(raw.flagObservations, playbook);
 
-      return {
-        ...raw,
-        designScore,
-        discoveryScore,
-        score,
-        coreCovered: [] as string[],
-        coreMissed: [] as string[]
-      };
-    }
-
-    const byId = new Map(criteria.map((c) => [c.id, c]));
-    let designPenalty = 0;
-    const coreCovered: string[] = [];
-    const coreMissed: string[] = [];
-
-    for (const ev of raw.criteriaEvaluations) {
-      const c = byId.get(ev.criterionId);
-      if (!c) continue;
-      if (!ev.covered) {
-        // Stretch criteria are bonus-only — never penalise design score for missing them.
-        if (c.importance === "stretch") continue;
-        const severity =
-          ev.severity ?? (c.importance === "core" ? ("high" as const) : ("medium" as const));
-        designPenalty += SEVERITY_PENALTY[severity];
-        if (c.importance === "core") coreMissed.push(c.id);
-      } else if (c.importance === "core") {
-        coreCovered.push(c.id);
-      }
-    }
-
-    const designScore = Math.max(0, 100 - designPenalty);
-
-    const hiddens = criteria.filter((c) => c.visibility === "hidden");
-    const totalHiddenWeight = hiddens.reduce((s, c) => s + IMPORTANCE_WEIGHT[c.importance], 0);
-    const discoveredHiddenWeight = hiddens
-      .filter((c) => c.discoveredVia)
-      .reduce((s, c) => s + IMPORTANCE_WEIGHT[c.importance], 0);
-    const discoveryScore =
-      totalHiddenWeight === 0 ? 100 : Math.round((discoveredHiddenWeight / totalHiddenWeight) * 100);
-
-    const score = Math.round(this.designWeight * designScore + (1 - this.designWeight) * discoveryScore);
-
-    return { ...raw, designScore, discoveryScore, score, coreCovered, coreMissed };
+    return {
+      ...raw,
+      designScore,
+      discoveryScore,
+      scoringMode,
+      score,
+      scoreBand: resolveScoreBand(score, playbook),
+      coreCovered,
+      coreMissed,
+      flagObservations
+    };
   }
 
   async listByProblem(problemId: string) {
@@ -374,6 +361,8 @@ export class SolutionsService {
     criteria?: RubricCriterion[];
     legacyRubric?: string[];
     interviewTranscript?: string;
+    playbook?: InterviewerPlaybook;
+    estimationDigest?: string;
   }) {
     try {
       return await this.aiService.validateSolution(input);

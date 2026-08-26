@@ -18,7 +18,8 @@ function formatDimensionsMarkdown(feedback: ValidationRecord["feedbackJson"]) {
     ["latencyPerformance", "Latency / performance"],
     ["cost", "Cost"],
     ["security", "Security"],
-    ["operability", "Operability"]
+    ["operability", "Operability"],
+    ["capacityEstimation", "Capacity estimation"]
   ] as const;
   // Hide null dimensions in the export — they signal "out of scope for this
   // rubric" and shouldn't surface as a fake "—" line in the report either.

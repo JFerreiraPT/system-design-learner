@@ -7,10 +7,12 @@ import { Board } from "../components/Board";
 import { ChatPanel } from "../components/ChatPanel";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { CriteriaReveal } from "../components/CriteriaReveal";
+import { FlagsPanel } from "../components/FlagsPanel";
 import {
   DesignDiscoverySubscores,
   DimensionBreakdown,
-  FeedbackMarkdownBody
+  FeedbackMarkdownBody,
+  ScoreBandCallout
 } from "../components/DimensionBreakdown";
 import {
   computeLegacyDerivedEstimation,
@@ -855,6 +857,10 @@ export function WorkspacePage() {
                       </p>
                       <ScorePill score={latestValidation.score} />
                     </div>
+                    <ScoreBandCallout
+                      feedback={latestValidation.feedbackJson}
+                      className="mb-3"
+                    />
                     <DesignDiscoverySubscores
                       feedback={latestValidation.feedbackJson}
                       className="mb-3"
@@ -874,6 +880,14 @@ export function WorkspacePage() {
                           criteria={criteriaRevealQuery.data.criteria}
                           feedback={latestValidation.feedbackJson}
                         />
+                      </div>
+                    ) : null}
+                    {(latestValidation.feedbackJson?.flagObservations ?? []).length > 0 ? (
+                      <div className="mt-4 border-t border-line/60 pt-3">
+                        <p className="mb-2 text-[10px] uppercase tracking-[0.18em] text-fg-faint">
+                          Observed signals
+                        </p>
+                        <FlagsPanel feedback={latestValidation.feedbackJson} />
                       </div>
                     ) : null}
                   </div>

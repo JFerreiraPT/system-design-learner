@@ -25,8 +25,6 @@ Use this skill before commit/PR.
 
 ### LLM assessment (30 points total)
 
-Requires `OPENAI_API_KEY`.
-
 - 15: diff satisfies issue acceptance criteria.
 - 15: diff scope remains focused to requested task.
 

@@ -10,11 +10,15 @@ import {
   buildProblemPrompt,
   buildReferenceSolutionPrompt,
   buildValidationPrompt,
+  ESTIMATION_DERIVED_FORMULA_RULES,
+  ESTIMATION_FIELD_RULES,
   TAG_VOCABULARY_SNIPPET,
   tutorSystemPrompt
 } from "@sdl/ai-prompts";
 import type {
   Difficulty,
+  InterviewerPlaybook,
+  InterviewRubric,
   InterviewerLevel,
   PhaseRuntimeInfo,
   RubricCriterion,
@@ -22,7 +26,9 @@ import type {
 } from "@sdl/shared";
 import {
   EstimationProblemSpecSchema,
+  InterviewerPlaybookSchema,
   InterviewPlanSchema,
+  normalizeEstimationSpec,
   RubricCriterionSchema
 } from "@sdl/shared";
 
@@ -161,7 +167,8 @@ const ValidationDimensionsSchema = z.object({
   latencyPerformance: dimensionScore,
   cost: dimensionScore,
   security: dimensionScore,
-  operability: dimensionScore
+  operability: dimensionScore,
+  capacityEstimation: dimensionScore
 });
 
 const CriterionEvaluationSchema = z.object({
@@ -172,10 +179,23 @@ const CriterionEvaluationSchema = z.object({
   evidence: z.string().max(500).optional()
 });
 
+/** Model-side flag verdict. Loose on purpose: `text` is echoed back by the
+ * model but the server overwrites it from the stored playbook, and unresolved
+ * addresses are dropped (see `sanitizeFlagObservations`). */
+const FlagObservationOutputSchema = z.object({
+  areaId: z.string(),
+  kind: z.enum(["green", "red"]),
+  index: z.number().int().nonnegative(),
+  text: z.string().optional(),
+  fired: z.boolean(),
+  evidence: z.string().optional()
+});
+
 const ValidationSchema = z.object({
   dimensions: ValidationDimensionsSchema,
   dimensionNotes: z.record(z.string(), z.string()).optional(),
   criteriaEvaluations: z.array(CriterionEvaluationSchema).optional(),
+  flagObservations: z.array(FlagObservationOutputSchema).optional(),
   strengths: z.array(z.string()),
   gaps: z.array(z.string()),
   nextSteps: z.array(z.string())
@@ -201,12 +221,35 @@ const LooseRubricCriterionSchema = z.object({
   importance: z.string().min(1).max(60),
   visibility: z.string().min(1).max(60),
   discoveryHints: z.array(z.string()).max(12).optional(),
+  progressiveNudges: z.array(z.string()).max(6).optional(),
   satisfiedBy: z.array(z.string()).max(12).optional(),
   scaleNote: z.string().max(1000).optional()
 });
 
-const GeneratedCriteriaSchema = z.object({
-  criteria: z.array(LooseRubricCriterionSchema).min(3).max(20)
+const LoosePlaybookAreaSchema = z.object({
+  id: z.string().min(1).max(200),
+  label: z.string().min(1).max(200),
+  phaseRefs: z.array(z.string()).max(12),
+  criterionRefs: z.array(z.string()).max(12),
+  sampleQuestions: z.array(z.string()).max(8),
+  progressiveNudges: z.array(z.string()).max(8),
+  greenFlags: z.array(z.string()).max(10),
+  redFlags: z.array(z.string()).max(10)
+});
+
+const LoosePlaybookSchema = z.object({
+  areasToProbe: z.array(LoosePlaybookAreaSchema).min(1).max(16),
+  scoreRubric: z.object({
+    "1": z.string().min(1).max(1200),
+    "2": z.string().min(1).max(1200),
+    "3": z.string().min(1).max(1200),
+    "4": z.string().min(1).max(1200)
+  })
+});
+
+const GeneratedRubricSchema = z.object({
+  criteria: z.array(LooseRubricCriterionSchema).min(3).max(20),
+  playbook: LoosePlaybookSchema
 });
 
 const SCORE_DIMENSIONS = [
@@ -254,6 +297,17 @@ const DIMENSION_ALIASES: Record<string, ScoreDim> = {
   maintainability: "operability"
 };
 
+function toSnakeSlug(raw: string, fallback: string, maxLen = 80): string {
+  const slug = raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .replace(/^[^a-z]/, "c_$&")
+    .slice(0, maxLen);
+  return slug.length > 0 ? slug : fallback;
+}
+
 /** Coerce a possibly-loose LLM criterion into the strict schema. Any
  * unrecoverable shape returns `null` and the caller drops the entry. */
 function repairCriterion(
@@ -285,13 +339,8 @@ function repairCriterion(
       ? (dimensionKey as ScoreDim)
       : "requirements";
 
-  const baseSlug = raw.id
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .replace(/^[^a-z]/, "c_$&");
-  let slug = baseSlug.length > 0 ? baseSlug.slice(0, 80) : `criterion_${index + 1}`;
+  const baseSlug = toSnakeSlug(raw.id, `criterion_${index + 1}`);
+  let slug = baseSlug;
   if (used.has(slug)) {
     let n = 2;
     while (used.has(`${slug}_${n}`) && n < 100) n += 1;
@@ -314,11 +363,150 @@ function repairCriterion(
     importance,
     visibility,
     discoveryHints: truncStrings(raw.discoveryHints),
+    progressiveNudges:
+      raw.progressiveNudges && raw.progressiveNudges.length > 0
+        ? normalizeThreeNudges(raw.progressiveNudges, [
+            `What assumption would help validate ${text}?`,
+            `Where should the design show ${text}?`,
+            `Make ${text} explicit before moving on.`
+          ])
+        : undefined,
     satisfiedBy: truncStrings(raw.satisfiedBy),
     scaleNote: raw.scaleNote ? raw.scaleNote.trim().slice(0, 300) : undefined
   };
   const parsed = RubricCriterionSchema.safeParse(candidate);
   return parsed.success ? parsed.data : null;
+}
+
+function normalizeThreeNudges(
+  raw: string[],
+  fallback: [string, string, string]
+): [string, string, string] {
+  const cleaned = raw.map((s) => s.trim().slice(0, 240)).filter((s) => s.length >= 4);
+  return [
+    cleaned[0] ?? fallback[0],
+    cleaned[1] ?? fallback[1],
+    cleaned[2] ?? fallback[2]
+  ];
+}
+
+function truncateList(xs: string[], maxLen: number, maxCount: number, fallback: string): string[] {
+  const cleaned = xs.map((s) => s.trim().slice(0, maxLen)).filter((s) => s.length >= 4);
+  return cleaned.length > 0 ? cleaned.slice(0, maxCount) : [fallback];
+}
+
+export function sanitizeGeneratedPlaybook(input: {
+  raw: z.infer<typeof LoosePlaybookSchema>;
+  criteria: RubricCriterion[];
+  phases: Array<{ id: string; label: string }>;
+}): InterviewerPlaybook {
+  const criterionIds = new Set(input.criteria.map((c) => c.id));
+  const phaseIds = new Set(input.phases.map((p) => p.id));
+  const fallbackPhaseId = input.phases[0]?.id ?? "clarify";
+  const fallbackCriterionId = input.criteria[0]?.id ?? "requirements";
+
+  const used = new Set<string>();
+  const areas = input.raw.areasToProbe
+    .map((area, index) => {
+      const baseSlug = toSnakeSlug(area.id, `probe_area_${index + 1}`);
+      let slug = baseSlug;
+      if (used.has(slug)) {
+        let n = 2;
+        while (used.has(`${slug}_${n}`) && n < 100) n += 1;
+        slug = `${slug}_${n}`;
+      }
+      used.add(slug);
+
+      const phaseRefs = area.phaseRefs.filter((id) => phaseIds.has(id)).slice(0, 8);
+      const criterionRefs = area.criterionRefs.filter((id) => criterionIds.has(id)).slice(0, 8);
+
+      return {
+        id: slug,
+        label: area.label.trim().slice(0, 80) || `Probe area ${index + 1}`,
+        phaseRefs: phaseRefs.length > 0 ? phaseRefs : [fallbackPhaseId],
+        criterionRefs: criterionRefs.length > 0 ? criterionRefs : [fallbackCriterionId],
+        sampleQuestions: truncateList(
+          area.sampleQuestions,
+          240,
+          4,
+          "What trade-off would you like to validate before locking this part of the design?"
+        ),
+        progressiveNudges: normalizeThreeNudges(area.progressiveNudges, [
+          "What assumption matters most before you choose this design?",
+          "Which requirement would break this approach first at the target scale?",
+          "Make a concrete call here and justify the trade-off."
+        ]),
+        greenFlags: truncateList(
+          area.greenFlags,
+          220,
+          6,
+          "Names a concrete trade-off and ties it to the problem constraints."
+        ),
+        redFlags: truncateList(
+          area.redFlags,
+          220,
+          6,
+          "Lists technology choices without connecting them to requirements."
+        )
+      };
+    })
+    .slice(0, 12);
+
+  const candidate = {
+    areasToProbe:
+      areas.length > 0
+        ? areas
+        : [
+            {
+              id: "core_requirements",
+              label: "Core Requirements",
+              phaseRefs: [fallbackPhaseId],
+              criterionRefs: [fallbackCriterionId],
+              sampleQuestions: ["What are the core user flows and constraints for v1?"],
+              progressiveNudges: normalizeThreeNudges([], [
+                "Start by clarifying the users and must-have flows.",
+                "Which requirement changes your architecture most?",
+                "State the v1 scope explicitly before drawing more components."
+              ]),
+              greenFlags: ["Clarifies scope before choosing architecture."],
+              redFlags: ["Jumps into components without clarifying requirements."]
+            }
+          ],
+    scoreRubric: {
+      "1": input.raw.scoreRubric["1"].trim().slice(0, 400),
+      "2": input.raw.scoreRubric["2"].trim().slice(0, 400),
+      "3": input.raw.scoreRubric["3"].trim().slice(0, 400),
+      "4": input.raw.scoreRubric["4"].trim().slice(0, 400)
+    }
+  };
+
+  const parsed = InterviewerPlaybookSchema.safeParse(candidate);
+  if (parsed.success) return parsed.data;
+
+  return {
+    areasToProbe: [
+      {
+        id: "core_requirements",
+        label: "Core Requirements",
+        phaseRefs: [fallbackPhaseId],
+        criterionRefs: [fallbackCriterionId],
+        sampleQuestions: ["What are the core user flows and constraints for v1?"],
+        progressiveNudges: [
+          "Start by clarifying the users and must-have flows.",
+          "Which requirement changes your architecture most?",
+          "State the v1 scope explicitly before drawing more components."
+        ],
+        greenFlags: ["Clarifies scope before choosing architecture."],
+        redFlags: ["Jumps into components without clarifying requirements."]
+      }
+    ],
+    scoreRubric: {
+      "1": "Cannot structure the design or gather requirements.",
+      "2": "Covers basics but misses important constraints or trade-offs.",
+      "3": "Meets the bar with a clear design and justified decisions.",
+      "4": "Exceeds the bar by driving scope, trade-offs, and operational readiness."
+    }
+  };
 }
 
 const DiscoveryMatchSchema = z.object({
@@ -368,7 +556,13 @@ export class AiService {
       prompt: buildProblemPrompt(input.difficulty, input.topic, input.existingProblems)
     });
 
-    return result.object;
+    // Drop incoherent unit/magnitude metadata before it is persisted, so a
+    // model slip degrades one field to "no calibration" instead of shipping a
+    // band that would mark correct answers wrong.
+    return {
+      ...result.object,
+      estimationSpec: normalizeEstimationSpec(result.object.estimationSpec)
+    };
   }
 
   async validateSolution(input: {
@@ -384,11 +578,20 @@ export class AiService {
     legacyRubric?: string[];
     /** Chronological interviewer chat when validating with an active interview. */
     interviewTranscript?: string;
+    /** Interview playbook, when present — supplies the green/red flags the
+     * validator judges as fired or not. */
+    playbook?: InterviewerPlaybook;
+    /** Deterministic calibration summary built by the solutions service. When
+     * present it REPLACES the raw estimation dump — the model should be told
+     * facts about the numbers, not asked to infer them. */
+    estimationDigest?: string;
   }) {
     const estimationText =
-      input.estimation && Object.keys(input.estimation).length > 0
-        ? `\nCandidate back-of-envelope estimation (JSON):\n${JSON.stringify(input.estimation, null, 2)}`
-        : "";
+      input.estimationDigest && input.estimationDigest.trim().length > 0
+        ? input.estimationDigest
+        : input.estimation && Object.keys(input.estimation).length > 0
+          ? `\nCandidate back-of-envelope estimation (JSON):\n${JSON.stringify(input.estimation, null, 2)}`
+          : "";
     const sortedCriteria = input.criteria
       ? [...input.criteria].sort((a, b) => a.id.localeCompare(b.id))
       : undefined;
@@ -397,7 +600,8 @@ export class AiService {
       constraints: input.constraints,
       criteria: sortedCriteria,
       legacyRubric: input.legacyRubric,
-      interviewTranscript: input.interviewTranscript
+      interviewTranscript: input.interviewTranscript,
+      playbook: input.playbook
     });
 
     const contentParts: Array<{ type: "text"; text: string }> = [
@@ -425,6 +629,7 @@ export class AiService {
     title: string;
     statement: string;
     seedConstraints: string[];
+    phases: Array<{ id: string; label: string }>;
     existingCriteria?: Array<{
       id: string;
       text: string;
@@ -434,13 +639,14 @@ export class AiService {
     /** If set, prepended to the prompt as a hard correction (used by the
      * server-side retry when the first attempt produced too few hiddens). */
     regenerationReason?: string;
-  }): Promise<RubricCriterion[]> {
+  }): Promise<InterviewRubric> {
     const prompt = buildCriteriaPrompt({
       difficulty: input.difficulty,
       interviewerLevel: input.interviewerLevel,
       title: input.title,
       statement: input.statement,
       seedConstraints: input.seedConstraints,
+      phases: input.phases,
       existingCriteria: input.existingCriteria,
       regenerationReason: input.regenerationReason
     });
@@ -451,7 +657,7 @@ export class AiService {
     const callModel = () =>
       generateObject({
         model: this.openai("gpt-4o-mini"),
-        schema: GeneratedCriteriaSchema,
+        schema: GeneratedRubricSchema,
         prompt
       });
 
@@ -476,7 +682,14 @@ export class AiService {
         "generateCriteria: every emitted criterion failed strict validation after repair"
       );
     }
-    return repaired;
+    return {
+      criteria: repaired,
+      playbook: sanitizeGeneratedPlaybook({
+        raw: result.object.playbook,
+        criteria: repaired,
+        phases: input.phases
+      })
+    };
   }
 
   /** After each interview turn, detect which undiscovered hidden criteria
@@ -555,12 +768,14 @@ ${input.statement}`
         "Constraints:",
         constraintsBlock,
         "",
-        "Return JSON with intro (optional), fields (4-10), derivedHints (3-6):",
-        "- fields: key snake_case, label, type number|text, optional placeholder/hint/unit",
-        "- derivedHints: sanity-check bullets for magnitudes from those fields"
+        "Return JSON with intro (optional), fields (4-10), derivedHints (3-6), derivedFormulas (2-4):",
+        "- fields, each:",
+        ESTIMATION_FIELD_RULES,
+        "- derivedHints: qualitative sanity-check bullets for magnitudes from those fields",
+        ESTIMATION_DERIVED_FORMULA_RULES
       ].join("\n")
     });
-    return result.object;
+    return normalizeEstimationSpec(result.object);
   }
 
   /** After the interviewer's streamed reply, derive a small set of proposals
@@ -692,6 +907,9 @@ ${input.statement}`
     /** Per-interview criteria used to coach (per-level rules) and to anchor
      * probes on undiscovered hiddens. Optional for legacy interviews. */
     criteria?: RubricCriterion[];
+    /** Private interviewer guide generated alongside the criteria. */
+    playbook?: InterviewerPlaybook;
+    currentPhaseId?: string;
     /** IDs of criteria already discovered; the prompt only nudges toward
      * the complement of this set. */
     discoveredCriterionIds?: string[];
@@ -711,6 +929,8 @@ ${input.statement}`
 
     const systemPrompt = buildInterviewerPrompt(args.interviewerLevel, {
       criteria: args.criteria,
+      playbook: args.playbook,
+      currentPhaseId: args.currentPhaseId,
       discoveredCriterionIds: args.discoveredCriterionIds
     });
 

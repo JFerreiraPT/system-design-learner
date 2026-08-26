@@ -15,7 +15,8 @@ export const DIM_KEYS: Array<keyof FeedbackDimensions> = [
   "latencyPerformance",
   "cost",
   "security",
-  "operability"
+  "operability",
+  "capacityEstimation"
 ];
 
 export const DIM_LABELS: Record<string, string> = {
@@ -26,7 +27,8 @@ export const DIM_LABELS: Record<string, string> = {
   latencyPerformance: "Latency",
   cost: "Cost",
   security: "Security",
-  operability: "Ops"
+  operability: "Ops",
+  capacityEstimation: "Capacity"
 };
 
 export function aggregateWeakDimensions(rows: ValidationRecord[], topN = 3) {

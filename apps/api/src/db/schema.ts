@@ -1,4 +1,4 @@
-import type { ConstraintProposal, LiveConstraint, RubricCriterion } from "@sdl/shared";
+import type { ConstraintProposal, LiveConstraint, StoredInterviewRubric } from "@sdl/shared";
 import { pgTable, text, timestamp, uuid, boolean, jsonb, integer } from "drizzle-orm/pg-core";
 
 export const problems = pgTable("problems", {
@@ -52,7 +52,7 @@ export const interviews = pgTable("interviews", {
    * `discoveredVia` as the conversation progresses. Null on legacy rows
    * that started before this column existed — services treat null as
    * "no per-interview criteria; fall back to legacy rubric strings". */
-  criteriaJson: jsonb("criteria_json").$type<RubricCriterion[] | null>().default(null),
+  criteriaJson: jsonb("criteria_json").$type<StoredInterviewRubric>().default(null),
   startedAt: timestamp("started_at", { withTimezone: true }).defaultNow().notNull(),
   endedAt: timestamp("ended_at", { withTimezone: true })
 });

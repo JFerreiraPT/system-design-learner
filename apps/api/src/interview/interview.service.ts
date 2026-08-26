@@ -1,15 +1,22 @@
 import { createHash, randomUUID } from "node:crypto";
 import { ForbiddenException, Inject, Injectable, NotFoundException } from "@nestjs/common";
 import { and, asc, desc, eq, isNotNull, isNull } from "drizzle-orm";
-import { buildInterviewerWelcome, getCriteriaHiddenMin } from "@sdl/ai-prompts";
+import {
+  buildInterviewerWelcome,
+  getCriteriaHiddenMin,
+  hasEstimationPhase
+} from "@sdl/ai-prompts";
 import {
   DEFAULT_INTERVIEW_PLAN,
+  getRubricCriteria,
+  getRubricPlaybook,
   InterviewPlanSchema,
   LiveConstraintSchema
 } from "@sdl/shared";
 import type {
   ConstraintProposal,
   Difficulty,
+  InterviewRubric,
   InterviewerLevel,
   LiveConstraint,
   PhaseRuntimeInfo,
@@ -66,6 +73,9 @@ export class InterviewService {
     if (!rows[0]) throw new NotFoundException("Problem not found");
 
     const problem = rows[0];
+    const planRaw = problem.interviewPlanJson;
+    const planParsed = InterviewPlanSchema.safeParse(planRaw);
+    const plan = planParsed.success ? planParsed.data : DEFAULT_INTERVIEW_PLAN;
     const seedConstraints: LiveConstraint[] = (problem.constraintsJson ?? []).map(
       (text: string) => ({
         id: randomUUID(),
@@ -85,7 +95,8 @@ export class InterviewService {
       problemStatement: problem.statement,
       difficulty: problem.difficulty as Difficulty,
       interviewerLevel: input.interviewerLevel,
-      seedConstraints: problem.constraintsJson ?? []
+      seedConstraints: problem.constraintsJson ?? [],
+      phases: plan.phases.map((p) => ({ id: p.id, label: p.label }))
     });
 
     const inserted = await this.db
@@ -101,9 +112,6 @@ export class InterviewService {
       .returning();
 
     const session = inserted[0];
-    const planRaw = problem.interviewPlanJson;
-    const planParsed = InterviewPlanSchema.safeParse(planRaw);
-    const plan = planParsed.success ? planParsed.data : DEFAULT_INTERVIEW_PLAN;
     const welcome = buildInterviewerWelcome(problem.title, plan);
     await this.db.insert(interviewMessages).values({
       interviewId: session.id,
@@ -124,7 +132,8 @@ export class InterviewService {
     difficulty: Difficulty;
     interviewerLevel: InterviewerLevel;
     seedConstraints: string[];
-  }): Promise<RubricCriterion[] | null> {
+    phases: Array<{ id: string; label: string }>;
+  }): Promise<InterviewRubric | null> {
     try {
       const existingCriteria = await this.collectExistingCriteriaForProblem(input.problemId);
       const baseInput = {
@@ -133,6 +142,7 @@ export class InterviewService {
         difficulty: input.difficulty,
         interviewerLevel: input.interviewerLevel,
         seedConstraints: input.seedConstraints,
+        phases: input.phases,
         existingCriteria: existingCriteria.length > 0 ? existingCriteria : undefined
       };
 
@@ -142,7 +152,7 @@ export class InterviewService {
       // Safety net: if the model under-delivered on the discovery floor,
       // retry exactly once with an explicit correction. Without this, prompt
       // wording alone is sometimes ignored under structured-output schemas.
-      const hiddenCount = generated.filter((c) => c.visibility === "hidden").length;
+      const hiddenCount = generated.criteria.filter((c) => c.visibility === "hidden").length;
       if (hiddenCount < hiddenMin) {
         generated = await this.aiService.generateCriteria({
           ...baseInput,
@@ -150,15 +160,23 @@ export class InterviewService {
         });
       }
 
+      // Same shape of safety net for estimation: if the plan sets aside a
+      // phase for capacity work, the rubric has to grade it, or that phase
+      // costs the candidate nothing and the Estimation tab stays decorative.
+      generated = await this.ensureCapacityCriterion(baseInput, generated, input.phases);
+
       // Pre-mark `visible` criteria as discovered (origin=seed) so the rail's
       // discovery indicator doesn't claim the candidate needs to "find"
       // things they can already read on the Problem rail.
       const now = new Date().toISOString();
-      return generated.map((c) =>
-        c.visibility === "visible" && !c.discoveredVia
-          ? { ...c, discoveredVia: { kind: "seed" as const, at: now } }
-          : c
-      );
+      return {
+        ...generated,
+        criteria: generated.criteria.map((c) =>
+          c.visibility === "visible" && !c.discoveredVia
+            ? { ...c, discoveredVia: { kind: "seed" as const, at: now } }
+            : c
+        )
+      };
     } catch (err) {
       const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
       console.error("[generateCriteriaSafely] LLM failure:", msg);
@@ -172,6 +190,31 @@ export class InterviewService {
       }
       return null;
     }
+  }
+
+  /** One-shot retry when the rubric skipped `capacityEstimation` on a problem
+   * whose plan has an estimation phase. Mirrors the hidden-floor retry: one
+   * correction attempt, then accept whatever came back rather than blocking
+   * the interview on rubric perfection. */
+  private async ensureCapacityCriterion(
+    baseInput: Parameters<AiService["generateCriteria"]>[0],
+    generated: InterviewRubric,
+    phases: Array<{ id: string; label: string }>
+  ): Promise<InterviewRubric> {
+    if (!hasEstimationPhase(phases)) return generated;
+    if (generated.criteria.some((c) => c.dimension === "capacityEstimation")) return generated;
+
+    const retried = await this.aiService.generateCriteria({
+      ...baseInput,
+      regenerationReason:
+        'Your previous attempt contained no criterion with dimension="capacityEstimation", but this problem\'s interview plan includes an estimation phase. Generate a fresh rubric with at least one criterion on that dimension, whose satisfiedBy bullets name the concrete quantities the candidate must estimate.'
+    });
+
+    // Only take the retry if it actually fixed the gap — otherwise the first
+    // attempt is at least known to satisfy the hidden-criteria floor.
+    return retried.criteria.some((c) => c.dimension === "capacityEstimation")
+      ? retried
+      : generated;
   }
 
   /** Flatten criteria from prior interviews on the same problem (dedupe by id, cap 50).
@@ -200,7 +243,7 @@ export class InterviewService {
       { text: string; visibility: "visible" | "hidden"; importance: "core" | "expected" | "stretch" }
     >();
     for (const row of rows) {
-      const list = row.criteriaJson as RubricCriterion[] | null;
+      const list = getRubricCriteria(row.criteriaJson);
       if (!Array.isArray(list)) continue;
       for (const c of list) {
         if (c?.id && c?.text && !byId.has(c.id)) {
@@ -270,7 +313,8 @@ export class InterviewService {
 
     // Pass per-interview criteria into the interviewer prompt so the
     // per-level coaching rules can nudge toward undiscovered hiddens.
-    const criteria = (session.criteriaJson as RubricCriterion[] | null) ?? undefined;
+    const criteria = getRubricCriteria(session.criteriaJson) ?? undefined;
+    const playbook = getRubricPlaybook(session.criteriaJson) ?? undefined;
     const discoveredCriterionIds = criteria
       ? criteria.filter((c) => c.discoveredVia).map((c) => c.id)
       : undefined;
@@ -283,6 +327,8 @@ export class InterviewService {
       workspaceContext: augmentedContext,
       sceneUnchanged,
       criteria,
+      playbook,
+      currentPhaseId: workspaceContext?.phase?.id,
       discoveredCriterionIds
     });
 
@@ -443,8 +489,7 @@ export class InterviewService {
     const sessionRows = await this.db.select().from(interviews).where(eq(interviews.id, interviewId));
     const session = sessionRows[0];
     if (!session) throw new NotFoundException("Interview not found");
-    const criteria: RubricCriterion[] | null =
-      (session.criteriaJson as RubricCriterion[] | null) ?? null;
+    const criteria: RubricCriterion[] | null = getRubricCriteria(session.criteriaJson);
     if (!criteria) return { criteria: null };
 
     const totals = { total: criteria.length, core: 0, expected: 0, stretch: 0 };
@@ -492,8 +537,7 @@ export class InterviewService {
       );
     }
 
-    const criteria: RubricCriterion[] | null =
-      (session.criteriaJson as RubricCriterion[] | null) ?? null;
+    const criteria: RubricCriterion[] | null = getRubricCriteria(session.criteriaJson);
     return { criteria };
   }
 
@@ -504,7 +548,7 @@ export class InterviewService {
     const sessionRows = await this.db.select().from(interviews).where(eq(interviews.id, interviewId));
     const session = sessionRows[0];
     if (!session) return null;
-    return (session.criteriaJson as RubricCriterion[] | null) ?? null;
+    return getRubricCriteria(session.criteriaJson);
   }
 
   /** Bulk backfill: generate criteria for every active interview that
@@ -525,13 +569,16 @@ export class InterviewService {
         skipped += 1;
         continue;
       }
+      const planParsed = InterviewPlanSchema.safeParse(problem.interviewPlanJson);
+      const plan = planParsed.success ? planParsed.data : DEFAULT_INTERVIEW_PLAN;
       const criteria = await this.generateCriteriaSafely({
         problemId: row.problemId,
         problemTitle: problem.title,
         problemStatement: problem.statement,
         difficulty: problem.difficulty as Difficulty,
         interviewerLevel: row.interviewerLevel as InterviewerLevel,
-        seedConstraints: problem.constraintsJson ?? []
+        seedConstraints: problem.constraintsJson ?? [],
+        phases: plan.phases.map((p) => ({ id: p.id, label: p.label }))
       });
       if (!criteria) {
         skipped += 1;
@@ -559,6 +606,8 @@ export class InterviewService {
     const problemRows = await this.db.select().from(problems).where(eq(problems.id, session.problemId));
     const problem = problemRows[0];
     if (!problem) throw new NotFoundException("Problem not found");
+    const planParsed = InterviewPlanSchema.safeParse(problem.interviewPlanJson);
+    const plan = planParsed.success ? planParsed.data : DEFAULT_INTERVIEW_PLAN;
 
     const criteria = await this.generateCriteriaSafely({
       problemId: session.problemId,
@@ -566,7 +615,8 @@ export class InterviewService {
       problemStatement: problem.statement,
       difficulty: problem.difficulty as Difficulty,
       interviewerLevel: session.interviewerLevel as InterviewerLevel,
-      seedConstraints: problem.constraintsJson ?? []
+      seedConstraints: problem.constraintsJson ?? [],
+      phases: plan.phases.map((p) => ({ id: p.id, label: p.label }))
     });
 
     await this.db
@@ -574,7 +624,7 @@ export class InterviewService {
       .set({ criteriaJson: criteria })
       .where(eq(interviews.id, interviewId));
 
-    return { criteria };
+    return { criteria: criteria?.criteria ?? null };
   }
 
   private async detectDiscoveries(interviewId: string, lastAssistantMessage: string) {
@@ -582,8 +632,7 @@ export class InterviewService {
     const session = sessionRows[0];
     if (!session) return;
 
-    const criteria: RubricCriterion[] | null =
-      (session.criteriaJson as RubricCriterion[] | null) ?? null;
+    const criteria: RubricCriterion[] | null = getRubricCriteria(session.criteriaJson);
     if (!criteria) return;
 
     const undiscovered = criteria.filter(
@@ -671,7 +720,7 @@ export class InterviewService {
     await this.db
       .update(interviews)
       .set({
-        criteriaJson: updatedCriteria,
+        criteriaJson: withUpdatedRubricCriteria(session.criteriaJson, updatedCriteria),
         liveConstraintsJson:
           newConstraints.length > 0
             ? [...liveConstraints, ...newConstraints]
@@ -771,4 +820,9 @@ function hashSceneSummary(summary: SceneSummary): string {
     edges: summary.edges.map((e) => [e.from, e.to, e.label ?? ""])
   });
   return createHash("sha1").update(canonical).digest("hex");
+}
+
+function withUpdatedRubricCriteria(raw: unknown, criteria: RubricCriterion[]) {
+  const playbook = getRubricPlaybook(raw);
+  return playbook ? { criteria, playbook } : criteria;
 }

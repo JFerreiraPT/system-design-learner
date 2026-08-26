@@ -1,7 +1,42 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { SCORE_BAND_NAMES, type ScoreBand } from "@sdl/shared";
 import type { ValidationFeedback } from "../lib/api";
 import { DIM_KEYS, DIM_LABELS, markdownFromFeedback } from "../lib/workspaceValidationUi";
+
+/** Warm for below-bar, cool for at-or-above-bar. Mirrors the importance
+ * badges in CriteriaReveal so the Validate tab reads as one palette. */
+const BAND_CLASS: Record<ScoreBand, string> = {
+  1: "border-rose-400/40 bg-rose-400/[0.07] text-rose-700 dark:text-rose-300",
+  2: "border-amber-400/40 bg-amber-400/[0.07] text-amber-700 dark:text-amber-300",
+  3: "border-violet-400/40 bg-violet-400/[0.07] text-violet-700 dark:text-violet-300",
+  4: "border-emerald-400/40 bg-emerald-400/[0.07] text-emerald-700 dark:text-emerald-300"
+};
+
+/** Headline verdict for the Validate tab: the 1-4 band plus the interview
+ * playbook's calibrated description of what that band means for THIS problem.
+ * Renders nothing on legacy validations that predate the band. */
+export function ScoreBandCallout({
+  feedback,
+  className = ""
+}: {
+  feedback?: ValidationFeedback | null;
+  className?: string;
+}) {
+  const scoreBand = feedback?.scoreBand;
+  if (!scoreBand) return null;
+  const { band, label } = scoreBand;
+  return (
+    <div className={`rounded-xl border px-3 py-2.5 ${BAND_CLASS[band]} ${className}`}>
+      <div className="flex items-baseline gap-2">
+        <span className="text-lg font-semibold tabular-nums leading-none">{band}</span>
+        <span className="text-[10px] uppercase tracking-[0.16em] opacity-70">of 4</span>
+        <span className="text-sm font-medium">{SCORE_BAND_NAMES[band]}</span>
+      </div>
+      <p className="mt-1.5 text-[12px] leading-snug text-fg-muted">{label}</p>
+    </div>
+  );
+}
 
 export function DimensionBreakdown({
   feedback,

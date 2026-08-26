@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { evaluateExpression } from "./estimationCalibration.js";
 
 export const DifficultySchema = z.enum(["beginner", "easy", "medium", "hard", "expert"]);
 export type Difficulty = z.infer<typeof DifficultySchema>;
@@ -63,7 +64,10 @@ export const ScoreDimensionSchema = z.enum([
   "latencyPerformance",
   "cost",
   "security",
-  "operability"
+  "operability",
+  /** Whether the back-of-envelope numbers are present, in the right order of
+   * magnitude, and consistent with the design that was drawn. */
+  "capacityEstimation"
 ]);
 export type ScoreDimension = z.infer<typeof ScoreDimensionSchema>;
 
@@ -77,7 +81,8 @@ export const ValidationDimensionsSchema = z.object({
   latencyPerformance: dimensionScore,
   cost: dimensionScore,
   security: dimensionScore,
-  operability: dimensionScore
+  operability: dimensionScore,
+  capacityEstimation: dimensionScore
 });
 export type ValidationDimensions = z.infer<typeof ValidationDimensionsSchema>;
 
@@ -114,6 +119,76 @@ export const CriterionEvaluationSchema = z.object({
 });
 export type CriterionEvaluation = z.infer<typeof CriterionEvaluationSchema>;
 
+/** Interview score band, matching the 1-4 scale every interview playbook
+ * generates (`InterviewerPlaybook.scoreRubric`) and the score tables in the
+ * interview-kit templates. */
+export const ScoreBandSchema = z.union([
+  z.literal(1),
+  z.literal(2),
+  z.literal(3),
+  z.literal(4)
+]);
+export type ScoreBand = z.infer<typeof ScoreBandSchema>;
+
+/** Inclusive lower bound of each band, highest first. The ONLY place band
+ * thresholds are defined — web and api both resolve through `scoreBandFor`. */
+export const SCORE_BAND_MIN: ReadonlyArray<{ band: ScoreBand; min: number }> = [
+  { band: 4, min: 85 },
+  { band: 3, min: 65 },
+  { band: 2, min: 40 },
+  { band: 1, min: 0 }
+];
+
+/** Short name per band. Stable UI wording, never model-generated. */
+export const SCORE_BAND_NAMES: Record<ScoreBand, string> = {
+  1: "Does not meet bar",
+  2: "Below expectations",
+  3: "Meets bar",
+  4: "Exceeds bar"
+};
+
+/** Generic band descriptions used when the interview has no playbook to supply
+ * problem-specific wording. Mirrors the interview-kit's system-design table. */
+export const DEFAULT_SCORE_BAND_DESCRIPTIONS: Record<ScoreBand, string> = {
+  1: "Cannot structure a design; no requirements gathering; ignores trade-offs.",
+  2: "Covers basics but shallow; needs significant guidance; misses failure modes.",
+  3: "Clear design with justified decisions; discusses trade-offs; identifies key challenges.",
+  4: "Drives the conversation; deep in 2+ areas; proactively surfaces limitations; considers operational readiness."
+};
+
+/** Map an overall 0-100 score onto its band. Non-finite input is treated as 0
+ * so a corrupt score can never crash the panel. */
+export function scoreBandFor(score: number): ScoreBand {
+  const clamped = Number.isFinite(score) ? Math.max(0, Math.min(100, score)) : 0;
+  for (const { band, min } of SCORE_BAND_MIN) {
+    if (clamped >= min) return band;
+  }
+  return 1;
+}
+
+/** One playbook flag, judged against the attempt.
+ *
+ * The interview playbook generates concrete observable signals per probe area
+ * (`greenFlags` / `redFlags`) modelled on the interview-kit's Green/Red Flag
+ * checkboxes. This is the validator's verdict on whether each one actually
+ * fired, addressed by `(areaId, kind, index)` so the server can resolve it
+ * back to the stored playbook and reject anything hallucinated. */
+export const FlagObservationSchema = z.object({
+  /** `InterviewerPlaybookArea.id` this flag belongs to. */
+  areaId: z.string().min(1).max(80),
+  kind: z.enum(["green", "red"]),
+  /** Position within that area's `greenFlags` / `redFlags` array. */
+  index: z.number().int().nonnegative(),
+  /** Denormalised flag text so the UI needs no join. ALWAYS rewritten from the
+   * stored playbook server-side — never trusted from model output. */
+  text: z.string().max(220),
+  fired: z.boolean(),
+  /** Quote or close paraphrase of the diagram element / transcript line that
+   * triggered the observation. Only meaningful when `fired` is true. */
+  evidence: z.string().max(500).optional()
+});
+export type FlagObservation = z.infer<typeof FlagObservationSchema>;
+
 /** Full model output stored in solutions.feedback_json after A1 */
 export const ValidationFeedbackSchema = z.object({
   /** Blended overall = designScore × w_design + discoveryScore × w_discovery. */
@@ -124,6 +199,31 @@ export const ValidationFeedbackSchema = z.object({
   /** Score for how much of the *hidden* scope the candidate surfaced through
    * clarifying questions or commitments. 100 if there were no hiddens. */
   discoveryScore: z.number().min(0).max(100).optional(),
+  /** Which regime produced `designScore`.
+   *
+   * `rubric` — weighted coverage of the interview's structured criteria. This
+   * is the real scoring path and the only one that is comparable across
+   * attempts.
+   * `dimensions` — fallback used when there are no criteria (legacy problems)
+   * or the validator returned no per-criterion judgments. It averages the
+   * dimension bars, which is a *different scale*; persisting the mode lets the
+   * UI and dashboard avoid silently mixing the two.
+   *
+   * Optional: rows written before this field existed leave it undefined. */
+  scoringMode: z.enum(["rubric", "dimensions"]).optional(),
+  /** The 1-4 band the overall `score` falls into, plus the calibrated
+   * description for that band.
+   *
+   * `label` prefers the interview playbook's generated `scoreRubric[band]`,
+   * which is written for THIS problem at THIS interviewer level, and falls
+   * back to `DEFAULT_SCORE_BAND_DESCRIPTIONS` when no playbook exists (legacy
+   * interviews, or a validation with no interview at all). */
+  scoreBand: z
+    .object({
+      band: ScoreBandSchema,
+      label: z.string().max(400)
+    })
+    .optional(),
   dimensions: ValidationDimensionsSchema.optional(),
   dimensionNotes: z.record(z.string(), z.string()).optional(),
   /** Per-criterion outcomes, indexed by id. Present when the validator was
@@ -135,6 +235,10 @@ export const ValidationFeedbackSchema = z.object({
   /** IDs of `core` criteria the candidate's design FAILED to cover. The UI
    * should highlight these prominently — they are the "you missed this" list. */
   coreMissed: z.array(z.string()).optional(),
+  /** Per-flag verdicts against the interview playbook. Reported, not scored —
+   * flags overlap the criteria they were written alongside, so counting both
+   * would double-penalise. Absent when the interview has no playbook. */
+  flagObservations: z.array(FlagObservationSchema).max(60).optional(),
   strengths: z.array(z.string()).optional(),
   gaps: z.array(z.string()).optional(),
   nextSteps: z.array(z.string()).optional()
@@ -217,6 +321,37 @@ export const DEFAULT_INTERVIEW_PLAN: InterviewPlan = {
 export const WORKSPACE_PHASES: PhaseDefinition[] = timerPhasesFromPlan(DEFAULT_INTERVIEW_PLAN);
 
 /** AI-generated estimation checklist for a specific problem */
+/** Unit family for a numeric estimation field. Values are ALWAYS stored in the
+ * family's base unit — bytes, seconds, or a plain count — regardless of the
+ * unit the field displays. `ratio` and `currency` are dimensionless in
+ * practice but are kept distinct so calibration copy can read correctly. */
+export const EstimationUnitKindSchema = z.enum([
+  "count",
+  "bytes",
+  "seconds",
+  "ratio",
+  "currency"
+]);
+export type EstimationUnitKind = z.infer<typeof EstimationUnitKindSchema>;
+
+/** Order-of-magnitude band a reasonable answer falls in, in BASE units.
+ *
+ * Deliberately wide: this checks whether the candidate is in the right
+ * ballpark, not whether their arithmetic is exact. A band narrower than one
+ * order of magnitude is treated as malformed and dropped — see
+ * `normalizeEstimationSpec`. */
+export const ExpectedMagnitudeSchema = z.object({
+  min: z.number().positive(),
+  max: z.number().positive(),
+  /** One clause explaining the band, shown only AFTER the candidate answers
+   * out of range ("~1KB per message is typical for text chat"). */
+  rationale: z.string().max(300).optional()
+});
+export type ExpectedMagnitude = z.infer<typeof ExpectedMagnitudeSchema>;
+
+/** Minimum span of a usable magnitude band, as a multiplier. */
+export const MIN_MAGNITUDE_SPAN = 10;
+
 export const EstimationFieldSpecSchema = z.object({
   key: z
     .string()
@@ -227,14 +362,119 @@ export const EstimationFieldSpecSchema = z.object({
   type: z.enum(["number", "text"]),
   placeholder: z.string().max(80).optional(),
   hint: z.string().max(500).optional(),
-  unit: z.string().max(40).optional()
+  /** @deprecated Free-text unit kept for specs generated before `displayUnit`.
+   * Presentation only; carries no conversion information. */
+  unit: z.string().max(40).optional(),
+  /** Unit family. Required on new numeric fields, absent on text fields and on
+   * every spec generated before magnitudes existed. */
+  unitKind: EstimationUnitKindSchema.optional(),
+  /** Unit shown next to the label, e.g. "KB", "ms", "req/s". */
+  displayUnit: z.string().max(24).optional(),
+  /** Multiply an entered display value by this to reach the base unit
+   * (KB -> 1024, ms -> 0.001). Absent means 1. */
+  displayMultiplier: z.number().positive().optional(),
+  expectedMagnitude: ExpectedMagnitudeSchema.optional()
 });
 export type EstimationFieldSpec = z.infer<typeof EstimationFieldSpecSchema>;
+
+/** Display value -> stored base value. Identity when no multiplier is set, so
+ * every legacy spec round-trips untouched. */
+export function toBaseUnit(field: EstimationFieldSpec, displayValue: number): number {
+  const m = field.displayMultiplier;
+  if (typeof m !== "number" || !Number.isFinite(m) || m <= 0) return displayValue;
+  return displayValue * m;
+}
+
+/** Stored base value -> display value. Inverse of `toBaseUnit`. */
+export function fromBaseUnit(field: EstimationFieldSpec, baseValue: number): number {
+  const m = field.displayMultiplier;
+  if (typeof m !== "number" || !Number.isFinite(m) || m <= 0) return baseValue;
+  return baseValue / m;
+}
+
+/**
+ * Strip incoherent unit/magnitude metadata from a generated spec.
+ *
+ * Runs after generation so a model slip degrades one field to "no calibration"
+ * instead of poisoning the checklist. Drops:
+ *   - unit/magnitude metadata on `text` fields, which have no magnitude;
+ *   - bands that are inverted, non-finite, or narrower than one order of
+ *     magnitude (too tight to be a fair order-of-magnitude check);
+ *   - non-positive display multipliers.
+ */
+export function normalizeEstimationSpec(spec: EstimationProblemSpec): EstimationProblemSpec {
+  const fieldKeys = new Set(spec.fields.filter((f) => f.type === "number").map((f) => f.key));
+
+  // A formula that references a field we don't have, or that the evaluator
+  // cannot parse, would render as a permanent "—". Drop it at generation time
+  // rather than showing a broken row forever.
+  const derivedFormulas = spec.derivedFormulas?.filter((formula) => {
+    const probe: Record<string, number> = {};
+    for (const key of fieldKeys) probe[key] = 1;
+    return evaluateExpression(formula.expression, probe) !== undefined;
+  });
+
+  return {
+    ...spec,
+    ...(spec.derivedFormulas
+      ? { derivedFormulas: derivedFormulas && derivedFormulas.length > 0 ? derivedFormulas : undefined }
+      : {}),
+    fields: spec.fields.map((field) => {
+      if (field.type !== "number") {
+        const { unitKind, displayUnit, displayMultiplier, expectedMagnitude, ...rest } = field;
+        return rest;
+      }
+
+      const next: EstimationFieldSpec = { ...field };
+
+      const m = next.displayMultiplier;
+      if (typeof m === "number" && (!Number.isFinite(m) || m <= 0)) {
+        delete next.displayMultiplier;
+      }
+
+      const band = next.expectedMagnitude;
+      if (band) {
+        const usable =
+          Number.isFinite(band.min) &&
+          Number.isFinite(band.max) &&
+          band.min > 0 &&
+          band.max >= band.min * MIN_MAGNITUDE_SPAN;
+        if (!usable) delete next.expectedMagnitude;
+      }
+
+      return next;
+    })
+  };
+}
+
+/** A quantity computed from the candidate's own inputs.
+ *
+ * `expression` is model-generated, so it is parsed and evaluated by a
+ * hand-written tokeniser + shunting-yard evaluator — never `eval`. Grammar:
+ * field keys, numeric literals, `+ - * /`, parentheses, unary minus. */
+export const EstimationDerivedFormulaSchema = z.object({
+  id: z
+    .string()
+    .min(1)
+    .max(40)
+    .regex(/^[a-z][a-z0-9_]*$/),
+  label: z.string().min(1).max(80),
+  /** References field `key`s, e.g. "dau * sessions_per_day / 86400". */
+  expression: z.string().min(1).max(200),
+  unitKind: EstimationUnitKindSchema,
+  displayUnit: z.string().max(24).optional()
+});
+export type EstimationDerivedFormula = z.infer<typeof EstimationDerivedFormulaSchema>;
 
 export const EstimationProblemSpecSchema = z.object({
   intro: z.string().max(800).optional(),
   fields: z.array(EstimationFieldSpecSchema).min(3).max(10),
-  derivedHints: z.array(z.string().max(400)).max(8).optional()
+  /** Qualitative sanity-check bullets. Kept alongside `derivedFormulas` —
+   * they answer "does this feel right", which arithmetic cannot. */
+  derivedHints: z.array(z.string().max(400)).max(8).optional(),
+  /** Quantitative checks computed from the entered values. Absent on every
+   * spec generated before formulas existed. */
+  derivedFormulas: z.array(EstimationDerivedFormulaSchema).max(6).optional()
 });
 export type EstimationProblemSpec = z.infer<typeof EstimationProblemSpecSchema>;
 
@@ -298,6 +538,17 @@ export const SceneSummarySchema = z.object({
 export type SceneSummary = z.infer<typeof SceneSummarySchema>;
 
 export { projectSceneJson } from "./sceneProjection.js";
+
+export {
+  calibrateAll,
+  calibrateField,
+  evaluateDerivedFormulas,
+  evaluateExpression,
+  type CalibrationVerdict,
+  type DerivedValue,
+  type FieldCalibration,
+  type SpecCalibration
+} from "./estimationCalibration.js";
 
 /** Importance tier for rubric criteria and live constraints. Drives both
  * scoring weight in validation and how aggressively the interviewer probes. */
@@ -390,6 +641,11 @@ export const RubricCriterionSchema = z.object({
    * criterion, scaled to the level (guided uses them eagerly, staff barely
    * at all). 1-3 short prompts. */
   discoveryHints: z.array(z.string().max(200)).max(4).optional(),
+  /** Ordered easy -> sharp nudges for the interviewer playbook. These give
+   * the AI a controlled escalation path before it reveals too much. */
+  progressiveNudges: z
+    .tuple([z.string().max(240), z.string().max(240), z.string().max(240)])
+    .optional(),
   /** Signals the validator should look for in the diagram/notes when
    * deciding `covered=true`. Free-form bullet hints, not strict matchers. */
   satisfiedBy: z.array(z.string().max(200)).max(4).optional(),
@@ -406,6 +662,68 @@ export type RubricCriterion = z.infer<typeof RubricCriterionSchema>;
  * validate the JSONB column with a single `.parse(...)`. */
 export const RubricCriteriaSetSchema = z.array(RubricCriterionSchema).max(40);
 export type RubricCriteriaSet = z.infer<typeof RubricCriteriaSetSchema>;
+
+export const InterviewerPlaybookAreaSchema = z.object({
+  id: z
+    .string()
+    .min(1)
+    .max(80)
+    .regex(/^[a-z][a-z0-9_]*$/),
+  label: z.string().min(1).max(80),
+  /** Phase ids from the generated interview plan where this probe area fits. */
+  phaseRefs: z.array(z.string().min(1).max(40)).min(1).max(8),
+  /** Criterion ids from this same rubric that the area helps evaluate. */
+  criterionRefs: z.array(z.string().min(1).max(80)).min(1).max(8),
+  sampleQuestions: z.array(z.string().min(4).max(240)).min(1).max(4),
+  progressiveNudges: z.tuple([
+    z.string().min(4).max(240),
+    z.string().min(4).max(240),
+    z.string().min(4).max(240)
+  ]),
+  greenFlags: z.array(z.string().min(4).max(220)).min(1).max(6),
+  redFlags: z.array(z.string().min(4).max(220)).min(1).max(6)
+});
+export type InterviewerPlaybookArea = z.infer<typeof InterviewerPlaybookAreaSchema>;
+
+export const InterviewerPlaybookSchema = z.object({
+  areasToProbe: z.array(InterviewerPlaybookAreaSchema).min(1).max(12),
+  scoreRubric: z.object({
+    "1": z.string().min(4).max(400),
+    "2": z.string().min(4).max(400),
+    "3": z.string().min(4).max(400),
+    "4": z.string().min(4).max(400)
+  })
+});
+export type InterviewerPlaybook = z.infer<typeof InterviewerPlaybookSchema>;
+
+export const InterviewRubricSchema = z.object({
+  criteria: RubricCriteriaSetSchema,
+  playbook: InterviewerPlaybookSchema
+});
+export type InterviewRubric = z.infer<typeof InterviewRubricSchema>;
+
+export type StoredInterviewRubric = InterviewRubric | RubricCriterion[] | null;
+
+export function getRubricCriteria(value: unknown): RubricCriterion[] | null {
+  if (value === null || value === undefined) return null;
+
+  const legacyParsed = RubricCriteriaSetSchema.safeParse(value);
+  if (legacyParsed.success) return legacyParsed.data;
+
+  const rubricParsed = InterviewRubricSchema.safeParse(value);
+  if (rubricParsed.success) return rubricParsed.data.criteria;
+
+  return null;
+}
+
+export function getRubricPlaybook(value: unknown): InterviewerPlaybook | null {
+  if (value === null || value === undefined || Array.isArray(value)) return null;
+
+  const rubricParsed = InterviewRubricSchema.safeParse(value);
+  if (rubricParsed.success) return rubricParsed.data.playbook;
+
+  return null;
+}
 
 /** Live pacing info for the current interview phase so AI assistants can
  * gauge how the candidate is doing against the suggested budget. */
