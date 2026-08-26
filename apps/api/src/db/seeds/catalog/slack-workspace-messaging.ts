@@ -245,5 +245,305 @@ export const slackWorkspaceMessaging = defineSeedProblem({
           "Close it out. **Interact with:** **Board** — mark the client-versus-server split you chose: what state the client owns, what the server owns, and who wins a conflict. **Interviewer** tab — summarise, then answer unprompted: what breaks first in a 500,000-user workspace, and how would you detect that clients were silently missing messages? Then **Validate**, then **End interview**."
       }
     ]
+  },
+  rubric: {
+    criteria: [
+      {
+        id: "gap_detection_on_resume",
+        text: "A resuming client detects whether it missed messages, rather than assuming its cache is current.",
+        dimension: "consistency",
+        importance: "core",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "A per-channel monotonic sequence the client compares on reconnect",
+          "An explicit resume handshake before anything is rendered"
+        ],
+        discoveryHints: [
+          "A laptop wakes after two weeks. How does it know what it missed?",
+          "What does the client send the server on reconnect?"
+        ],
+        progressiveNudges: [
+          "The client reconnects. Its cache says the last message is from two weeks ago. Is it current?",
+          "How can it tell 'nothing happened' apart from 'I missed 400 messages'?",
+          "What monotonic value does it compare against, and who assigns that value?"
+        ]
+      },
+      {
+        id: "bounded_catchup",
+        text: "Filling a gap is bounded — a summary or ranged fetch — not a replay of full channel history.",
+        dimension: "scalability",
+        importance: "core",
+        hiddenFrom: "hard",
+        satisfiedBy: [
+          "A gap response that can say 'too much, refetch from here' rather than streaming everything",
+          "Per-channel ranged fetch with a cap"
+        ],
+        discoveryHints: [
+          "The gap is 40,000 messages across 200 channels. What do you send?",
+          "Is there an upper bound on catch-up size?"
+        ],
+        progressiveNudges: [
+          "Client is two weeks behind across 200 channels. How much data does catch-up transfer?",
+          "Is that bounded, or does it grow with how long they were away?",
+          "What does the server return when the gap is too large to stream?"
+        ]
+      },
+      {
+        id: "optimistic_send_reconciliation",
+        text: "A locally sent message renders immediately and is reconciled with the server-assigned id and sequence.",
+        dimension: "consistency",
+        importance: "core",
+        hiddenFrom: "hard",
+        satisfiedBy: [
+          "A client-side temporary id replaced or matched on server ack",
+          "A defined UI state for a send that failed"
+        ],
+        discoveryHints: [
+          "What does the user see the instant they hit enter?",
+          "How does that placeholder become the real message?"
+        ],
+        progressiveNudges: [
+          "The user sends a message. Does it wait for the server before appearing?",
+          "If it appears immediately, what identifies it before the server responds?",
+          "The send then fails. What does the user see, and can they retry without duplicating?"
+        ]
+      },
+      {
+        id: "search_permission_filtering",
+        text: "Search results are filtered by channel membership so private channels never leak.",
+        dimension: "security",
+        importance: "core",
+        hiddenFrom: "staff",
+        satisfiedBy: [
+          "Membership applied as a filter on the query, not on the rendered results",
+          "A stated position on filtering before versus after ranking"
+        ],
+        discoveryHints: [
+          "Can a search surface a message from a private channel the user is not in?",
+          "Where is membership applied in the query path?"
+        ],
+        progressiveNudges: [
+          "A user searches a term that appears in a private channel they cannot see. What comes back?",
+          "Is membership checked in the index query, or on the results?",
+          "If you filter after ranking, what leaks — and what does filtering before cost you?"
+        ]
+      },
+      {
+        id: "instant_channel_switch",
+        text: "Switching to an open channel renders from local state with no network call on the critical path.",
+        dimension: "latencyPerformance",
+        importance: "core",
+        satisfiedBy: [
+          "A local store holding recent messages per open channel",
+          "Network fetches treated as background refresh, not as the render path"
+        ]
+      },
+      {
+        id: "connection_and_fanout_math",
+        text: "Concurrent connections and fanout events per second are both computed, and the gap between them noted.",
+        dimension: "capacityEstimation",
+        importance: "expected",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "Connections derived from users times online fraction",
+          "Fanout derived from message rate times channel membership"
+        ],
+        discoveryHints: [
+          "How many connections at peak, and how many events per second?",
+          "What multiplies your post rate into delivery volume?"
+        ],
+        progressiveNudges: [
+          "Give me peak concurrent connections.",
+          "Now messages per second, then multiply by channel membership.",
+          "Why is the second number so much larger, and what has to carry it?"
+        ]
+      },
+      {
+        id: "per_channel_sequence_model",
+        text: "The data model carries a per-channel monotonic sequence that makes ordering and gaps expressible.",
+        dimension: "consistency",
+        importance: "expected",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "A sequence or cursor column scoped to channel, not global",
+          "A partition key chosen so that sequence is cheap to assign"
+        ],
+        discoveryHints: [
+          "What orders messages within a channel?",
+          "Is that sequence global or per channel, and why does it matter?"
+        ],
+        progressiveNudges: [
+          "How do you order two messages in the same channel?",
+          "Would a global sequence work? What does it cost you at this write rate?",
+          "Scope it per channel — what does that imply for your partition key?"
+        ]
+      },
+      {
+        id: "unread_state_convergence",
+        text: "Unread counts are derived from a per-user read cursor and converge across that user's devices.",
+        dimension: "consistency",
+        importance: "expected",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "A read watermark per user per channel rather than per-message flags",
+          "Cursor updates propagated to the user's other devices"
+        ],
+        discoveryHints: [
+          "How is an unread count computed?",
+          "A user reads on their phone. When does the laptop badge clear?"
+        ],
+        progressiveNudges: [
+          "Do you store a read flag per message per user?",
+          "What does that cost at your message volume? What is cheaper?",
+          "With a watermark, how do the user's other devices learn it moved?"
+        ]
+      },
+      {
+        id: "workspace_isolation",
+        text: "A very large workspace with a busy all-hands channel does not degrade other workspaces.",
+        dimension: "reliability",
+        importance: "expected",
+        hiddenFrom: "standard",
+        satisfiedBy: [
+          "Partitioning keyed on workspace or channel",
+          "Rate limits or dedicated capacity for outsized workspaces"
+        ],
+        discoveryHints: [
+          "A 150,000-person announcement channel gets a message. Who else is affected?",
+          "What is your partition key, and does one workspace fit in one partition?"
+        ],
+        progressiveNudges: [
+          "One workspace has 150,000 people in a single channel. What does one post there cost?",
+          "Does that traffic share infrastructure with small workspaces?",
+          "What bulkheads them — partitioning, quotas, or dedicated capacity?"
+        ]
+      },
+      {
+        id: "client_cache_eviction",
+        text: "The client's local cache is bounded with an eviction policy, not allowed to grow without limit.",
+        dimension: "cost",
+        importance: "stretch",
+        hiddenFrom: "hard",
+        satisfiedBy: [
+          "A cap on cached messages per channel or overall",
+          "An eviction rule tied to recency of channel use"
+        ],
+        discoveryHints: [
+          "How large can the local store get after a year of use?",
+          "What gets evicted first?"
+        ],
+        progressiveNudges: [
+          "The app has been open for a year. How big is the local database?",
+          "Is there a cap, or does it grow with usage?",
+          "What do you evict, and what happens when the user scrolls into evicted history?"
+        ]
+      }
+    ],
+    playbook: {
+      areasToProbe: [
+        {
+          id: "sync_correctness",
+          label: "Sync protocol correctness",
+          phaseRefs: ["sync_protocol"],
+          criterionRefs: ["gap_detection_on_resume", "bounded_catchup", "per_channel_sequence_model"],
+          sampleQuestions: [
+            "A desktop client wakes from two weeks of suspend. Walk me through everything before it renders.",
+            "The gap turns out to be 40,000 messages across 200 channels. What does the server send?"
+          ],
+          progressiveNudges: [
+            "What does the client send on reconnect?",
+            "How does it distinguish 'nothing new' from 'I missed a lot'?",
+            "And what bounds the size of the catch-up response?"
+          ],
+          greenFlags: [
+            "Per-channel monotonic sequence compared explicitly on resume",
+            "Server can refuse to stream an oversized gap and hand back a restart point"
+          ],
+          redFlags: [
+            "Assumes the websocket buffer covers reconnects",
+            "Unbounded history replay on resume"
+          ]
+        },
+        {
+          id: "client_architecture",
+          label: "Client state and rendering",
+          phaseRefs: ["client_state"],
+          criterionRefs: [
+            "instant_channel_switch",
+            "optimistic_send_reconciliation",
+            "client_cache_eviction"
+          ],
+          sampleQuestions: [
+            "Switching channels must render in under 100ms with no network call. What makes that possible?",
+            "A message the user sent fails to send. What do they see?"
+          ],
+          progressiveNudges: [
+            "Where does the rendered message list come from?",
+            "Is the network on that path at all?",
+            "Now the optimistic send — what id does the placeholder carry before the server answers?"
+          ],
+          greenFlags: [
+            "Local store is the render source, network is background refresh",
+            "Temporary client id reconciled with the server-assigned one"
+          ],
+          redFlags: [
+            "Fetches the channel on every switch",
+            "No failed-send state in the UI"
+          ]
+        },
+        {
+          id: "state_derivation",
+          label: "Unread state and scale",
+          phaseRefs: ["data_model", "estimate"],
+          criterionRefs: ["unread_state_convergence", "connection_and_fanout_math"],
+          sampleQuestions: [
+            "How is an unread count computed, and what does it cost per user?",
+            "How many fanout events per second, and how does that compare to your post rate?"
+          ],
+          progressiveNudges: [
+            "Do you store per-message read flags?",
+            "What does that cost at your volume? What is the cheaper representation?",
+            "Now compute fanout and connections, and tell me which one sizes the gateway fleet."
+          ],
+          greenFlags: [
+            "Read watermark per user per channel rather than per-message flags",
+            "Notices fanout dwarfs post rate and designs for it"
+          ],
+          redFlags: [
+            "Per-message per-user read rows",
+            "Sizes connections from workspace count"
+          ]
+        },
+        {
+          id: "search_and_tenancy",
+          label: "Search safety and isolation",
+          phaseRefs: ["search_and_isolation"],
+          criterionRefs: ["search_permission_filtering", "workspace_isolation"],
+          sampleQuestions: [
+            "A user searches a term that appears only in a private channel they are not in. What comes back?",
+            "A 150,000-person workspace is very busy. How are small workspaces protected?"
+          ],
+          progressiveNudges: [
+            "Where in the query path is channel membership applied?",
+            "Before or after ranking? What leaks if it is after?",
+            "Now isolation: what is your partition key, and does one workspace fit one partition?"
+          ],
+          greenFlags: [
+            "Applies membership inside the index query",
+            "Names a bulkhead for outsized workspaces"
+          ],
+          redFlags: [
+            "Filters results after ranking and calls it safe",
+            "One shared index with no tenancy dimension"
+          ]
+        }
+      ],
+      scoreRubric: {
+        "1": "Designs a chat server with a websocket and a message table, with no client cache, no resume protocol, and no notion of a gap.",
+        "2": "Has live delivery and some local caching, but resume is best-effort, ordering relies on timestamps, and search ignores permissions.",
+        "3": "Uses a per-channel sequence, detects and bounds gaps on resume, renders channel switches from local state, and filters search by membership.",
+        "4": "Also reconciles optimistic sends, derives unread state from watermarks that converge across devices, isolates large workspaces, and bounds the client cache."
+      }
+    }
   }
 });

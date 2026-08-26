@@ -229,5 +229,351 @@ export const canaryDeploymentPlatform = defineSeedProblem({
           "Close it out. **Interact with:** **Board** — mark the trade-offs: rollout speed against confidence, blast radius against sample size, automation against human judgement. Note how tenants are isolated. **Interviewer** tab — summarise, then answer unprompted: what breaks first at 10x deploy volume, and what would you record so a passed-but-bad rollout is explainable afterwards? Then **Validate**, then **End interview**."
       }
     ]
+  },
+  rubric: {
+    criteria: [
+      {
+        id: "migration_gated_rollback",
+        text: "Rollback is refused or gated when the release applied a schema change the previous version cannot read.",
+        dimension: "consistency",
+        importance: "core",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "Migrations sequenced as a separate step the platform knows about",
+          "A backward-compatibility property recorded per migration and checked before rollback"
+        ],
+        discoveryHints: [
+          "The canary fails after the migration already ran. Can you roll back?",
+          "Does the platform know whether a migration is reversible?"
+        ],
+        progressiveNudges: [
+          "Your rollout applied a schema change, then the canary failed. What does automated rollback do?",
+          "If the old code cannot read the new schema, what happens when it comes back?",
+          "So how does the platform know, before rolling back, that this is safe? What does it record per migration?"
+        ]
+      },
+      {
+        id: "insufficient_data_verdict",
+        text: "A canary that cannot reach statistical confidence returns insufficient-data rather than a pass.",
+        dimension: "reliability",
+        importance: "core",
+        hiddenFrom: "hard",
+        satisfiedBy: [
+          "A minimum sample size or confidence check before a verdict",
+          "A third verdict distinct from pass and fail, with a defined next action"
+        ],
+        discoveryHints: [
+          "A service takes three requests a minute. What does a 1% canary observe?",
+          "Can your verdict be pass, fail, or something else?"
+        ],
+        progressiveNudges: [
+          "Compute the canary sample for a service at three requests a minute over ten minutes.",
+          "Can you detect a doubled error rate from that sample?",
+          "So what does the platform return — and what does it do next, given it cannot decide?"
+        ]
+      },
+      {
+        id: "concurrent_baseline_comparison",
+        text: "The canary is compared against a concurrently running baseline, not against historical data.",
+        dimension: "reliability",
+        importance: "core",
+        hiddenFrom: "hard",
+        satisfiedBy: [
+          "A baseline group serving traffic in the same window",
+          "Matched instance class and traffic mix between canary and baseline"
+        ],
+        discoveryHints: [
+          "What are you comparing the canary's metrics against?",
+          "Why not yesterday's numbers for the same service?"
+        ],
+        progressiveNudges: [
+          "What is the control group in this experiment?",
+          "If you compare against last week, what confounds the result?",
+          "What has to match between canary and baseline for the comparison to mean anything?"
+        ]
+      },
+      {
+        id: "metrics_blind_pauses",
+        text: "When the metrics backend is degraded, rollouts pause rather than silently passing.",
+        dimension: "reliability",
+        importance: "core",
+        hiddenFrom: "staff",
+        satisfiedBy: [
+          "Absence of data treated as not-a-pass",
+          "A defined state for rollouts in flight when metrics are unavailable"
+        ],
+        discoveryHints: [
+          "Your metrics backend goes blind for ten minutes mid-rollout. What happens?",
+          "Is no data the same as good data?"
+        ],
+        progressiveNudges: [
+          "Forty rollouts are in flight and metrics stop arriving. What does each do?",
+          "If your check is 'error rate below threshold', what does zero data evaluate to?",
+          "Make the failure mode explicit: does no data pass, fail, or pause?"
+        ]
+      },
+      {
+        id: "fast_abort",
+        text: "A rollout can be aborted at any point with all traffic back on the previous version within 60 seconds.",
+        dimension: "latencyPerformance",
+        importance: "core",
+        satisfiedBy: [
+          "Traffic weights reset in one control-plane operation",
+          "The previous version's instances kept warm until the rollout completes"
+        ]
+      },
+      {
+        id: "canary_sample_math",
+        text: "Canary sample size is computed from traffic rate, split, and observation window, for both a busy and a quiet service.",
+        dimension: "capacityEstimation",
+        importance: "expected",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "A sample-size number for a typical service",
+          "The same computation redone for a low-traffic service, showing the problem"
+        ],
+        discoveryHints: [
+          "How many requests does the canary actually serve during one step?",
+          "Redo that for a service doing one request a minute."
+        ],
+        progressiveNudges: [
+          "Multiply request rate by canary fraction by window length.",
+          "Now do it for your quietest service.",
+          "What does the difference between those two numbers say about a fleet-wide canary policy?"
+        ]
+      },
+      {
+        id: "reconciled_rollout_state",
+        text: "Rollout state is persisted and reconciled, so a control-plane restart resumes rather than loses the rollout.",
+        dimension: "reliability",
+        importance: "expected",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "Desired state stored durably and continuously reconciled against actual",
+          "A rollout that survives the orchestrator restarting"
+        ],
+        discoveryHints: [
+          "The control plane restarts mid-rollout. What happens to the rollout?",
+          "Where does rollout state live?"
+        ],
+        progressiveNudges: [
+          "Your orchestrator process dies at 25% traffic shifted. What is the state of the world?",
+          "Is that state in memory or persisted?",
+          "How does the new process learn what it should be converging toward?"
+        ]
+      },
+      {
+        id: "progressive_traffic_steps",
+        text: "Traffic is shifted in defined steps with a verdict gate between them, not in one jump.",
+        dimension: "requirements",
+        importance: "expected",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "Named traffic percentages per step",
+          "A gate between steps that consults the verdict"
+        ],
+        discoveryHints: [
+          "What are the actual traffic percentages in your rollout?",
+          "What has to happen between one step and the next?"
+        ],
+        progressiveNudges: [
+          "Describe the traffic sequence from 0% to 100%.",
+          "What decides whether to take the next step?",
+          "How do you pick step sizes — blast radius, or sample size, or both?"
+        ]
+      },
+      {
+        id: "verdict_metric_selection",
+        text: "The metrics compared are named and tied to user-visible impact, not just infrastructure signals.",
+        dimension: "operability",
+        importance: "expected",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "Specific signals such as error rate and latency percentiles",
+          "A statement of why CPU or memory alone is not a verdict"
+        ],
+        discoveryHints: [
+          "Which metrics decide pass or fail?",
+          "Would you fail a canary on CPU alone?"
+        ],
+        progressiveNudges: [
+          "Name the specific signals your verdict reads.",
+          "Which of those would a user actually notice?",
+          "What do you do about a canary that is slower but has no errors?"
+        ]
+      },
+      {
+        id: "tenant_isolation",
+        text: "One team's failing rollout does not block or delay another team's.",
+        dimension: "reliability",
+        importance: "expected",
+        hiddenFrom: "standard",
+        satisfiedBy: [
+          "Per-team or per-service rollout concurrency rather than a global queue",
+          "A stuck rollout that does not hold a shared lock"
+        ],
+        discoveryHints: [
+          "Forty rollouts are in flight. One is stuck. What happens to the other 39?",
+          "Is there anything global that rollouts contend on?"
+        ],
+        progressiveNudges: [
+          "One team's rollout hangs waiting for a verdict. Who else is blocked?",
+          "What resource do all rollouts share?",
+          "How do you bound the damage — per-team concurrency, timeouts, or both?"
+        ]
+      },
+      {
+        id: "metrics_ingest_scale",
+        text: "The platform's own metrics ingestion volume is sized, and comparisons run against aggregates rather than raw samples.",
+        dimension: "scalability",
+        importance: "expected",
+        hiddenFrom: "hard",
+        satisfiedBy: [
+          "An ingest throughput figure derived from instances and series",
+          "Verdicts computed from pre-aggregated series"
+        ],
+        discoveryHints: [
+          "How much metric data does the whole fleet produce?",
+          "Does the verdict query raw samples?"
+        ],
+        progressiveNudges: [
+          "Compute metrics ingest across instances and series.",
+          "Is that a small number?",
+          "So can your verdict scan raw samples per rollout, or does it need pre-aggregation?"
+        ]
+      },
+      {
+        id: "decision_audit_trail",
+        text: "Every rollout decision is auditable: who deployed, which metrics were compared, and why the verdict was reached.",
+        dimension: "operability",
+        importance: "stretch",
+        hiddenFrom: "hard",
+        satisfiedBy: [
+          "Recorded inputs to the verdict alongside the outcome",
+          "Enough detail to explain a passed-but-bad rollout after the fact"
+        ],
+        discoveryHints: [
+          "A bad version passed and reached 100%. How do you find out why?",
+          "What do you record at verdict time?"
+        ],
+        progressiveNudges: [
+          "A team says the platform passed a broken release. How do you investigate?",
+          "Do you still have the metric values the verdict saw?",
+          "What exactly would you persist so that question has a definitive answer?"
+        ]
+      }
+    ],
+    playbook: {
+      areasToProbe: [
+        {
+          id: "verdict_logic",
+          label: "Canary verdict",
+          phaseRefs: ["verdict", "estimate"],
+          criterionRefs: [
+            "insufficient_data_verdict",
+            "concurrent_baseline_comparison",
+            "canary_sample_math",
+            "verdict_metric_selection"
+          ],
+          sampleQuestions: [
+            "A service takes three requests a minute. What does a 1% canary over ten minutes observe, and can you decide anything?",
+            "What are you comparing the canary against, and why not last week's numbers?"
+          ],
+          progressiveNudges: [
+            "Compute the canary sample size for a busy service, then a quiet one.",
+            "Can the quiet one detect a doubled error rate?",
+            "So what is the third verdict, and what does the platform do next?"
+          ],
+          greenFlags: [
+            "Returns insufficient-data instead of a false pass",
+            "Insists on a concurrent baseline with matched conditions"
+          ],
+          redFlags: [
+            "One fixed canary percentage for the whole fleet",
+            "Compares against historical data from another window"
+          ]
+        },
+        {
+          id: "rollout_mechanics",
+          label: "Rollout mechanics",
+          phaseRefs: ["rollout_model"],
+          criterionRefs: ["progressive_traffic_steps", "fast_abort", "reconciled_rollout_state"],
+          sampleQuestions: [
+            "Describe the traffic sequence from 0% to 100% and what gates each step.",
+            "The control plane restarts at 25% shifted. What is the state of the world?"
+          ],
+          progressiveNudges: [
+            "What are the actual percentages?",
+            "How is the 60-second abort achieved — are old instances still warm?",
+            "And where does rollout state live so a restart resumes rather than loses it?"
+          ],
+          greenFlags: [
+            "Persisted desired state continuously reconciled",
+            "Keeps the previous version warm to make abort fast"
+          ],
+          redFlags: [
+            "Rollout state in orchestrator memory",
+            "Abort requires redeploying the old version"
+          ]
+        },
+        {
+          id: "unsafe_rollback",
+          label: "Migrations and unsafe rollback",
+          phaseRefs: ["migrations_and_rollback"],
+          criterionRefs: ["migration_gated_rollback"],
+          sampleQuestions: [
+            "The canary fails after the migration already applied. What does automated rollback do?",
+            "How does the platform know a migration is not backward-compatible?"
+          ],
+          progressiveNudges: [
+            "Old code, new schema. What breaks?",
+            "Does the platform know that before it rolls back?",
+            "What does it record per migration, and what does it ask a human to do?"
+          ],
+          greenFlags: [
+            "Sequences migrations separately and records reversibility",
+            "Refuses automated rollback and escalates rather than corrupting data"
+          ],
+          redFlags: [
+            "Rolls back code without considering schema state",
+            "Assumes all migrations are additive"
+          ]
+        },
+        {
+          id: "platform_scale",
+          label: "Platform scale and accountability",
+          phaseRefs: ["estimate", "wrap_up"],
+          criterionRefs: [
+            "metrics_blind_pauses",
+            "tenant_isolation",
+            "metrics_ingest_scale",
+            "decision_audit_trail"
+          ],
+          sampleQuestions: [
+            "Metrics stop arriving during forty concurrent rollouts. What does each do?",
+            "A team says you passed a broken release. How do you investigate?"
+          ],
+          progressiveNudges: [
+            "If your check is 'errors below threshold', what does no data evaluate to?",
+            "Now isolation: what do all forty rollouts share?",
+            "And what did you persist at verdict time to answer the audit question?"
+          ],
+          greenFlags: [
+            "Treats absent data as not-a-pass and pauses",
+            "Records the verdict inputs, not just the outcome"
+          ],
+          redFlags: [
+            "Missing metrics evaluate as healthy",
+            "A global rollout queue or lock"
+          ]
+        }
+      ],
+      scoreRubric: {
+        "1": "Describes shifting traffic and watching a dashboard, with no defined verdict rule, no baseline, and no consideration of migrations.",
+        "2": "Has progressive steps and automated rollback on error-rate threshold, but one fixed canary percentage, historical comparison, and no migration handling.",
+        "3": "Compares against a concurrent baseline, computes sample size, returns insufficient-data honestly, and gates rollback on migration reversibility.",
+        "4": "Also pauses when metrics are blind, isolates tenants, sizes its own metrics ingest and aggregates for verdicts, and records enough to audit a bad pass afterwards."
+      }
+    }
   }
 });

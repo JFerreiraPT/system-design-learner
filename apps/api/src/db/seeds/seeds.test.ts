@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { TAG_VOCABULARY_SNIPPET } from "@sdl/ai-prompts";
-import { DEFAULT_INTERVIEW_PLAN, getProblemNarrative, getTrack } from "@sdl/shared";
+import { TAG_VOCABULARY_SNIPPET, getCriteriaHiddenMin, hasEstimationPhase } from "@sdl/ai-prompts";
+import {
+  DEFAULT_INTERVIEW_PLAN,
+  INTERVIEWER_LEVEL_ORDER,
+  InterviewRubricSchema,
+  getProblemNarrative,
+  getTrack,
+  hiddenCountAtLevel,
+  projectRubricForLevel
+} from "@sdl/shared";
 import { SEED_PROBLEMS, validateAllSeeds } from "./index.js";
 import { SEED_TAG_VOCABULARY } from "./types.js";
 
@@ -72,6 +80,101 @@ test("every problem states a mechanism-bearing signature challenge", () => {
     const text = seed.narrative.signatureChallenge.toLowerCase();
     for (const phrase of banned) {
       assert.ok(!text.includes(phrase), `${seed.slug}: signature challenge is generic ("${phrase}")`);
+    }
+  }
+});
+
+// --- authored rubrics ------------------------------------------------------
+
+test("every seed ships an authored rubric", () => {
+  // Not required by the schema (a seed without one still works), but the point
+  // of the catalogue is that starting an interview on it costs no model call.
+  for (const seed of SEED_PROBLEMS) {
+    assert.ok(seed.rubric, `${seed.slug}: no authored rubric, would fall back to generation`);
+  }
+});
+
+test("each rubric projects to a legal InterviewRubric at every level", () => {
+  for (const seed of SEED_PROBLEMS) {
+    if (!seed.rubric) continue;
+    for (const level of INTERVIEWER_LEVEL_ORDER) {
+      const projected = projectRubricForLevel(seed.rubric, level, "2026-08-26T00:00:00.000Z");
+      const parsed = InterviewRubricSchema.safeParse(projected);
+      assert.ok(
+        parsed.success,
+        `${seed.slug} at ${level}: ${parsed.success ? "" : parsed.error.issues[0]?.message}`
+      );
+    }
+  }
+});
+
+test("hidden counts rise with level and never fall below the difficulty floor", () => {
+  for (const seed of SEED_PROBLEMS) {
+    if (!seed.rubric) continue;
+    const floor = getCriteriaHiddenMin(seed.difficulty);
+    let previous = -1;
+    for (const level of INTERVIEWER_LEVEL_ORDER) {
+      const hidden = hiddenCountAtLevel(seed.rubric, level);
+      assert.ok(hidden >= floor, `${seed.slug} at ${level}: ${hidden} hidden, floor is ${floor}`);
+      assert.ok(hidden >= previous, `${seed.slug} at ${level}: hidden count fell as level rose`);
+      previous = hidden;
+    }
+  }
+});
+
+test("guided and staff differ, or the projection is pointless", () => {
+  for (const seed of SEED_PROBLEMS) {
+    if (!seed.rubric) continue;
+    assert.ok(
+      hiddenCountAtLevel(seed.rubric, "staff") > hiddenCountAtLevel(seed.rubric, "guided"),
+      `${seed.slug}: guided and staff hide the same amount — level has no effect`
+    );
+  }
+});
+
+test("every rubric grades the estimation phase it sets aside", () => {
+  for (const seed of SEED_PROBLEMS) {
+    if (!seed.rubric) continue;
+    if (!hasEstimationPhase(seed.interviewPlan.phases)) continue;
+    assert.ok(
+      seed.rubric.criteria.some((c) => c.dimension === "capacityEstimation"),
+      `${seed.slug}: has an estimation phase but nothing grades it`
+    );
+  }
+});
+
+test("playbook references resolve to real criteria and real phases", () => {
+  for (const seed of SEED_PROBLEMS) {
+    if (!seed.rubric) continue;
+    const ids = new Set(seed.rubric.criteria.map((c) => c.id));
+    const phases = new Set(seed.interviewPlan.phases.map((p) => p.id));
+    for (const area of seed.rubric.playbook.areasToProbe) {
+      for (const ref of area.criterionRefs) {
+        assert.ok(ids.has(ref), `${seed.slug}/${area.id}: dangling criterionRef "${ref}"`);
+      }
+      for (const ref of area.phaseRefs) {
+        assert.ok(phases.has(ref), `${seed.slug}/${area.id}: dangling phaseRef "${ref}"`);
+      }
+    }
+  }
+});
+
+test("hidden criteria carry the coaching material the interviewer needs", () => {
+  // An undiscovered hidden criterion with no hints and no nudges gives the
+  // interviewer nothing to probe with at exactly the moment it matters.
+  for (const seed of SEED_PROBLEMS) {
+    if (!seed.rubric) continue;
+    for (const criterion of seed.rubric.criteria) {
+      if (!criterion.hiddenFrom) continue;
+      assert.ok(
+        (criterion.discoveryHints ?? []).length > 0,
+        `${seed.slug}/${criterion.id}: hidden with no discoveryHints`
+      );
+      assert.equal(
+        criterion.progressiveNudges?.length,
+        3,
+        `${seed.slug}/${criterion.id}: hidden without three progressive nudges`
+      );
     }
   }
 });

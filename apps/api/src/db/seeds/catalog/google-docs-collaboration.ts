@@ -228,5 +228,345 @@ export const googleDocsCollaboration = defineSeedProblem({
           "Close it out. **Interact with:** **Board** — mark the costs of your convergence choice: metadata overhead, tombstones, server statefulness. **Interviewer** tab — summarise, then answer unprompted: what breaks first at 10x editors per document, and how would you detect a divergence bug in production before a user reports it? Then **Validate**, then **End interview**."
       }
     ]
+  },
+  rubric: {
+    criteria: [
+      {
+        id: "convergence_mechanism",
+        text: "A specific convergence mechanism is named — OT against a server-ordered log, or a CRDT with position identifiers — and defended.",
+        dimension: "consistency",
+        importance: "core",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "The mechanism named explicitly, not just 'merge the edits'",
+          "A stated property that guarantees identical final state"
+        ],
+        discoveryHints: [
+          "What guarantees both clients end up with the same text?",
+          "Is there a server ordering, or is it order-independent?"
+        ],
+        progressiveNudges: [
+          "Two clients apply edits in different orders. What makes the results identical?",
+          "Are you transforming operations against a server order, or making them commutative?",
+          "Pick one and name it. Then tell me the property it gives you."
+        ]
+      },
+      {
+        id: "concurrent_insert_same_position",
+        text: "Two inserts at the same position at the same instant resolve deterministically without a lock.",
+        dimension: "consistency",
+        importance: "core",
+        hiddenFrom: "hard",
+        satisfiedBy: [
+          "A deterministic tie-break, such as author id or identifier ordering",
+          "A traced example showing both clients reaching the same result"
+        ],
+        discoveryHints: [
+          "Both users type a character at position 12 simultaneously. Which comes first?",
+          "What breaks the tie, and is it the same on both clients?"
+        ],
+        progressiveNudges: [
+          "Two editors insert at the same index at the same moment. Walk both clients through it.",
+          "Does each client see its own edit first? Do they still converge?",
+          "What deterministic tie-break do you use, and is it available to both clients without a round trip?"
+        ]
+      },
+      {
+        id: "offline_merge_bounded",
+        text: "A client returning with hundreds of local operations against a far-advanced document merges without losing work or replaying everything.",
+        dimension: "consistency",
+        importance: "core",
+        hiddenFrom: "hard",
+        satisfiedBy: [
+          "Local operations rebased or transformed against the missed range",
+          "A bounded path that does not require transforming against 40,000 operations one by one"
+        ],
+        discoveryHints: [
+          "A client reconnects with 800 local ops and the doc moved 40,000 ops ahead.",
+          "What does the merge actually compute, and how long does it take?"
+        ],
+        progressiveNudges: [
+          "Client offline a week, 800 local operations, document 40,000 ahead. What happens on reconnect?",
+          "Is that 800 x 40,000 transformations? What does that cost?",
+          "How do you bound it — snapshots, compaction, or a different mechanism entirely?"
+        ]
+      },
+      {
+        id: "ack_durability",
+        text: "An acknowledged edit survives a server restart, and the client knows which edits are not yet safe.",
+        dimension: "reliability",
+        importance: "core",
+        hiddenFrom: "hard",
+        satisfiedBy: [
+          "Operations appended durably before acknowledgement",
+          "A client-side pending set retried until acknowledged"
+        ],
+        discoveryHints: [
+          "What does the client do with an edit that has not been acknowledged?",
+          "The server restarts. Which edits survive?"
+        ],
+        progressiveNudges: [
+          "The server acks an operation then restarts. Is that operation still in the document?",
+          "What had to happen before the ack for that to be true?",
+          "And what does the client hold onto until the ack arrives?"
+        ]
+      },
+      {
+        id: "tombstone_metadata_cost",
+        text: "The metadata cost of the chosen mechanism — tombstones or position identifiers — is acknowledged and managed.",
+        dimension: "cost",
+        importance: "core",
+        hiddenFrom: "staff",
+        satisfiedBy: [
+          "Recognition that deleted characters or identifiers accumulate",
+          "A compaction or garbage-collection strategy with its safety condition"
+        ],
+        discoveryHints: [
+          "What happens to deleted characters in your representation?",
+          "Does the document's overhead grow with edit history?"
+        ],
+        progressiveNudges: [
+          "A document has been edited for two years. How much bigger is its representation than its text?",
+          "What is accumulating — tombstones, identifiers, or both?",
+          "When is it safe to collect them, given a client could still be offline holding old state?"
+        ]
+      },
+      {
+        id: "local_first_rendering",
+        text: "A local keystroke renders immediately without waiting for the server.",
+        dimension: "latencyPerformance",
+        importance: "core",
+        satisfiedBy: [
+          "The edit applied to local state before being sent",
+          "Server acknowledgement handled asynchronously"
+        ]
+      },
+      {
+        id: "operation_model",
+        text: "The operation type and position representation are defined precisely, not left implicit.",
+        dimension: "requirements",
+        importance: "expected",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "Insert and delete with a stated addressing scheme",
+          "A version or causal stamp carried with each operation"
+        ],
+        discoveryHints: [
+          "What exactly is sent when someone types one character?",
+          "How is the position addressed — by index, or by identifier?"
+        ],
+        progressiveNudges: [
+          "Describe the payload of a single keystroke.",
+          "Is the position an integer index or a stable identifier?",
+          "Index-based and identifier-based lead to very different designs. Which are you choosing?"
+        ]
+      },
+      {
+        id: "op_log_and_snapshots",
+        text: "Persistence is an operation log plus periodic snapshots, so opening a document does not replay all history.",
+        dimension: "scalability",
+        importance: "expected",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "A snapshot cadence with a reason",
+          "Document open reconstructing from the latest snapshot plus a bounded tail"
+        ],
+        discoveryHints: [
+          "What happens when someone opens a document with a million operations?",
+          "Is the current text stored anywhere, or only the operations?"
+        ],
+        progressiveNudges: [
+          "How do you reconstruct current state on open?",
+          "If that replays every operation ever, how long does it take?",
+          "How often do you snapshot, and what does that cost?"
+        ]
+      },
+      {
+        id: "fanout_math",
+        text: "Broadcast fanout is computed and its quadratic dependence on editors per document is noticed.",
+        dimension: "capacityEstimation",
+        importance: "expected",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "Operations/sec and broadcast events/sec both stated",
+          "Recognition that fanout scales with editors squared per document"
+        ],
+        discoveryHints: [
+          "How many broadcast events per second?",
+          "What happens to that number when editors per document doubles?"
+        ],
+        progressiveNudges: [
+          "Compute operations per second across all documents.",
+          "Now multiply by editors per document, since each op goes to all of them.",
+          "So what is the relationship between editor count and fanout? Say it precisely."
+        ]
+      },
+      {
+        id: "presence_ephemeral",
+        text: "Cursors and presence are treated as ephemeral, on a cheaper path than document operations.",
+        dimension: "operability",
+        importance: "expected",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "Presence not written to the durable operation log",
+          "Lossy or throttled cursor updates"
+        ],
+        discoveryHints: [
+          "Is a cursor move an operation in your log?",
+          "Does presence need to survive a restart?"
+        ],
+        progressiveNudges: [
+          "Someone moves their cursor thirty times a second. Does each one persist?",
+          "What would that do to your operation log volume?",
+          "So what guarantees does presence actually need, and how does that change its path?"
+        ]
+      },
+      {
+        id: "version_history_restore",
+        text: "Restoring the document as of an arbitrary point in the retention window is supported by the persistence design.",
+        dimension: "requirements",
+        importance: "expected",
+        hiddenFrom: "standard",
+        satisfiedBy: [
+          "Snapshots plus operations sufficient to reconstruct any point in the window",
+          "Restore expressed as new operations rather than mutating history"
+        ],
+        discoveryHints: [
+          "How do you show the document as it was 12 days ago?",
+          "Is a restore a rewrite, or new edits?"
+        ],
+        progressiveNudges: [
+          "A user wants the document as of last Tuesday. What do you read?",
+          "Do you have a snapshot near that point, or do you replay?",
+          "And when they restore it, does the intervening history disappear?"
+        ]
+      },
+      {
+        id: "divergence_detection",
+        text: "There is a way to detect two clients having diverged before a user reports it.",
+        dimension: "operability",
+        importance: "stretch",
+        hiddenFrom: "hard",
+        satisfiedBy: [
+          "Periodic state checksums compared across clients or against the server",
+          "An alert when checksums disagree at the same version"
+        ],
+        discoveryHints: [
+          "How would you know a convergence bug had shipped?",
+          "Can two clients tell each other they agree?"
+        ],
+        progressiveNudges: [
+          "A subtle bug makes two clients diverge on rare interleavings. How do you find out?",
+          "Could clients exchange a cheap fingerprint of their state?",
+          "At what version would you compare, and what do you do when they disagree?"
+        ]
+      }
+    ],
+    playbook: {
+      areasToProbe: [
+        {
+          id: "convergence",
+          label: "Convergence guarantee",
+          phaseRefs: ["convergence", "edit_model"],
+          criterionRefs: [
+            "convergence_mechanism",
+            "concurrent_insert_same_position",
+            "operation_model"
+          ],
+          sampleQuestions: [
+            "Two editors insert a character at the same position at the same instant. Trace both clients to identical state.",
+            "Is your position an integer index or a stable identifier, and what does that choice cost?"
+          ],
+          progressiveNudges: [
+            "Describe one keystroke's payload.",
+            "Two clients apply edits in different orders — what makes results identical?",
+            "Name the mechanism and the deterministic tie-break."
+          ],
+          greenFlags: [
+            "Commits to OT or CRDT and states the property it provides",
+            "Has a tie-break both clients can compute without a round trip"
+          ],
+          redFlags: [
+            "Says 'merge the changes' without a mechanism",
+            "Proposes locking a region of the document"
+          ]
+        },
+        {
+          id: "durability",
+          label: "Persistence and history",
+          phaseRefs: ["persistence"],
+          criterionRefs: ["ack_durability", "op_log_and_snapshots", "version_history_restore"],
+          sampleQuestions: [
+            "The server acknowledges an operation then restarts. Is that edit still in the document?",
+            "Someone opens a document with a million operations. What happens?"
+          ],
+          progressiveNudges: [
+            "What had to happen before the ack?",
+            "How is current state reconstructed on open?",
+            "How often do you snapshot, and how does that support a 30-day restore?"
+          ],
+          greenFlags: [
+            "Appends durably before acknowledging",
+            "Snapshot cadence justified against open latency"
+          ],
+          redFlags: [
+            "Acks from memory and persists later",
+            "Replays full history on every open"
+          ]
+        },
+        {
+          id: "offline_and_presence",
+          label: "Offline merge and presence",
+          phaseRefs: ["offline_and_presence"],
+          criterionRefs: ["offline_merge_bounded", "presence_ephemeral", "local_first_rendering"],
+          sampleQuestions: [
+            "A client reconnects with 800 local operations against a document 40,000 operations ahead. What happens?",
+            "Does a cursor move go into your operation log?"
+          ],
+          progressiveNudges: [
+            "What does the merge compute, and how expensive is it?",
+            "Is that a product of both counts? What bounds it?",
+            "Now presence — what guarantees does it actually need?"
+          ],
+          greenFlags: [
+            "Bounds the offline merge rather than transforming pairwise",
+            "Keeps presence off the durable path"
+          ],
+          redFlags: [
+            "Discards local work on a large divergence",
+            "Persists cursor movements as operations"
+          ]
+        },
+        {
+          id: "scale_and_safety",
+          label: "Fanout scale and divergence safety",
+          phaseRefs: ["estimate", "wrap_up"],
+          criterionRefs: ["fanout_math", "tombstone_metadata_cost", "divergence_detection"],
+          sampleQuestions: [
+            "How does broadcast volume change when editors per document doubles?",
+            "A convergence bug makes two clients diverge on rare interleavings. How do you find out?"
+          ],
+          progressiveNudges: [
+            "Compute operations per second, then broadcast events per second.",
+            "What is the relationship to editor count? Say it precisely.",
+            "And what fingerprint could clients exchange to prove they agree?"
+          ],
+          greenFlags: [
+            "Notices fanout is quadratic in editors per document",
+            "Proposes state checksums compared at a version"
+          ],
+          redFlags: [
+            "Assumes 60 editors is just 10x harder than 6",
+            "No answer for detecting divergence except user reports"
+          ]
+        }
+      ],
+      scoreRubric: {
+        "1": "Proposes last-write-wins or a lock on the document, with no mechanism for concurrent edits at the same position.",
+        "2": "Names OT or CRDT but cannot trace two concurrent inserts to identical state, and has no offline or persistence story.",
+        "3": "Commits to a mechanism, traces concurrent inserts deterministically, persists before acking, and uses snapshots so opening a document is fast.",
+        "4": "Also bounds the offline merge, keeps presence ephemeral, notices fanout is quadratic in editors, manages tombstone growth, and can detect divergence proactively."
+      }
+    }
   }
 });

@@ -180,5 +180,198 @@ export const urlShortener = defineSeedProblem({
           "Close it out. **Interact with:** **Board** — mark one or two decisions you would revisit, such as counting clicks synchronously versus asynchronously. **Interviewer** tab — summarise your design in a few sentences, then tell me unprompted what you would change if traffic grew ten times. Then use **Validate** for a score and **End interview** for the written debrief."
       }
     ]
+  },
+  rubric: {
+    criteria: [
+      {
+        id: "unique_code_generation",
+        text: "Two simultaneous create requests cannot be assigned the same short code, via a named mechanism.",
+        dimension: "consistency",
+        importance: "core",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "A uniqueness constraint with retry, a pre-allocated key range, or a per-node counter",
+          "A stated reason why random generation alone is not sufficient"
+        ],
+        discoveryHints: [
+          "Two people create a link at exactly the same moment. Could they get the same code?",
+          "What guarantees a code has not been used before?"
+        ],
+        progressiveNudges: [
+          "Two create requests arrive at the same instant on different servers. What code does each get?",
+          "If you generate randomly and check, what happens between the check and the write?",
+          "Name the mechanism that makes the code assignment unique — a constraint, a range, or a counter."
+        ]
+      },
+      {
+        id: "redirect_availability",
+        text: "Redirects keep working when the link-creation path is entirely down.",
+        dimension: "reliability",
+        importance: "core",
+        hiddenFrom: "hard",
+        satisfiedBy: [
+          "Read and write paths that do not share a single point of failure",
+          "Redirects served from cache or replicas independent of the create service"
+        ],
+        discoveryHints: [
+          "The create service is down. Do existing links still work?",
+          "What do the read and write paths share?"
+        ],
+        progressiveNudges: [
+          "Your link creation service is completely offline. Can people still follow existing links?",
+          "Which components do creating and redirecting have in common?",
+          "How would you separate them so a create outage never becomes a redirect outage?"
+        ]
+      },
+      {
+        id: "cache_backed_read_path",
+        text: "Redirects are served from a cache in front of the datastore to meet the 50ms p95 budget.",
+        dimension: "latencyPerformance",
+        importance: "core",
+        satisfiedBy: [
+          "A cache checked before the datastore on the redirect path",
+          "A stated hit ratio and what a miss costs"
+        ]
+      },
+      {
+        id: "read_write_ratio_math",
+        text: "Creates per second and redirects per second are both computed, and the ratio justifies the caching design.",
+        dimension: "capacityEstimation",
+        importance: "expected",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "Both rates stated as numbers",
+          "Database reads after cache derived from the hit ratio"
+        ],
+        discoveryHints: [
+          "How many redirects per second versus creates per second?",
+          "How many of those redirects reach the database?"
+        ],
+        progressiveNudges: [
+          "Roughly how many links are created per day, and how many redirects?",
+          "Divide both by 86,400. What is the ratio?",
+          "Now apply your cache hit ratio. How many reads actually hit the database?"
+        ]
+      },
+      {
+        id: "non_sequential_codes",
+        text: "Short codes are not sequentially guessable, so links cannot be enumerated.",
+        dimension: "security",
+        importance: "expected",
+        hiddenFrom: "standard",
+        satisfiedBy: [
+          "Randomised or scrambled codes rather than an encoded incrementing id",
+          "Recognition that a plain base62 counter is walkable"
+        ],
+        discoveryHints: [
+          "If I have one code, can I guess the next one?",
+          "What does your code encode?"
+        ],
+        progressiveNudges: [
+          "Suppose your codes are a counter in base62. What can I do with one code?",
+          "Why might enumerating everyone's links be a problem?",
+          "How would you keep codes short but not walkable?"
+        ]
+      },
+      {
+        id: "async_click_counting",
+        text: "Click counting is off the redirect critical path and never decreases.",
+        dimension: "operability",
+        importance: "stretch",
+        hiddenFrom: "hard",
+        satisfiedBy: [
+          "Events buffered, batched, or streamed rather than a synchronous increment",
+          "Aggregation that tolerates retries without going backwards"
+        ],
+        discoveryHints: [
+          "Does counting a click slow down the redirect?",
+          "What stops a count going backwards?"
+        ],
+        progressiveNudges: [
+          "When someone follows a link, when is the click counted?",
+          "If that is a synchronous database write, what does it add to your 50ms budget?",
+          "Move it off the path — and then what keeps the count from dipping when the aggregator restarts?"
+        ]
+      }
+    ],
+    playbook: {
+      areasToProbe: [
+        {
+          id: "code_assignment",
+          label: "Short code generation",
+          phaseRefs: ["api_and_codes"],
+          criterionRefs: ["unique_code_generation", "non_sequential_codes"],
+          sampleQuestions: [
+            "Two create requests arrive at the same instant on different servers. What code does each get, and how do you know they differ?",
+            "If I have one of your short codes, can I guess another valid one?"
+          ],
+          progressiveNudges: [
+            "How is a code produced — random, hashed, or counted?",
+            "If you generate then check, what happens between the check and the write?",
+            "Name the mechanism that makes uniqueness guaranteed rather than likely."
+          ],
+          greenFlags: [
+            "Names a uniqueness constraint with retry, a key range, or a per-node counter",
+            "Keeps codes short without making them sequential"
+          ],
+          redFlags: [
+            "Random generation with a read-then-write check and no constraint",
+            "Base62 of an auto-increment id with no scrambling"
+          ]
+        },
+        {
+          id: "read_path",
+          label: "Redirect path",
+          phaseRefs: ["read_path", "estimate"],
+          criterionRefs: ["cache_backed_read_path", "read_write_ratio_math", "redirect_availability"],
+          sampleQuestions: [
+            "How many redirects per second versus creates, and how many reach the database?",
+            "The create service is completely down. Do existing links still resolve?"
+          ],
+          progressiveNudges: [
+            "Compute both rates and take the ratio.",
+            "Apply your cache hit ratio — how many database reads remain?",
+            "Now what do the read and write paths share, and can you separate them?"
+          ],
+          greenFlags: [
+            "States the read/write ratio and uses it to justify caching",
+            "Separates read and write paths so a create outage does not break redirects"
+          ],
+          redFlags: [
+            "Every redirect queries the primary database",
+            "Read and write share one service and one datastore instance"
+          ]
+        },
+        {
+          id: "counting",
+          label: "Click counting",
+          phaseRefs: ["read_path", "wrap_up"],
+          criterionRefs: ["async_click_counting"],
+          sampleQuestions: [
+            "When is a click counted, and does that add to redirect latency?",
+            "What stops the count going backwards if your aggregator restarts?"
+          ],
+          progressiveNudges: [
+            "Is counting a synchronous write on the redirect path?",
+            "What does that add to your 50ms budget?",
+            "Move it off the path — then how do you keep the total monotonic?"
+          ],
+          greenFlags: [
+            "Buffers or batches click events off the critical path",
+            "Handles aggregator restarts without dipping the count"
+          ],
+          redFlags: [
+            "Synchronous counter increment inside the redirect",
+            "No thought given to double counting on retry"
+          ]
+        }
+      ],
+      scoreRubric: {
+        "1": "Stores a mapping and looks it up, with no cache, no uniqueness guarantee, and no sense of how lopsided reads and writes are.",
+        "2": "Adds a cache and computes rough rates, but code uniqueness relies on generate-and-check and the read path shares fate with creates.",
+        "3": "Names a real uniqueness mechanism, computes the read/write ratio, serves redirects from cache, and keeps redirects working when creates are down.",
+        "4": "Also keeps codes non-enumerable, moves click counting off the critical path, and keeps that count monotonic across aggregator restarts."
+      }
+    }
   }
 });

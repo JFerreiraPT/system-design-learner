@@ -256,5 +256,305 @@ export const ragKnowledgeAssistant = defineSeedProblem({
           "Close it out. **Interact with:** **Board** — mark the trade-offs: retrieval recall against prompt cost, cache reuse against permission safety, answer quality against latency. **Interviewer** tab — summarise, then answer unprompted: what breaks first at 10x corpus size, and what would you log on every query to make a bad answer debuggable a week later? Then **Validate**, then **End interview**."
       }
     ]
+  },
+  rubric: {
+    criteria: [
+      {
+        id: "query_time_authorization",
+        text: "Permissions are enforced at query time against the live authorization source, not against metadata copied into the index.",
+        dimension: "security",
+        importance: "core",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "An authorization filter applied per retrieval using current permissions",
+          "Index permission metadata treated as a hint at best"
+        ],
+        discoveryHints: [
+          "A document was public when indexed and is restricted now. Is its chunk retrievable?",
+          "Where do the permissions used in retrieval come from?"
+        ],
+        progressiveNudges: [
+          "You indexed a chunk while its document was company-wide. It is now team-only. What happens on retrieval?",
+          "If the index holds a copy of the ACL, how stale can that copy be?",
+          "So what has to be consulted at query time for the answer to be safe?"
+        ]
+      },
+      {
+        id: "cache_scoped_to_requester",
+        text: "The answer cache is keyed on the requester's access scope, so a cached answer cannot leak across users.",
+        dimension: "security",
+        importance: "core",
+        hiddenFrom: "hard",
+        satisfiedBy: [
+          "A cache key including the identity or permission set, not just the question text",
+          "Recognition that identical questions can have different lawful answers"
+        ],
+        discoveryHints: [
+          "Two people ask the same question with different access. Same cached answer?",
+          "What is in your cache key?"
+        ],
+        progressiveNudges: [
+          "An engineer asks a question and you cache the answer. Now a contractor asks the same words.",
+          "If the key is the question text, what did you just serve them?",
+          "What has to be in that key to make reuse safe, and what does that do to your hit rate?"
+        ]
+      },
+      {
+        id: "grounded_or_abstain",
+        text: "Every claim cites a retrieved source, and the assistant abstains when retrieval finds nothing relevant.",
+        dimension: "reliability",
+        importance: "core",
+        hiddenFrom: "hard",
+        satisfiedBy: [
+          "Citations tied to specific retrieved chunks",
+          "An explicit no-answer path when retrieval scores are poor"
+        ],
+        discoveryHints: [
+          "What happens when nothing relevant is retrieved?",
+          "What stops the model answering from its own weights?"
+        ],
+        progressiveNudges: [
+          "Retrieval returns three irrelevant chunks. What does the user get?",
+          "Does the model still answer? What would it be answering from?",
+              "What signal do you use to decide to abstain instead?"
+        ]
+      },
+      {
+        id: "provider_degradation",
+        text: "A slow or failing model provider degrades the experience deliberately rather than failing outright.",
+        dimension: "reliability",
+        importance: "core",
+        hiddenFrom: "staff",
+        satisfiedBy: [
+          "Timeouts plus fallback to a cheaper or alternate model",
+          "A stated user-visible behaviour during degradation"
+        ],
+        discoveryHints: [
+          "The provider starts timing out on a third of calls. What does a user see?",
+          "Is there a second model in this design?"
+        ],
+        progressiveNudges: [
+          "A third of your inference calls are timing out. What happens to those requests?",
+          "Do you retry, fall back, or fail? Pick and say why.",
+          "If you fall back to a weaker model, how does the user know the answer is degraded?"
+        ]
+      },
+      {
+        id: "index_freshness_pipeline",
+        text: "Document edits reach retrieval within the stated window via incremental updates, and deletes remove chunks.",
+        dimension: "consistency",
+        importance: "core",
+        satisfiedBy: [
+          "An incremental ingestion path triggered by document change events",
+          "A delete path that removes chunks rather than orphaning them"
+        ]
+      },
+      {
+        id: "index_and_cost_math",
+        text: "Vector index size and daily inference cost are both computed, and the cost driver identified.",
+        dimension: "capacityEstimation",
+        importance: "expected",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "Total chunks times embedding bytes stated as a number",
+          "Daily spend derived from queries, prompt tokens, and price per token"
+        ],
+        discoveryHints: [
+          "How large is the vector index?",
+          "What does a day of queries cost?"
+        ],
+        progressiveNudges: [
+          "How many chunks, and how many bytes each?",
+          "Now the bill: queries times prompt tokens times price.",
+          "Which of those factors would you attack first to halve it?"
+        ]
+      },
+      {
+        id: "chunking_strategy",
+        text: "Chunking is a stated strategy with a named cost at retrieval time, not an arbitrary token split.",
+        dimension: "requirements",
+        importance: "expected",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "Chunk size and overlap chosen with a reason",
+          "Recognition that small chunks improve precision but lose context"
+        ],
+        discoveryHints: [
+          "How do you split a document, and why that way?",
+          "What does a chunk that is too small cost you?"
+        ],
+        progressiveNudges: [
+          "What is your chunk size?",
+          "What happens to an answer whose evidence spans a chunk boundary?",
+          "So what does overlap buy, and what does it cost in index size?"
+        ]
+      },
+      {
+        id: "latency_budget_breakdown",
+        text: "The 5-second budget is broken into retrieval, reranking, and generation, with the dominant term named.",
+        dimension: "latencyPerformance",
+        importance: "expected",
+        hiddenFrom: "guided",
+        satisfiedBy: [
+          "Per-stage latency estimates that sum within budget",
+          "Generation identified as the dominant cost"
+        ],
+        discoveryHints: [
+          "Where does the 5 seconds actually go?",
+          "Which stage dominates?"
+        ],
+        progressiveNudges: [
+          "Break the 5-second budget into stages.",
+          "Which one is largest, and by how much?",
+          "Given queries per second is tiny, is throughput or latency your real problem?"
+        ]
+      },
+      {
+        id: "per_team_budget_attribution",
+        text: "Inference spend is attributed per team and one team cannot exhaust the global budget.",
+        dimension: "cost",
+        importance: "expected",
+        hiddenFrom: "standard",
+        satisfiedBy: [
+          "Per-team accounting on the inference gateway",
+          "Quotas or rate limits that bound one team's spend"
+        ],
+        discoveryHints: [
+          "One team writes a script that asks 100,000 questions overnight. What happens?",
+          "How do you know which team spent what?"
+        ],
+        progressiveNudges: [
+          "A team automates queries and burns the monthly budget in a night. Who stops them?",
+          "Is spend attributable per team at all?",
+          "What is the enforcement — a quota, a rate limit, or a hard cutoff?"
+        ]
+      },
+      {
+        id: "offline_eval_gate",
+        text: "There is an offline evaluation set and a scoring method that gates prompt or model changes.",
+        dimension: "operability",
+        importance: "stretch",
+        hiddenFrom: "hard",
+        satisfiedBy: [
+          "A labelled question set with a retrieval and answer metric",
+          "A gate in the release path for prompt or model changes"
+        ],
+        discoveryHints: [
+          "How would you know a prompt change made answers worse?",
+          "What runs before a model upgrade ships?"
+        ],
+        progressiveNudges: [
+          "You swap the model for a newer one. How do you know quality did not regress?",
+          "Is there a dataset you can score against?",
+          "What metric, and what threshold blocks the release?"
+        ]
+      }
+    ],
+    playbook: {
+      areasToProbe: [
+        {
+          id: "permission_safety",
+          label: "Permission safety",
+          phaseRefs: ["permissions"],
+          criterionRefs: ["query_time_authorization", "cache_scoped_to_requester"],
+          sampleQuestions: [
+            "A chunk was indexed while its document was public. The document is now restricted. What happens on retrieval?",
+            "Two users with different access ask the identical question. What does your cache do?"
+          ],
+          progressiveNudges: [
+            "Where do the permissions used at retrieval come from?",
+            "How stale can that copy be, and what is the 5-minute constraint asking for?",
+            "Now the cache key — what makes reuse safe across users?"
+          ],
+          greenFlags: [
+            "Filters against live authorization at query time",
+            "Includes access scope in the cache key and accepts the hit-rate cost"
+          ],
+          redFlags: [
+            "Stores ACLs in the vector index and trusts them",
+            "Caches on question text alone"
+          ]
+        },
+        {
+          id: "retrieval_quality",
+          label: "Retrieval quality",
+          phaseRefs: ["ingestion", "retrieval"],
+          criterionRefs: ["chunking_strategy", "grounded_or_abstain", "index_freshness_pipeline"],
+          sampleQuestions: [
+            "What is your chunk size, and what happens when evidence spans a boundary?",
+            "Retrieval returns three irrelevant chunks. What does the user get?"
+          ],
+          progressiveNudges: [
+            "How are documents split?",
+            "What does overlap buy you, and what does it cost?",
+            "And when retrieval is bad, what makes the system abstain rather than improvise?"
+          ],
+          greenFlags: [
+            "Justifies chunk size and overlap against retrieval precision",
+            "Has an explicit abstain path with a score threshold"
+          ],
+          redFlags: [
+            "Fixed token split with no rationale",
+            "Always answers, citing whatever came back"
+          ]
+        },
+        {
+          id: "cost_and_latency",
+          label: "Cost and latency",
+          phaseRefs: ["estimate", "serving_and_evals"],
+          criterionRefs: [
+            "index_and_cost_math",
+            "latency_budget_breakdown",
+            "per_team_budget_attribution"
+          ],
+          sampleQuestions: [
+            "What does a day of queries cost, and what would you change first to halve it?",
+            "One team scripts 100,000 questions overnight. What happens?"
+          ],
+          progressiveNudges: [
+            "Compute daily inference spend from queries, tokens, and price.",
+            "Now break the 5-second budget into stages — which dominates?",
+            "And who stops one team consuming the whole budget?"
+          ],
+          greenFlags: [
+            "Notices queries per second is tiny, so latency not throughput is the problem",
+            "Attributes spend per team with an enforced quota"
+          ],
+          redFlags: [
+            "Treats inference cost as an afterthought",
+            "Scales for throughput that does not exist"
+          ]
+        },
+        {
+          id: "reliability_and_quality_gates",
+          label: "Provider failure and evals",
+          phaseRefs: ["serving_and_evals", "wrap_up"],
+          criterionRefs: ["provider_degradation", "offline_eval_gate"],
+          sampleQuestions: [
+            "The provider times out on a third of calls. What does a user experience?",
+            "You upgrade the model. How do you know quality did not regress?"
+          ],
+          progressiveNudges: [
+            "Do you retry, fall back, or fail?",
+            "If you fall back to a weaker model, does the user know?",
+            "And what dataset and metric would block a bad prompt change from shipping?"
+          ],
+          greenFlags: [
+            "Timeouts plus a named fallback model and a user-visible signal",
+            "A scored eval set gating releases"
+          ],
+          redFlags: [
+            "Unbounded retries against a failing provider",
+            "No way to detect a quality regression before users complain"
+          ]
+        }
+      ],
+      scoreRubric: {
+        "1": "Describes embed-retrieve-generate with no permission model, no cost awareness, and no behaviour when retrieval or the provider fails.",
+        "2": "Has a working pipeline with chunking and a vector store, but permissions live in the index, the cache is keyed on the question, and cost is unexamined.",
+        "3": "Enforces authorization at query time, scopes the cache to the requester, abstains when ungrounded, keeps the index fresh, and computes the bill.",
+        "4": "Also breaks down the latency budget, attributes and bounds spend per team, degrades deliberately when the provider fails, and gates changes on a scored eval set."
+      }
+    }
   }
 });

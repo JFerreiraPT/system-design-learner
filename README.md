@@ -97,9 +97,20 @@ pnpm db:seed             # upsert every seed
 
 Seeds carry the same payload the generator produces (`narrative_json`, `estimation_spec_json`, `interview_plan_json`), so framing scripts, stall ladders, per-problem phases, and magnitude calibration all behave identically on them.
 
-Rubric criteria are deliberately **not** seeded: `interviews.criteria_json` is generated per interview because it depends on the interviewer level, so one stored rubric could not serve all four. Starting an interview on a seeded problem still makes that one model call.
+### Rubrics are seeded too, via projection
 
-Adding a problem: drop a file in `seeds/catalog/`, export it from `seeds/index.ts`, then run `pnpm db:seed --dry-run`. Validation is stricter than the DB schema — it rejects magnitude bands narrower than 10x and derived formulas that would be silently discarded at runtime. `pnpm --filter @sdl/api test` covers the whole catalogue.
+Interviewer level changes exactly **one** thing about a rubric: which expectations are hidden rather than printed on the Problem rail (`LEVEL_HIDDEN_GUIDANCE` in `@sdl/ai-prompts` is the only place level enters rubric generation — every other budget comes from difficulty). So rather than store four near-duplicate rubrics per problem and let them drift, each seed stores **one** canonical criteria set in `problems.seeded_rubric_json`, with every criterion tagged by the level at which it goes hidden:
+
+```ts
+{ id: "edge_prepositioning", importance: "core", hiddenFrom: "standard", ... }
+// guided -> visible | standard, hard, staff -> hidden
+```
+
+`projectRubricForLevel` binds it to a level at interview start, producing exactly what the generator would have — including pre-marking `visible` criteria as discovered so the rail does not ask the candidate to "find" a bullet they can already read. **A seeded problem therefore starts an interview with no model call at all**, at any of the four levels.
+
+`interviews.criteria_json` still stores the projected, per-interview rubric — `discoveredVia` is mutated as the candidate surfaces things, so it has to be per interview. Only the *template* is shared. A seed with no `rubric` is still valid; it just falls back to generating one.
+
+Adding a problem: drop a file in `seeds/catalog/`, export it from `seeds/index.ts`, then run `pnpm db:seed --dry-run`. Validation is stricter than the DB schema and checks **every level's projection**, not just one — a discovery floor satisfied at `staff` but violated at `guided` would otherwise ship silently and leave guided candidates nothing to discover. It also enforces the same `CRITERIA_BUDGET_BY_DIFFICULTY` the generator is held to, rejects magnitude bands narrower than 10x, and rejects derived formulas that would be silently discarded at runtime. `pnpm --filter @sdl/api test` covers the whole catalogue.
 
 The runner matches on `title` and updates in place, so re-seeding never duplicates rows or orphans a running interview, and it only ever touches rows whose title matches a seed.
 
