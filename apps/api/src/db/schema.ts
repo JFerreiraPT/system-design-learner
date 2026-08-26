@@ -9,7 +9,18 @@ import type {
   StoredInterviewRubric,
   Track
 } from "@sdl/shared";
-import { index, pgTable, text, timestamp, uuid, boolean, jsonb, integer } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import {
+  index,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+  boolean,
+  jsonb,
+  integer
+} from "drizzle-orm/pg-core";
 
 export const problems = pgTable("problems", {
   id: uuid("id").defaultRandom().primaryKey(),
@@ -147,25 +158,49 @@ export const interviewPhaseEvents = pgTable(
   })
 );
 
-export const interviewMessages = pgTable("interview_messages", {
-  id: uuid("id").defaultRandom().primaryKey(),
-  interviewId: uuid("interview_id").notNull().references(() => interviews.id),
-  role: text("role").notNull(),
-  content: text("content").notNull(),
-  /** `"voice"` on turns that arrived through a realtime session. NULL means
-   * text — which is every row written before voice existed, and is deliberately
-   * not backfilled. Nothing downstream branches on this; it exists so a session
-   * can be reviewed later knowing how it was conducted. */
-  source: text("source").$type<"voice">(),
-  /** Realtime conversation item id, and the idempotency key for
-   * `POST /interviews/:id/voice/turns`. A unique index on
-   * `(interview_id, external_id)` (partial, `WHERE external_id IS NOT NULL`)
-   * makes a re-post a no-op: reconnects and retries will replay turns, and a
-   * duplicated candidate answer skews the debrief and double-counts
-   * discoveries. NULL on every text row. */
-  externalId: text("external_id"),
-  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull()
-});
+export const interviewMessages = pgTable(
+  "interview_messages",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    interviewId: uuid("interview_id")
+      .notNull()
+      .references(() => interviews.id),
+    role: text("role").notNull(),
+    content: text("content").notNull(),
+    /** `"voice"` on turns that arrived through a realtime session. NULL means
+     * text — which is every row written before voice existed, and is
+     * deliberately not backfilled. Nothing downstream branches on this; it
+     * exists so a session can be reviewed later knowing how it was
+     * conducted. */
+    source: text("source").$type<"voice">(),
+    /** Realtime conversation item id, and the idempotency key for
+     * `POST /interviews/:id/voice/turns`. NULL on every text row. */
+    externalId: text("external_id"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull()
+  },
+  (table) => ({
+    /**
+     * Makes a re-posted spoken turn a no-op.
+     *
+     * Reconnects, retries and React strict-mode double-effects all replay
+     * turns, and a duplicated candidate answer skews the debrief and
+     * double-counts discoveries. `persistVoiceTurns` relies on this index
+     * existing: without it `onConflictDoNothing` matches nothing and every
+     * replay inserts.
+     *
+     * It has to be declared HERE, not only in the hand-written migration —
+     * `pnpm db:push` diffs this file against the database and never reads the
+     * SQL files, so an index that lives only in a migration silently does not
+     * exist in any dev database.
+     *
+     * Partial, because `external_id` is NULL on every text row and NULLs must
+     * stay unconstrained.
+     */
+    externalIdUidx: uniqueIndex("interview_messages_external_id_uidx")
+      .on(table.interviewId, table.externalId)
+      .where(sql`${table.externalId} IS NOT NULL`)
+  })
+);
 
 export const tutorSessions = pgTable("tutor_sessions", {
   id: uuid("id").defaultRandom().primaryKey(),

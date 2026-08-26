@@ -11,6 +11,7 @@
     "db:generate": "pnpm --filter @sdl/api db:generate",
     "db:migrate": "pnpm --filter @sdl/api db:migrate",
     "db:push": "pnpm --filter @sdl/api db:push",
+    "db:seed": "pnpm --filter @sdl/api db:seed",
     "agent:login": "bash scripts/agent-login.sh",
     "agent:status": "bash scripts/agent-login.sh --status",
     "agent:logout": "bash scripts/agent-login.sh --logout",
