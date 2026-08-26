@@ -104,6 +104,13 @@ export const interviews = pgTable("interviews", {
    * the interview is still active and on every legacy row — the Validate tab
    * simply renders no debrief block in that case. */
   debriefJson: jsonb("debrief_json").$type<InterviewDebrief | null>().default(null),
+  /** Accumulated seconds of realtime audio spent on this interview.
+   *
+   * Persisted rather than tracked client-side so the session ceiling survives a
+   * reload. A voice session bills for as long as its socket is open — unlike
+   * every other AI call here, which is bounded by a request — so a ceiling that
+   * resets on F5 is decoration. */
+  voiceSeconds: integer("voice_seconds").default(0).notNull(),
   startedAt: timestamp("started_at", { withTimezone: true }).defaultNow().notNull(),
   endedAt: timestamp("ended_at", { withTimezone: true })
 });
@@ -145,6 +152,18 @@ export const interviewMessages = pgTable("interview_messages", {
   interviewId: uuid("interview_id").notNull().references(() => interviews.id),
   role: text("role").notNull(),
   content: text("content").notNull(),
+  /** `"voice"` on turns that arrived through a realtime session. NULL means
+   * text — which is every row written before voice existed, and is deliberately
+   * not backfilled. Nothing downstream branches on this; it exists so a session
+   * can be reviewed later knowing how it was conducted. */
+  source: text("source").$type<"voice">(),
+  /** Realtime conversation item id, and the idempotency key for
+   * `POST /interviews/:id/voice/turns`. A unique index on
+   * `(interview_id, external_id)` (partial, `WHERE external_id IS NOT NULL`)
+   * makes a re-post a no-op: reconnects and retries will replay turns, and a
+   * duplicated candidate answer skews the debrief and double-counts
+   * discoveries. NULL on every text row. */
+  externalId: text("external_id"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull()
 });
 

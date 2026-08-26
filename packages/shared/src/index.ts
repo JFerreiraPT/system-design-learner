@@ -1433,3 +1433,175 @@ export const TutorMessageSchema = z.object({
   content: z.string().min(1),
   workspaceContext: workspaceContextSchema
 });
+
+// ---------------------------------------------------------------------------
+// Voice (tasks 20-26) — spoken interviews over the OpenAI Realtime API.
+//
+// The browser holds a WebRTC connection straight to OpenAI; the server only
+// mints credentials and records what was said. Everything in this block is the
+// contract between those two halves.
+// ---------------------------------------------------------------------------
+
+/** Turn-detection modes we expose. `semantic_vad` runs a model over the audio
+ * and sets the end-of-turn timeout from how *finished* the speech sounds, which
+ * is the only one of the two that survives a candidate thinking mid-sentence.
+ * `server_vad` is a fixed silence threshold, kept as an escape hatch. */
+export const VoiceTurnDetectionModeSchema = z.enum(["semantic_vad", "server_vad"]);
+export type VoiceTurnDetectionMode = z.infer<typeof VoiceTurnDetectionModeSchema>;
+
+/** How eager the model is to take the floor. `low` lets the candidate speak
+ * uninterrupted — the right default for someone reasoning out loud over a
+ * whiteboard. Only meaningful for `semantic_vad`. */
+export const VoiceEagernessSchema = z.enum(["low", "medium", "high", "auto"]);
+export type VoiceEagerness = z.infer<typeof VoiceEagernessSchema>;
+
+/** Non-secret turn-detection snapshot handed to the client so its UI can
+ * explain what it is doing. Deliberately not the authority: the real config was
+ * baked into the ephemeral credential server-side. */
+export const VoiceTurnDetectionSchema = z.object({
+  type: VoiceTurnDetectionModeSchema,
+  eagerness: VoiceEagernessSchema.optional(),
+  /** Only set for `server_vad`. */
+  silenceDurationMs: z.number().int().positive().optional()
+});
+export type VoiceTurnDetection = z.infer<typeof VoiceTurnDetectionSchema>;
+
+/**
+ * What `POST /interviews/:id/voice/session` returns.
+ *
+ * Note what is NOT here: `instructions`. The interviewer prompt embeds every
+ * undiscovered hidden expectation verbatim, with its progressive nudges, so
+ * shipping it to the browser would let a candidate read the entire hidden rubric
+ * out of devtools and make `detectDiscoveries` meaningless. The prompt is baked
+ * into the ephemeral credential by the server and never leaves it.
+ */
+export const VoiceSessionResponseSchema = z.object({
+  /** Short-lived credential. Authorises exactly one realtime call. */
+  clientSecret: z.string().min(1),
+  /** ISO timestamp. The client re-mints *before* this, rather than waiting for
+   * a dead connection — an expired session has no request to fail. */
+  expiresAt: z.string(),
+  model: z.string().min(1),
+  voice: z.string().min(1),
+  sampleRate: z.number().int().positive(),
+  turnDetection: VoiceTurnDetectionSchema,
+  /** Seconds of voice already spent on this interview, and the ceiling. Drives
+   * the countdown and the spend meter (task 26). */
+  accumulatedSeconds: z.number().int().nonnegative(),
+  maxSessionSeconds: z.number().int().positive()
+});
+export type VoiceSessionResponse = z.infer<typeof VoiceSessionResponseSchema>;
+
+/** Where the interviewer's attention is, derived from data-channel events.
+ *
+ * `speech_stopped` deliberately does NOT map to `thinking`: under semantic VAD
+ * speech can stop and resume inside a single turn, and a UI that flickers to
+ * "thinking" during every pause tells the candidate they are being cut off even
+ * when they are not. */
+export const VoiceTurnStateSchema = z.enum([
+  "idle",
+  "listening",
+  "candidateSpeaking",
+  "thinking",
+  "interviewerSpeaking",
+  "held"
+]);
+export type VoiceTurnState = z.infer<typeof VoiceTurnStateSchema>;
+
+export const VoiceConnectionStatusSchema = z.enum([
+  "idle",
+  "connecting",
+  "live",
+  "reconnecting",
+  "closed",
+  "failed"
+]);
+export type VoiceConnectionStatus = z.infer<typeof VoiceConnectionStatusSchema>;
+
+/** One completed spoken turn, posted back for persistence.
+ *
+ * `externalId` is the realtime conversation item id and doubles as the
+ * idempotency key: reconnects, retries and React strict-mode double-effects all
+ * re-post the same turn, and a duplicated candidate answer skews the debrief
+ * and double-counts discoveries. */
+export const VoiceTurnSchema = z.object({
+  externalId: z.string().min(1).max(200),
+  role: z.enum(["user", "assistant"]),
+  content: z.string().min(1).max(20000),
+  /** Phase snapshot from the turn that produced this. The timer is
+   * client-owned, so pacing has to travel with the turn — same as the text
+   * path. */
+  phase: PhaseRuntimeInfoSchema.optional(),
+  /** True when the candidate talked over the interviewer and the item was
+   * truncated to what was actually heard. */
+  interrupted: z.boolean().optional()
+});
+export type VoiceTurn = z.infer<typeof VoiceTurnSchema>;
+
+/** Body for a session mint. The workspace snapshot is optional and advisory —
+ * it only seeds the opening context, and the constraint set inside it is
+ * overwritten server-side from `interviews.live_constraints_json` exactly as the
+ * text path does. Nothing here is trusted. */
+export const VoiceSessionRequestSchema = z.object({
+  workspaceContext: workspaceContextSchema.optional()
+});
+export type VoiceSessionRequest = z.infer<typeof VoiceSessionRequestSchema>;
+
+export const VoiceTurnsRequestSchema = z.object({
+  turns: z.array(VoiceTurnSchema).min(1).max(20),
+  /** Audio seconds consumed since the last post, for the per-interview
+   * ceiling. Client-reported, like phase events. */
+  audioSecondsDelta: z.number().nonnegative().max(3600).optional()
+});
+export type VoiceTurnsRequest = z.infer<typeof VoiceTurnsRequestSchema>;
+
+export const VoiceTurnsResponseSchema = z.object({
+  /** Turns actually inserted. A replay reports 0 and runs no post-turn work. */
+  persisted: z.number().int().nonnegative(),
+  /** Turns skipped because their `externalId` was already recorded. */
+  duplicates: z.number().int().nonnegative(),
+  accumulatedSeconds: z.number().int().nonnegative(),
+  /** True once the ceiling is reached; the client must close the session. */
+  ceilingReached: z.boolean()
+});
+export type VoiceTurnsResponse = z.infer<typeof VoiceTurnsResponseSchema>;
+
+/** Placeholder for a candidate turn whose transcription never completed.
+ *
+ * A gap is far better than a dropped turn: `detectDiscoveries` reads the
+ * assistant reply, and without the question it answered the transcript reads as
+ * the interviewer asking something out of nowhere. */
+export const INAUDIBLE_TURN_CONTENT = "[inaudible]";
+
+/** Marker prefix on context items injected into a live session (task 24).
+ *
+ * These exist in the model's conversation but are not interview turns: they must
+ * not be persisted, must not render in the transcript, and must not reach the
+ * debrief. One prefix, checked in one place. */
+export const VOICE_CONTEXT_ITEM_PREFIX = "[workspace]";
+
+/** Realtime audio pricing, used only for the client-side spend estimate.
+ * Documented at developers.openai.com/api/docs/pricing (August 2026). */
+export const VOICE_RATE_USD_PER_MILLION_INPUT_TOKENS = 32;
+export const VOICE_RATE_USD_PER_MILLION_OUTPUT_TOKENS = 64;
+/** Rough token-per-second rates for audio, from OpenAI's own worked example:
+ * ~600 tokens per minute heard, ~1200 per minute spoken. */
+export const VOICE_INPUT_TOKENS_PER_SECOND = 10;
+export const VOICE_OUTPUT_TOKENS_PER_SECOND = 20;
+
+/**
+ * Estimated spend for a voice session. Deliberately approximate — the point is
+ * that the candidate can see the meter running, not accounting accuracy.
+ */
+export function estimateVoiceCostUsd(input: {
+  heardSeconds: number;
+  spokenSeconds: number;
+}): number {
+  const heard = Math.max(0, input.heardSeconds);
+  const spoken = Math.max(0, input.spokenSeconds);
+  const inputUsd =
+    (heard * VOICE_INPUT_TOKENS_PER_SECOND * VOICE_RATE_USD_PER_MILLION_INPUT_TOKENS) / 1_000_000;
+  const outputUsd =
+    (spoken * VOICE_OUTPUT_TOKENS_PER_SECOND * VOICE_RATE_USD_PER_MILLION_OUTPUT_TOKENS) / 1_000_000;
+  return inputUsd + outputUsd;
+}

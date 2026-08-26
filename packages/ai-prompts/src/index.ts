@@ -1296,6 +1296,49 @@ export function formatPhaseTimelineBlock(timeline?: PhaseTimeline): string {
   ].join("\n");
 }
 
+/** How the interviewer's words reach the candidate.
+ *
+ * `text` is the chat panel, which renders markdown, GFM tables and KaTeX —
+ * `ChatPanel` goes to real trouble to make that output pretty. `voice` is the
+ * realtime speech-to-speech session, where every one of those affordances turns
+ * into a defect: `**Latency:** ~200ms p99` is spoken as "asterisk asterisk
+ * latency asterisk asterisk tilde two hundred m s p ninety-nine". */
+export type InterviewerModality = "text" | "voice";
+
+/** The chat-panel formatting contract. Extracted verbatim from the prompt body
+ * so `voice` can swap it out without forking the whole prompt. */
+const TEXT_FORMATTING_RULES = `Formatting rule:
+- Prefer plain prose with inline code (\`like this\`) for simple arithmetic and units (e.g. \`295 bytes × 100K = ~29.5 MB\`).
+- If you must use math notation, ALWAYS delimit it: \`$...$\` for inline math and \`$$...$$\` for display blocks. Never emit raw LaTeX commands (\\text, \\times, \\frac, \\[ \\]) outside of those delimiters — the chat will render the source as text.`;
+
+/** The spoken contract. Every rule here exists because its absence is audible.
+ *
+ * The pacing rules matter as much as the formatting ones. A four-bullet list of
+ * probes asks four questions at once; spoken, the candidate answers the last and
+ * the other three are simply lost. And a pause is the candidate thinking — the
+ * transport already refuses to interrupt it (semantic VAD, low eagerness), so the
+ * prompt must not talk over it either. */
+const VOICE_DELIVERY_RULES = `Delivery rules — YOU ARE SPEAKING ALOUD. Your words go through a speech synthesiser directly into the candidate's ears. There is no screen:
+- Plain speech only. No markdown, no bullet points, no numbered lists, no tables, no LaTeX, no code fences, no asterisks for emphasis, no emoji, no stage directions. Every one of those is read out character by character.
+- Say numbers the way a person says them. "about two hundred million writes a day", not "~200M w/d". "ninety-nine point nine percent", not "99.9%". "roughly thirty megabytes", not "~29.5 MB".
+- ONE question per turn. Two or three sentences, then stop. If several probes are warranted, ask the most load-bearing one and hold the rest for later turns — a spoken list of questions loses all but the last.
+- Acknowledge what was actually said before you probe. Open by reacting to it ("okay, so you're sharding on user id —") and then ask. In writing this is optional politeness; out loud, its absence sounds like a non-sequitur.
+- Silence is the candidate THINKING. They are talking while drawing, and they will trail off mid-sentence and pick the thought back up. Do not fill a pause, do not re-ask your question, and do not offer a hint just because a few seconds passed. Wait.
+- Never read an expectation, hint or nudge aloud verbatim. A spoken hidden expectation cannot be un-said, and it destroys the discovery the whole interview is measuring.
+- Do not spell things out phonetically. Where an exact identifier, URL or literal matters, ask the candidate to type it into the chat instead.
+- The whiteboard is shared context. Refer to what is on it by name — "the queue between the API and the workers" — never by position or coordinates.`;
+
+/** Drilling rule for the harder levels. Text and voice differ only in how the
+ * follow-ups are spread: three stacked probes read fine in a chat bubble the
+ * candidate can re-read, and sound like an interrogation out loud. */
+const TEXT_DRILL_RULE = `
+Hard/Staff drilling rule: Parse sceneJson. Identify ONE component the candidate has visibly drawn that carries the richest trade-offs (e.g. queue, DB, cache, broker, search index). Before broadening, drill that component for at least three consecutive follow-ups covering: consistency model, failure modes, and scaling/operational characteristics. Only then may you change topics.
+`;
+
+const VOICE_DRILL_RULE = `
+Hard/Staff drilling rule: Parse sceneJson. Identify ONE component the candidate has visibly drawn that carries the richest trade-offs (e.g. queue, DB, cache, broker, search index). Stay on that component across at least three consecutive TURNS, covering consistency model, failure modes, and scaling/operational characteristics — one of those per turn, in whichever order the candidate's answers make natural. Do not stack them into a single question. Only once all three are covered may you change topics.
+`;
+
 /** Build the interviewer system prompt.
  *
  * `criteria` and `discoveredCriterionIds` are optional so legacy interviews
@@ -1316,14 +1359,15 @@ export const buildInterviewerPrompt = (
     /** Problem-level narrative. Supplies the stall ladder; `framingScript` is
      * used by the welcome message, not here. */
     narrative?: ProblemNarrative | null;
-  }
+  },
+  /** Delivery channel. Defaults to `text`, which reproduces this prompt
+   * byte-for-byte as it was before voice existed — every existing call site and
+   * assertion is unaffected. */
+  options?: { modality?: InterviewerModality }
 ) => {
+  const spoken = options?.modality === "voice";
   const drill =
-    level === "hard" || level === "staff"
-      ? `
-Hard/Staff drilling rule: Parse sceneJson. Identify ONE component the candidate has visibly drawn that carries the richest trade-offs (e.g. queue, DB, cache, broker, search index). Before broadening, drill that component for at least three consecutive follow-ups covering: consistency model, failure modes, and scaling/operational characteristics. Only then may you change topics.
-`
-      : "";
+    level === "hard" || level === "staff" ? (spoken ? VOICE_DRILL_RULE : TEXT_DRILL_RULE) : "";
 
   const criteria = scope?.criteria ?? [];
   const discoveredIds = new Set(scope?.discoveredCriterionIds ?? []);
@@ -1351,7 +1395,13 @@ Hard/Staff drilling rule: Parse sceneJson. Identify ONE component the candidate 
           })
           .join("\n") +
         (anyNudges
-          ? "\nNudge escalation rule: start at nudge 1 for a given expectation. Move to nudge 2 only if the candidate stays on that same topic in a later turn without surfacing it, and to nudge 3 only after that. Never emit two nudges for the same expectation in one turn, and never skip ahead — a sharp nudge used first gives the answer away. Where an expectation has no nudges, use its hints instead."
+          ? "\nNudge escalation rule: start at nudge 1 for a given expectation. Move to nudge 2 only if the candidate stays on that same topic in a later turn without surfacing it, and to nudge 3 only after that. Never emit two nudges for the same expectation in one turn, and never skip ahead — a sharp nudge used first gives the answer away. Where an expectation has no nudges, use its hints instead." +
+            // A written nudge sits on screen until it is read; a spoken one is
+            // gone the moment it is said. Without this the ladder burns a rung
+            // on a nudge the candidate simply did not catch.
+            (spoken
+              ? " Spoken exception: a nudge that draws no reaction at all — the candidate neither engages with it nor changes direction — may be said ONCE more in different words before you escalate. A nudge they engaged with and got wrong is not this case; that one escalates normally."
+              : "")
           : "")
       : criteria.length > 0
         ? "\n\nAll hidden expectations have already been surfaced. Do not invent new ones; probe the design itself."
@@ -1377,7 +1427,13 @@ Hard/Staff drilling rule: Parse sceneJson. Identify ONE component the candidate 
       ].join("\n")
     : "";
   const transitionBlock = scope?.pendingPhaseTransition
-    ? `\n\nThe candidate is currently being offered the move to "${scope.pendingPhaseTransition.toLabel}". Close out the thread you are on: summarise what you have from it in a sentence, then hand over with a natural transition ("that covers X — want to move on to ${scope.pendingPhaseTransition.toLabel}?"). Do NOT open a new line of questioning this turn, and do not advance the phase yourself — the candidate decides.`
+    ? `\n\nThe candidate is currently being offered the move to "${scope.pendingPhaseTransition.toLabel}". Close out the thread you are on: summarise what you have from it in a sentence, then hand over with a natural transition ("that covers X — want to move on to ${scope.pendingPhaseTransition.toLabel}?"). Do NOT open a new line of questioning this turn, and do not advance the phase yourself — the candidate decides.${
+        // Task 09 asked for a natural transition sentence and text never quite
+        // delivered one; spoken, anything else is jarring.
+        spoken
+          ? " Say it as one short spoken sentence — no recap list, no summary of the whole phase."
+          : ""
+      }`
     : "";
 
   return `You are a system design interviewer running a live mock interview. You play TWO roles in the same voice:
@@ -1399,9 +1455,7 @@ Scope is LIVE (not the original problem statement):
 - When you explicitly scope something OUT, say so plainly ("we won't worry about offline for v1") so a removal proposal can be generated against the right constraint.
 - Do NOT invent unrelated constraints the candidate didn't ask about. When answering an asked question, make only the smallest scope commitment needed and tie it back to visible constraints or previous answers.
 
-Formatting rule:
-- Prefer plain prose with inline code (\`like this\`) for simple arithmetic and units (e.g. \`295 bytes × 100K = ~29.5 MB\`).
-- If you must use math notation, ALWAYS delimit it: \`$...$\` for inline math and \`$$...$$\` for display blocks. Never emit raw LaTeX commands (\\text, \\times, \\frac, \\[ \\]) outside of those delimiters — the chat will render the source as text.
+${spoken ? VOICE_DELIVERY_RULES : TEXT_FORMATTING_RULES}
 
 ${STYLE_BY_LEVEL[level]}
 

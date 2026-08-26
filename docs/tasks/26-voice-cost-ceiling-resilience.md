@@ -3,6 +3,15 @@
 **Area:** Voice · **Priority:** P1 · **Size:** M · **Depends on:** 20
 **Labels:** `agent-ready`, `voice`, `api`, `web`
 
+> **Status: DONE.** Ceiling and idle timeout are env-tunable with falling-back defaults;
+> accumulated seconds live on `interviews.voice_seconds` so a reload cannot reset them
+> (asserted). The credential is re-minted `REMINT_LEAD_MS` *before* expiry rather than after
+> a dead connection, and a re-mint carries the persisted transcript, so the interviewer does
+> not re-deliver `framingScript`. `costMeter.ts` attributes heard and spoken time separately
+> because output audio costs 4x per second — asserted — and a held mic bills nothing.
+> Exhausted retries close the session, flush the transcript and leave text working.
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 Every other AI call in this product is bounded by a request. A voice session is

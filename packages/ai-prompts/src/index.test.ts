@@ -17,7 +17,13 @@ import {
   trackContextBlock
 } from "./index.js";
 import { TrackSchema } from "@sdl/shared";
-import type { InterviewerPlaybook, PhaseTimeline, RubricCriterion, Track } from "@sdl/shared";
+import type {
+  InterviewerLevel,
+  InterviewerPlaybook,
+  PhaseTimeline,
+  RubricCriterion,
+  Track
+} from "@sdl/shared";
 
 const criteria: RubricCriterion[] = [
   {
@@ -889,5 +895,114 @@ test("the debrief omits the tutor block when the tutor was never used", () => {
       tutorUsage: { sessions: 1, candidateTurns: 0, firstUsedAtPhase: null, topics: [] }
     }),
     /TUTOR USE DURING THE SESSION/
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Task 21 — voice delivery. The load-bearing assertion is the first one: text
+// output must not move by a single byte, because voice is additive and the chat
+// panel is still the default surface.
+// ---------------------------------------------------------------------------
+
+const VOICE_LEVELS: InterviewerLevel[] = ["guided", "standard", "hard", "staff"];
+
+/** Every branch of the prompt builder that voice touches. */
+const VOICE_SCOPES: Parameters<typeof buildInterviewerPrompt>[1][] = [
+  undefined,
+  { criteria },
+  { criteria, discoveredCriterionIds: criteria.map((c) => c.id) },
+  { criteria, pendingPhaseTransition: { toLabel: "Deep dive" } }
+];
+
+test("modality defaults to text and leaves the prompt byte-identical", () => {
+  for (const level of VOICE_LEVELS) {
+    for (const scope of VOICE_SCOPES) {
+      // An explicit `text` and an omitted modality must be the same string, and
+      // both must still carry the chat-panel formatting contract.
+      const omitted = buildInterviewerPrompt(level, scope);
+      assert.equal(buildInterviewerPrompt(level, scope, {}), omitted);
+      assert.equal(buildInterviewerPrompt(level, scope, { modality: "text" }), omitted);
+      assert.match(omitted, /Formatting rule:/);
+      assert.match(omitted, /\$\$\.\.\.\$\$/);
+    }
+  }
+});
+
+test("voice mode forbids markdown, bullets, tables and LaTeX by name", () => {
+  const prompt = buildInterviewerPrompt("standard", { criteria }, { modality: "voice" });
+  assert.match(prompt, /No markdown/);
+  assert.match(prompt, /no bullet points/);
+  assert.match(prompt, /no tables/);
+  assert.match(prompt, /no LaTeX/);
+  // And the chat-only contract is gone rather than merely supplemented — a
+  // prompt carrying both tells the model to emit `$$...$$` out loud.
+  assert.doesNotMatch(prompt, /Formatting rule:/);
+  assert.doesNotMatch(prompt, /\$\$\.\.\.\$\$/);
+  assert.doesNotMatch(prompt, /inline code/);
+});
+
+test("voice mode asks one question per turn and treats silence as thinking", () => {
+  const prompt = buildInterviewerPrompt("standard", { criteria }, { modality: "voice" });
+  assert.match(prompt, /ONE question per turn/);
+  assert.match(prompt, /Silence is the candidate THINKING/);
+  assert.match(prompt, /Do not fill a pause/);
+  // Spoken numbers, since "~200M w/d" is unlistenable.
+  assert.match(prompt, /Say numbers the way a person says them/);
+});
+
+test("voice spreads the hard/staff drill across turns instead of stacking it", () => {
+  const text = buildInterviewerPrompt("staff", { criteria });
+  const voice = buildInterviewerPrompt("staff", { criteria }, { modality: "voice" });
+
+  assert.match(text, /three consecutive follow-ups/);
+  assert.match(voice, /three consecutive TURNS/);
+  assert.match(voice, /Do not stack them into a single question/);
+  assert.doesNotMatch(voice, /three consecutive follow-ups/);
+
+  // Levels below hard have no drill rule in either modality.
+  assert.doesNotMatch(
+    buildInterviewerPrompt("standard", { criteria }, { modality: "voice" }),
+    /drilling rule/
+  );
+});
+
+test("voice never reads hidden criterion text aloud", () => {
+  const sentinel = "SENTINEL_HIDDEN_EXPECTATION_TEXT";
+  const withSentinel: RubricCriterion[] = [
+    { ...criteria[0], id: "sentinel", text: sentinel, visibility: "hidden" }
+  ];
+  const prompt = buildInterviewerPrompt("standard", { criteria: withSentinel }, { modality: "voice" });
+
+  // The expectation is present (it has to be — it shapes the probes) but the
+  // prohibition travels with it, and voice restates it because a spoken
+  // expectation cannot be un-said.
+  assert.ok(prompt.includes(sentinel));
+  assert.match(prompt, /do not paste these texts at the candidate/);
+  assert.match(prompt, /Never read an expectation, hint or nudge aloud verbatim/);
+});
+
+test("voice allows one nudge repeat before escalating; text does not", () => {
+  const nudged: RubricCriterion[] = [
+    { ...criteria[0], progressiveNudges: ["gentle", "firmer", "sharp"] }
+  ];
+  const text = buildInterviewerPrompt("standard", { criteria: nudged });
+  const voice = buildInterviewerPrompt("standard", { criteria: nudged }, { modality: "voice" });
+
+  assert.match(text, /Nudge escalation rule/);
+  assert.doesNotMatch(text, /Spoken exception/);
+  assert.match(voice, /Spoken exception/);
+  assert.match(voice, /may be said ONCE more in different words/);
+});
+
+test("voice phrases the phase-transition offer as one spoken sentence", () => {
+  const voice = buildInterviewerPrompt(
+    "standard",
+    { criteria, pendingPhaseTransition: { toLabel: "Deep dive" } },
+    { modality: "voice" }
+  );
+  assert.match(voice, /one short spoken sentence/);
+  assert.doesNotMatch(
+    buildInterviewerPrompt("standard", { criteria, pendingPhaseTransition: { toLabel: "Deep dive" } }),
+    /one short spoken sentence/
   );
 });

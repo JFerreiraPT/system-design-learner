@@ -42,7 +42,31 @@ import {
   normalizeEstimationSpec,
   RubricCriterionSchema
 } from "@sdl/shared";
-import { resolveAiModels, type AiModels } from "./ai.models.js";
+import {
+  resolveAiModels,
+  resolveVoiceName,
+  VOICE_SAMPLE_RATE,
+  type AiModels,
+  type VoiceTurnDetectionConfig
+} from "./ai.models.js";
+import {
+  buildRealtimeSessionConfig,
+  REALTIME_CLIENT_SECRETS_URL
+} from "../voice/voice.realtime.js";
+
+/** The mint response reports expiry as a unix timestamp; the client only needs
+ * something it can compare against `Date.now()`. A missing value is treated as
+ * the API's documented one-minute floor rather than "never expires", so the
+ * re-mint path in task 26 errs on the side of refreshing too early. */
+function normalizeExpiry(raw: number | string | undefined): string {
+  const asNumber = typeof raw === "string" ? Number(raw) : raw;
+  if (typeof asNumber === "number" && Number.isFinite(asNumber) && asNumber > 0) {
+    // Unix seconds if it looks like seconds, milliseconds otherwise.
+    const ms = asNumber < 1e12 ? asNumber * 1000 : asNumber;
+    return new Date(ms).toISOString();
+  }
+  return new Date(Date.now() + 60_000).toISOString();
+}
 
 type WorkspaceContext = {
   problemId?: string;
@@ -1309,6 +1333,127 @@ ${input.statement}`
       system: `${systemPrompt}\nProblem:\n${args.problemStatement}${contextText}`,
       messages: [...args.history, { role: "user", content: userContent }]
     });
+  }
+
+  /**
+   * Build the system instructions for a spoken interview.
+   *
+   * Same builder, same rubric, same playbook as `streamInterviewer` — only the
+   * delivery contract differs (`modality: "voice"`), because a prompt tuned for
+   * a markdown chat panel spoken aloud reads out its own asterisks.
+   *
+   * The transcript is folded in here rather than replayed as conversation items:
+   * a realtime session takes its instructions once, at mint time, and cannot be
+   * seeded with history. That also makes reconnection work — task 26 re-mints
+   * mid-interview and the interviewer picks up where it left off instead of
+   * reintroducing itself twenty minutes in.
+   */
+  buildVoiceInstructions(args: {
+    interviewerLevel: InterviewerLevel;
+    problemStatement: string;
+    history: Array<{ role: "user" | "assistant"; content: string }>;
+    workspaceContext?: WorkspaceContext;
+    criteria?: RubricCriterion[];
+    playbook?: InterviewerPlaybook;
+    currentPhaseId?: string;
+    discoveredCriterionIds?: string[];
+    phaseTimeline?: PhaseTimeline;
+    pendingPhaseTransition?: { toLabel: string };
+    narrative?: ProblemNarrative | null;
+    transcript?: string | null;
+  }): string {
+    const systemPrompt = buildInterviewerPrompt(
+      args.interviewerLevel,
+      {
+        criteria: args.criteria,
+        playbook: args.playbook,
+        currentPhaseId: args.currentPhaseId,
+        discoveredCriterionIds: args.discoveredCriterionIds,
+        phaseTimeline: args.phaseTimeline,
+        pendingPhaseTransition: args.pendingPhaseTransition,
+        narrative: args.narrative
+      },
+      { modality: "voice" }
+    );
+
+    // No board image: the realtime model's value here is conversation, and the
+    // scene arrives as text both at mint time and as deltas during the session.
+    const contextText = args.workspaceContext
+      ? formatWorkspaceContextText(args.workspaceContext, /* includeScene */ true, false)
+      : "";
+
+    const opening = args.history.length === 0 && args.narrative?.framingScript
+      ? `\n\nOPEN THE INTERVIEW by saying this, in your own voice and at a natural pace. Do not read it as a script and do not add a UI tour:\n${args.narrative.framingScript}`
+      : "";
+
+    const resumed = args.transcript
+      ? `\n\nCONVERSATION SO FAR (this interview is already in progress — do NOT reintroduce yourself, restate the problem, or start over; continue from where this leaves off):\n${args.transcript}`
+      : "";
+
+    return `${systemPrompt}\nProblem:\n${args.problemStatement}${contextText}${resumed}${opening}`;
+  }
+
+  /**
+   * Exchange the server's API key for a short-lived credential the browser can
+   * hold, with the session config — instructions included — already baked in.
+   *
+   * This asymmetry is the whole security model. `buildInterviewerPrompt` embeds
+   * every undiscovered hidden expectation verbatim along with its progressive
+   * nudges, so a browser that assembled its own session config could read the
+   * entire hidden rubric out of devtools and `detectDiscoveries` would be
+   * measuring nothing. The prompt goes into the credential; the credential is
+   * all the browser ever sees.
+   */
+  async mintRealtimeSession(input: {
+    instructions: string;
+    turnDetection: VoiceTurnDetectionConfig;
+    keywords?: string[];
+  }): Promise<{ clientSecret: string; expiresAt: string; model: string; voice: string }> {
+    const voice = resolveVoiceName((key) => this.configService.get<string>(key));
+    const model = this.models.interviewerVoice;
+
+    const session = buildRealtimeSessionConfig({
+      model,
+      transcriptionModel: this.models.voiceTranscription,
+      voice,
+      sampleRate: VOICE_SAMPLE_RATE,
+      instructions: input.instructions,
+      turnDetection: input.turnDetection,
+      keywords: input.keywords
+    });
+
+    const response = await fetch(REALTIME_CLIENT_SECRETS_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.configService.getOrThrow<string>("OPENAI_API_KEY")}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ session })
+    });
+
+    if (!response.ok) {
+      // Surface the status and a clipped body: a 400 here is almost always a
+      // reshaped session object, and the body says which field.
+      const detail = await response.text().catch(() => "");
+      throw new Error(
+        `Realtime session mint failed (${response.status}): ${detail.slice(0, 400)}`
+      );
+    }
+
+    const body = (await response.json()) as {
+      value?: string;
+      expires_at?: number | string;
+    };
+    if (typeof body.value !== "string" || body.value.length === 0) {
+      throw new Error("Realtime session mint returned no client secret");
+    }
+
+    return {
+      clientSecret: body.value,
+      expiresAt: normalizeExpiry(body.expires_at),
+      model,
+      voice
+    };
   }
 
   streamTutor(args: {

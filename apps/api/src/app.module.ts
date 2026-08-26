@@ -9,6 +9,7 @@ import { ProblemsModule } from "./problems/problems.module.js";
 import { SolutionsModule } from "./solutions/solutions.module.js";
 import { InterviewModule } from "./interview/interview.module.js";
 import { TutorModule } from "./tutor/tutor.module.js";
+import { VoiceModule } from "./voice/voice.module.js";
 import { AppController } from "./app.controller.js";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -25,7 +26,8 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..")
     ProblemsModule,
     SolutionsModule,
     InterviewModule,
-    TutorModule
+    TutorModule,
+    VoiceModule
   ],
   controllers: [AppController]
 })

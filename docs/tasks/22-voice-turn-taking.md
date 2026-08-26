@@ -3,6 +3,15 @@
 **Area:** Voice · **Priority:** P1 · **Size:** M · **Depends on:** 20
 **Labels:** `agent-ready`, `voice`, `web`
 
+> **Status: DONE.** `semantic_vad` / `eagerness: "low"` by default, `server_vad` at 2500ms
+> as an escape hatch. `turnState.ts` is a pure reducer with 13 tests; the load-bearing one
+> feeds `speech_started → speech_stopped → speech_started → committed` and asserts it yields
+> ONE turn that never flickers to `thinking`. Barge-in sends `conversation.item.truncate`
+> with real elapsed playback, derived from wall-clock because over WebRTC the audio never
+> touches the data channel. Hold disables the mic track locally; Space holds it unless the
+> candidate is typing.
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 This is the task the whole feature lives or dies on, and it is not "add a VAD".

@@ -15,7 +15,10 @@ import type {
   ScoreBand,
   ScoreDimension,
   Track,
-  TutorUsage
+  TutorUsage,
+  VoiceSessionResponse,
+  VoiceTurn,
+  VoiceTurnsResponse
 } from "@sdl/shared";
 
 export type {
@@ -38,7 +41,12 @@ export type {
   ScoreBand,
   ScoreDimension,
   Track,
-  TutorUsage
+  TutorUsage,
+  VoiceConnectionStatus,
+  VoiceSessionResponse,
+  VoiceTurn,
+  VoiceTurnState,
+  VoiceTurnsResponse
 } from "@sdl/shared";
 
 export type InterviewConstraintState = {
@@ -341,4 +349,70 @@ export async function streamEndpoint(
   } finally {
     void reader.cancel().catch(() => {});
   }
+}
+
+// ---------------------------------------------------------------------------
+// Voice
+// ---------------------------------------------------------------------------
+
+/** The URL the browser POSTs its SDP offer to.
+ *
+ * The candidate's audio goes straight from their machine to OpenAI — it never
+ * transits this app's API — which is why the transcript has to be posted back
+ * separately (see `postVoiceTurns`). */
+export const REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls";
+
+/** Mint a realtime credential for this interview.
+ *
+ * The response deliberately carries no `instructions`: the interviewer prompt
+ * embeds the hidden rubric verbatim, so it is baked into the credential
+ * server-side and never reaches the browser. */
+export async function createVoiceSession(
+  interviewId: string,
+  workspaceContext?: Record<string, unknown>
+): Promise<VoiceSessionResponse> {
+  return (
+    await api.post<VoiceSessionResponse>(`/interviews/${interviewId}/voice/session`, {
+      workspaceContext
+    })
+  ).data;
+}
+
+/** Record completed spoken turns. Idempotent on `externalId`. */
+export async function postVoiceTurns(
+  interviewId: string,
+  turns: VoiceTurn[],
+  audioSecondsDelta?: number
+): Promise<VoiceTurnsResponse> {
+  return (
+    await api.post<VoiceTurnsResponse>(`/interviews/${interviewId}/voice/turns`, {
+      turns,
+      audioSecondsDelta
+    })
+  ).data;
+}
+
+/**
+ * Exchange an SDP offer for an answer, establishing the media path.
+ *
+ * `Content-Type: application/sdp` and a raw-string body, not JSON — the one
+ * endpoint in this client that is not.
+ */
+export async function exchangeSdp(offerSdp: string, clientSecret: string): Promise<string> {
+  const response = await fetch(REALTIME_CALLS_URL, {
+    method: "POST",
+    body: offerSdp,
+    headers: {
+      Authorization: `Bearer ${clientSecret}`,
+      "Content-Type": "application/sdp"
+    }
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new StreamError(
+      `Voice connection was refused (${response.status}). ${detail.slice(0, 200)}`.trim(),
+      response.status
+    );
+  }
+  return response.text();
 }

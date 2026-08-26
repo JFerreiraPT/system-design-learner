@@ -83,7 +83,7 @@ score. Several tasks below are pure harvest of data we already pay to produce.
 
 ### Voice — spoken interviews
 
-Not yet implemented; these are specs. A system design interview is a spoken
+A system design interview is a spoken
 conversation held over a whiteboard, and until now SDL has been a typing exercise.
 The architecture is **speech-to-speech**: the browser holds a WebRTC connection
 straight to OpenAI's Realtime API (`gpt-realtime-2.1`), the server mints
@@ -101,42 +101,49 @@ Two constraints shape every task below:
 
 | # | Task | Area |
 |---|---|---|
-| [20](20-voice-realtime-transport.md) | Server-minted realtime sessions over WebRTC | Voice |
-| [21](21-voice-interviewer-delivery.md) | Voice-native interviewer delivery rules | Voice |
-| [22](22-voice-turn-taking.md) | Silence tolerance, hold-to-think, barge-in truncation | Voice |
-| [23](23-voice-transcript-persistence.md) | Persist voice turns into the existing transcript | Voice |
-| [24](24-voice-workspace-context.md) | Feed the live whiteboard into a voice conversation | Voice |
-| [25](25-voice-workspace-ui.md) | Mode toggle, turn state, live transcript in chat | Voice |
-| [26](26-voice-cost-ceiling-resilience.md) | Cost ceiling, expiry and reconnect | Voice |
+| [20](20-voice-realtime-transport.md) ✅ | Server-minted realtime sessions over WebRTC | Voice |
+| [21](21-voice-interviewer-delivery.md) ✅ | Voice-native interviewer delivery rules | Voice |
+| [22](22-voice-turn-taking.md) ✅ | Silence tolerance, hold-to-think, barge-in truncation | Voice |
+| [23](23-voice-transcript-persistence.md) ✅ | Persist voice turns into the existing transcript | Voice |
+| [24](24-voice-workspace-context.md) ✅ | Feed the live whiteboard into a voice conversation | Voice |
+| [25](25-voice-workspace-ui.md) ✅ | Mode toggle, turn state, live transcript in chat | Voice |
+| [26](26-voice-cost-ceiling-resilience.md) ✅ | Cost ceiling, expiry and reconnect | Voice |
 
-Build order: **20 → 23 → 22 → 25** is the shortest path to a usable spoken
-interview. 21 is independent and can land first — it is cheap and every voice turn
-is worse without it. 23 is not optional polish: the debrief, the rubric matcher and
-the export all read `interview_messages`, so a voice session that persists nothing
-silently produces an empty debrief and a rubric where nothing is ever discovered.
+Built in the order **21 → 20 → 23 → 22 → 24 → 25 → 26**. 21 went first because it is cheap,
+independent, and every voice turn is worse without it. 23 went early because it is not
+optional polish: the debrief, the rubric matcher and the export all read
+`interview_messages`, so a voice session that persists nothing silently produces an empty
+debrief and a rubric where nothing was ever discovered.
 
-> **Re-verify the Realtime API before implementing.** Every field path in 20–26 was
-> checked against `developers.openai.com` in **August 2026**. That surface has
-> already been reshaped once — `turn_detection` and `input_audio_transcription`
-> moved under `session.audio.input.*`, and the docs host moved off
-> `platform.openai.com`.
+> **Re-verify the Realtime API before touching this code.** Every field path in 20–26 was
+> checked against `developers.openai.com` in **August 2026**, and the shipped
+> implementation matches it. That surface has already been reshaped once —
+> `turn_detection` and `input_audio_transcription` moved under `session.audio.input.*`, and
+> the docs host moved off `platform.openai.com` — so treat a `400` from the mint call as a
+> signal to re-read those pages before debugging anything else. The wire format is isolated
+> in `apps/api/src/voice/voice.realtime.ts` for exactly this reason.
 
 ## Status
 
-**Tasks 01-19 are implemented and verified** on the working tree: `pnpm -w lint`,
+**All 26 tasks are implemented and verified** on the working tree: `pnpm -w lint`,
 `pnpm -w turbo run typecheck` and `pnpm -w turbo run test` are green across all
-workspaces (212 tests). Every task file carries a `Status: DONE` banner naming
-what landed. **Tasks 20-26 (Voice) are specs only — nothing is implemented yet.**
+workspaces (313 tests). Every task file carries a `Status: DONE` banner naming
+what landed.
 
-Two caveats worth carrying into review:
+Three caveats worth carrying into review:
 
 - **Migrations are hand-written, not generated.** Only `0000` has a drizzle
   snapshot, so `pnpm db:generate` would diff against that and re-emit every
-  change since `0001`. Migrations `0005`–`0012` follow the established
+  change since `0001`. Migrations `0005`–`0014` follow the established
   idempotent-SQL convention (`ADD COLUMN IF NOT EXISTS`,
   `CREATE TABLE IF NOT EXISTS`) with manual `meta/_journal.json` entries.
   **`pnpm db:push` is required** to pick up the new columns and the
-  `interview_phase_events` table.
+  `interview_phase_events` table, and again for `0014`'s voice columns and index.
+- **No voice task has been exercised against a live Realtime session.** Everything
+  testable without a WebRTC connection is tested — the security property, the turn-state
+  reducer, transcript ordering, the context feed's debounce, the cost meter — but latency,
+  transcription quality and whether `eagerness: "low"` actually tolerates a real
+  candidate's pauses can only be judged by talking to it with a funded key.
 - **Task 11's verification note was not completed.** Generating one problem at
   each of easy/medium/hard/expert against a live key needs an `OPENAI_API_KEY`
   and real spend; the structural assertions are in place but the difficulty

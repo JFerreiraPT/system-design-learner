@@ -1,61 +1,12 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import rehypeKatex from "rehype-katex";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { StreamError, streamEndpoint } from "../lib/api";
-
-/** LaTeX-ish commands the model tends to emit. Used to detect "bare-bracket"
- * math like `[ 295 \text{ bytes} \times 100,000 ]` (no `$$` delimiters and
- * no `\[ \]` escapes) so we can wrap it for KaTeX. */
-const LATEX_COMMAND_PATTERN =
-  /\\(?:text|times|div|approx|frac|sum|int|sqrt|cdot|to|leq|geq|neq|le|ge|ne|pm|infty|alpha|beta|gamma|delta|theta|lambda|mu|sigma|pi|log|ln|max|min|left|right)\b/;
+import { TranscriptView, type Msg } from "./TranscriptView";
 
 /** How long tokens are buffered before being committed to React state.
  * Re-parsing markdown + KaTeX on every token makes long answers crawl; one
  * commit per frame-ish interval streams just as smoothly for a fraction of
  * the work. */
 const FLUSH_INTERVAL_MS = 60;
-
-/** Normalizes the various ways an LLM tends to emit math so that
- * `remark-math` + `rehype-katex` actually render it. We:
- *  - convert proper LaTeX `\[ \]` / `\( \)` to `$$...$$` / `$...$`
- *  - wrap bare `[ ... ]` blocks that clearly contain LaTeX commands
- *  - leave fenced code blocks and inline code untouched
- */
-function normalizeMathDelimiters(text: string): string {
-  // Split out fenced (```...```) and inline (`...`) code so we don't touch
-  // brackets the user actually wants verbatim.
-  const segments = text.split(/(```[\s\S]*?```|`[^`\n]*`)/g);
-  return segments
-    .map((segment, idx) => {
-      if (idx % 2 === 1) return segment; // code block / inline code, leave alone
-      return segment
-        .replace(/\\\[([\s\S]*?)\\\]/g, (_match, inner) => `$$${inner}$$`)
-        .replace(/\\\(([\s\S]*?)\\\)/g, (_match, inner) => `$${inner}$`)
-        .replace(/\[\s*([^\[\]\n]*?)\s*\](?!\()/g, (match, inner: string) => {
-          // Only treat as math if it contains a LaTeX command — otherwise the
-          // user probably meant literal brackets (e.g. "[note]").
-          return LATEX_COMMAND_PATTERN.test(inner) ? `$$${inner}$$` : match;
-        });
-    })
-    .join("");
-}
-
-/** Half-written markdown reflows violently mid-stream: an unclosed ``` fence
- * makes the rest of the answer render as one giant code block until the
- * closing fence arrives, and a lone `$` swallows a paragraph into KaTeX.
- * Provisionally closing them keeps the streaming view stable. */
-function closeOpenMarkdown(text: string): string {
-  let out = text;
-  const fences = (out.match(/```/g) ?? []).length;
-  if (fences % 2 === 1) out += "\n```";
-  const inlineTicks = (out.replace(/```/g, "").match(/`/g) ?? []).length;
-  if (inlineTicks % 2 === 1) out += "`";
-  const blockMath = (out.match(/\$\$/g) ?? []).length;
-  if (blockMath % 2 === 1) out += "$$";
-  return out;
-}
 
 type Props = {
   endpoint: string;
@@ -71,9 +22,14 @@ type Props = {
   disabled?: boolean;
   /** Shown in place of the composer while `disabled`. */
   disabledNotice?: string;
+  /** Extra turns to render after history — speech in progress from a live voice
+   * session sharing this transcript. Display only; voice owns its persistence. */
+  liveTurns?: React.ComponentProps<typeof TranscriptView>["live"];
+  /** Rendered above the composer. The voice bar goes here. */
+  toolbar?: React.ReactNode;
 };
 
-type Msg = { role: "user" | "assistant"; content: string };
+export type { Msg };
 
 /** Cheap structural identity for a history array. Callers build
  * `initialMessages` inline (`.filter().map()`), so it is a new array on every
@@ -91,7 +47,9 @@ export function ChatPanel({
   initialMessages,
   onMessageComplete,
   disabled = false,
-  disabledNotice
+  disabledNotice,
+  liveTurns,
+  toolbar
 }: Props) {
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<Msg[]>(initialMessages ?? []);
@@ -102,8 +60,6 @@ export function ChatPanel({
   const [error, setError] = useState<string | null>(null);
   /** The last user message, kept so a failed send can be retried verbatim. */
   const retryContentRef = useRef<string | null>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const contentRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   /** Last endpoint this panel synced against — see the history effect below. */
@@ -115,15 +71,17 @@ export function ChatPanel({
   /** True while a send is in flight. Read by the history-sync effect, which
    * must not clobber a partially streamed message with server history. */
   const streamingRef = useRef(false);
-  /** True when the user is pinned at (or near) the bottom of the chat. We only
-   * auto-scroll while this is true, so that scrolling up to re-read history
-   * isn't yanked back down on every streamed token. Tracked in a ref so the
-   * ResizeObserver below can read the latest value without re-binding. */
-  const stickToBottomRef = useRef(true);
-  /** Suppresses the next user-driven scroll event so programmatic scrolls
-   * (auto-pin to bottom) don't accidentally flip stickToBottomRef off. */
-  const suppressScrollRef = useRef(false);
-  const [showJumpToBottom, setShowJumpToBottom] = useState(false);
+  /** Bumped whenever the view should re-engage stick-to-bottom. Passed to
+   * `TranscriptView` as its reset key, which is where that state now lives.
+   * Set in exactly the two places the pre-extraction code set it directly: a
+   * conversation switch / history load, and sending a message. */
+  const [pinToken, setPinToken] = useState(`${endpoint}|0`);
+  const pinCounterRef = useRef(0);
+
+  const bumpPin = useCallback(() => {
+    pinCounterRef.current += 1;
+    setPinToken(`${endpointRef.current}|${pinCounterRef.current}`);
+  }, []);
 
   const incomingSignature = useMemo(
     () => historySignature(initialMessages ?? []),
@@ -148,8 +106,7 @@ export function ChatPanel({
     setError(null);
     // A new conversation (endpoint switch) or fresh history load should land
     // the user at the bottom regardless of where they were in the previous one.
-    stickToBottomRef.current = true;
-    setShowJumpToBottom(false);
+    bumpPin();
     // `incomingSignature` — not `initialMessages` — is the real dependency:
     // see historySignature.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -164,57 +121,6 @@ export function ChatPanel({
     },
     []
   );
-
-  /** Pin the scroll container to the bottom in a single paint. Auto-pins use
-   * `instant` to avoid stuttering during token streaming; the explicit jump
-   * button uses smooth elsewhere. */
-  const pinToBottom = useCallback(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    suppressScrollRef.current = true;
-    el.scrollTop = el.scrollHeight;
-    // Clear suppression on the next frame, after the scroll event has fired.
-    requestAnimationFrame(() => {
-      suppressScrollRef.current = false;
-    });
-  }, []);
-
-  // Re-pin to bottom whenever the chat content height changes (token streaming,
-  // markdown reflow, image loads, etc.). Driving auto-scroll off the actual DOM
-  // size — instead of React state — avoids the per-token jitter where
-  // `scrollTop = scrollHeight` lands on a stale height.
-  useLayoutEffect(() => {
-    const content = contentRef.current;
-    if (!content) return;
-    const observer = new ResizeObserver(() => {
-      if (stickToBottomRef.current) pinToBottom();
-    });
-    observer.observe(content);
-    return () => observer.disconnect();
-  }, [pinToBottom]);
-
-  // Initial mount / conversation switch: land at the bottom synchronously.
-  useLayoutEffect(() => {
-    if (stickToBottomRef.current) pinToBottom();
-  }, [endpoint, pinToBottom]);
-
-  function handleScroll() {
-    if (suppressScrollRef.current) return;
-    const el = scrollRef.current;
-    if (!el) return;
-    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    const nearBottom = distanceFromBottom < 80;
-    stickToBottomRef.current = nearBottom;
-    setShowJumpToBottom(!nearBottom);
-  }
-
-  function jumpToBottom() {
-    const el = scrollRef.current;
-    if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-    stickToBottomRef.current = true;
-    setShowJumpToBottom(false);
-  }
 
   /** Commits buffered tokens onto the trailing assistant message. */
   const flushPending = useCallback(() => {
@@ -261,8 +167,7 @@ export function ChatPanel({
       setError(null);
       // Sending a new message always re-engages stick-to-bottom: the user
       // expects to see what they just typed, even if they had scrolled up.
-      stickToBottomRef.current = true;
-      setShowJumpToBottom(false);
+      bumpPin();
       setMessages((prev) => [
         ...prev,
         { role: "user", content: trimmed },
@@ -329,7 +234,7 @@ export function ChatPanel({
 
       await onMessageComplete?.();
     },
-    [buildPayload, disabled, endpoint, flushPending, onMessageComplete, payload, queueToken]
+    [bumpPin, buildPayload, disabled, endpoint, flushPending, onMessageComplete, payload, queueToken]
   );
 
   function submit() {
@@ -348,72 +253,31 @@ export function ChatPanel({
   }
 
   const lastIndex = messages.length - 1;
+  const streamingIndex =
+    loading && lastIndex >= 0 && messages[lastIndex].role === "assistant" ? lastIndex : -1;
+  const thinkingIndex =
+    waitingForFirstToken && lastIndex >= 0 && messages[lastIndex].role === "assistant"
+      ? lastIndex
+      : -1;
 
   return (
     <div className="relative flex h-full min-h-0 flex-col gap-2">
-      <div
-        ref={scrollRef}
-        onScroll={handleScroll}
-        className="surface-inset flex-1 overflow-y-auto overscroll-contain p-3"
-      >
-        <div ref={contentRef} className="flex min-h-full flex-col gap-2">
-          {messages.length === 0 ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-2 text-center">
-              <div className="brand-mark h-10 w-10">
-                <ChatIcon />
-              </div>
-              <p className="text-sm text-fg-muted">Start the conversation</p>
-              <p className="text-xs text-fg-faint">
-                Press <kbd className="rounded bg-surface px-1.5 py-0.5 text-[10px]">Enter</kbd> to send,{" "}
-                <kbd className="rounded bg-surface px-1.5 py-0.5 text-[10px]">Shift</kbd>+
-                <kbd className="rounded bg-surface px-1.5 py-0.5 text-[10px]">Enter</kbd> for newline
-              </p>
-            </div>
-          ) : null}
+      <TranscriptView
+        messages={messages}
+        live={liveTurns}
+        streamingIndex={streamingIndex}
+        thinkingIndex={thinkingIndex}
+        error={error}
+        onRetry={() => {
+          const content = retryContentRef.current;
+          setError(null);
+          if (content) void send(content);
+        }}
+        resetKey={pinToken}
+        emptyState={<EmptyState />}
+      />
 
-          {messages.map((msg, idx) => (
-            <MessageBubble
-              key={idx}
-              role={msg.role}
-              content={msg.content}
-              streaming={loading && idx === lastIndex && msg.role === "assistant"}
-              thinking={waitingForFirstToken && idx === lastIndex && msg.role === "assistant"}
-            />
-          ))}
-
-          {error ? (
-            <div
-              role="alert"
-              className="mr-auto flex max-w-[92%] flex-wrap items-center gap-2 rounded-2xl border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-fg"
-            >
-              <WarningIcon />
-              <span className="text-fg-muted">{error}</span>
-              <button
-                type="button"
-                onClick={() => {
-                  const content = retryContentRef.current;
-                  setError(null);
-                  if (content) void send(content);
-                }}
-                className="rounded-lg border border-line bg-surface px-2 py-0.5 font-medium transition hover:border-violet-400/50"
-              >
-                Retry
-              </button>
-            </div>
-          ) : null}
-        </div>
-      </div>
-
-      {showJumpToBottom ? (
-        <button
-          type="button"
-          onClick={jumpToBottom}
-          className="absolute bottom-20 left-1/2 z-10 -translate-x-1/2 rounded-full border border-line bg-surface px-3 py-1.5 text-xs text-fg shadow-md transition hover:border-violet-400/50"
-          aria-label="Jump to latest message"
-        >
-          ↓ New messages
-        </button>
-      ) : null}
+      {toolbar}
 
       {disabled ? (
         <p
@@ -462,68 +326,19 @@ export function ChatPanel({
   );
 }
 
-/** Memoized so a streaming answer only re-renders its own bubble. Without
- * this, every buffered flush re-parses the markdown + KaTeX of the entire
- * transcript, which is what makes long conversations stutter. */
-const MessageBubble = memo(function MessageBubble({
-  role,
-  content,
-  streaming,
-  thinking
-}: {
-  role: "user" | "assistant";
-  content: string;
-  streaming: boolean;
-  thinking: boolean;
-}) {
-  const rendered = useMemo(() => {
-    if (role === "user") return content;
-    const normalized = normalizeMathDelimiters(content);
-    return streaming ? closeOpenMarkdown(normalized) : normalized;
-  }, [content, role, streaming]);
-
-  if (role === "assistant" && thinking) {
-    return (
-      <div className="flex w-full justify-start">
-        <div className="bubble bubble-assistant" role="status" aria-label="Assistant is replying">
-          <TypingDots />
-        </div>
-      </div>
-    );
-  }
-
+function EmptyState() {
   return (
-    <div className={`flex w-full ${role === "user" ? "justify-end" : "justify-start"}`}>
-      <div className={role === "user" ? "bubble bubble-user" : "bubble bubble-assistant"}>
-        <div
-          className={[
-            "prose-chat prose-chat-compact break-words",
-            role === "user" ? "whitespace-pre-wrap" : "",
-            streaming ? "prose-chat-streaming" : ""
-          ]
-            .filter(Boolean)
-            .join(" ")}
-        >
-          <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
-            {rendered}
-          </ReactMarkdown>
-        </div>
+    <div className="flex flex-1 flex-col items-center justify-center gap-2 text-center">
+      <div className="brand-mark h-10 w-10">
+        <ChatIcon />
       </div>
+      <p className="text-sm text-fg-muted">Start the conversation</p>
+      <p className="text-xs text-fg-faint">
+        Press <kbd className="rounded bg-surface px-1.5 py-0.5 text-[10px]">Enter</kbd> to send,{" "}
+        <kbd className="rounded bg-surface px-1.5 py-0.5 text-[10px]">Shift</kbd>+
+        <kbd className="rounded bg-surface px-1.5 py-0.5 text-[10px]">Enter</kbd> for newline
+      </p>
     </div>
-  );
-});
-
-function TypingDots() {
-  return (
-    <span className="flex items-center gap-1 py-0.5">
-      {[0, 1, 2].map((i) => (
-        <span
-          key={i}
-          className="h-1.5 w-1.5 rounded-full bg-current opacity-40 animate-typing-dot"
-          style={{ animationDelay: `${i * 160}ms` }}
-        />
-      ))}
-    </span>
   );
 }
 
@@ -548,16 +363,6 @@ function StopIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
       <rect x="6" y="6" width="12" height="12" rx="2.5" />
-    </svg>
-  );
-}
-
-function WarningIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="text-rose-500">
-      <path d="M12 9v4" />
-      <path d="M12 17h.01" />
-      <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
     </svg>
   );
 }

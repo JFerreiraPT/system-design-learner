@@ -3,6 +3,13 @@
 **Area:** Voice · **Priority:** P1 · **Size:** S · **Depends on:** —
 **Labels:** `agent-ready`, `voice`, `prompts`
 
+> **Status: DONE.** `buildInterviewerPrompt(level, scope, { modality })`. Text output is
+> **byte-identical** to before — asserted across every level × scope combination, including
+> an explicit `{ modality: "text" }` and an omitted options object. `VOICE_DELIVERY_RULES`
+> replaces the chat-panel formatting contract rather than supplementing it, since a prompt
+> carrying both tells the model to say `$$...$$` out loud.
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 `buildInterviewerPrompt` (`packages/ai-prompts/src/index.ts:1304`) was written for

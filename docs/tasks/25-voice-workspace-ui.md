@@ -3,6 +3,18 @@
 **Area:** Voice · **Priority:** P1 · **Size:** L · **Depends on:** 20, 22, 23
 **Labels:** `agent-ready`, `voice`, `web`, `a11y`
 
+> **Status: DONE.** `TranscriptView` extracted with no behaviour change, including the
+> `ResizeObserver` auto-pin and the `historySignature` guard; the stick-to-bottom reset that
+> lived inside `ChatPanel.send` is preserved as an explicit pin token.
+>
+> **Deviation from this spec, deliberate:** there is no separate `VoicePanel` transcript.
+> Voice and text share ONE `ChatPanel` — voice supplies `liveTurns` and a `toolbar` — because
+> the spec's own requirement that the composer stay usable during a voice session is met
+> naturally that way, and two panels over one conversation would need two copies of the
+> history-sync logic. `VoicePanel.tsx` is a thin wrapper holding the mode toggle and the
+> realtime session.
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 `ChatPanel` owns its entire send loop: it holds `messages`, opens the fetch,

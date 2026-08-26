@@ -3,6 +3,14 @@
 **Area:** Voice · **Priority:** P1 · **Size:** L · **Depends on:** —
 **Labels:** `agent-ready`, `voice`, `api`, `web`
 
+> **Status: DONE.** `apps/api/src/voice/` mints ephemeral credentials with the interviewer
+> prompt baked in; `apps/web/src/lib/voice/useRealtimeVoice.ts` holds the WebRTC session.
+> The security property is asserted directly in `voice.service.test.ts` with a sentinel
+> string planted in a hidden criterion: it appears in the instructions and in neither the
+> response body nor the built client bundle. `resolveVoiceName` / `resolveVoiceTurnDetection`
+> / `resolveVoiceLimits` in `ai.models.ts` all fall back rather than throw.
+> Verified with `pnpm -w lint`, `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 > **Verify the API surface before writing code.** The Realtime session object has
 > already been reshaped once (flat `input_audio_transcription` /
 > `turn_detection` moved under `session.audio.input.*`, and the docs host moved

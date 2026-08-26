@@ -5,6 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Board } from "../components/Board";
 import { ChatPanel } from "../components/ChatPanel";
+import { VoicePanel } from "../components/VoicePanel";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { CriteriaReveal } from "../components/CriteriaReveal";
 import { FlagsPanel } from "../components/FlagsPanel";
@@ -627,6 +628,22 @@ export function WorkspacePage() {
     localStorage.setItem(`workspace:${id}:phase`, JSON.stringify(persist));
   }, [id, phaseIndex, elapsedInPhase, phaseRunning, restoredPhaseId]);
 
+  /** Post-turn refresh, shared by the text stream and by persisted voice
+   * turns. Chat history first so the reply is visible, then the state the
+   * server's proposal extractor and criterion matcher wrote after the turn. */
+  const refreshAfterInterviewerTurn = async () => {
+    await interviewMessagesQuery.refetch();
+    await Promise.all([
+      constraintsQuery.refetch(),
+      criteriaProgressQuery.refetch(),
+      phaseProposalQuery.refetch()
+    ]);
+  };
+
+  /** Active live constraints, for the voice context feed. */
+  const liveConstraintTexts =
+    constraintsQuery.data?.constraints.filter((c) => c.status === "active").map((c) => c.text) ?? [];
+
   const buildWorkspaceContext = async () => {
     // Capture the screenshot lazily, only when actually sending. Skipped when
     // the board is empty so we don't waste a multimodal slot.
@@ -981,23 +998,19 @@ export function WorkspacePage() {
                     </p>
                   ) : null}
                   <div className="min-h-0 flex-1">
-                    <ChatPanel
+                    <VoicePanel
+                      interviewId={interviewId}
                       endpoint={`/interviews/${interviewId}/messages`}
                       disabled={interviewCompleted}
                       disabledNotice="This interview is finished. Your debrief is on the Validate tab; the board and Tutor stay open, and Replay starts a fresh session."
                       buildPayload={buildWorkspaceContext}
-                      onMessageComplete={async () => {
-                        // Refetch chat history first so the user sees the
-                        // assistant message; then poll constraints since the
-                        // server's proposal extractor + criterion-discovery
-                        // matcher both run after the stream ends.
-                        await interviewMessagesQuery.refetch();
-                        await Promise.all([
-                          constraintsQuery.refetch(),
-                          criteriaProgressQuery.refetch(),
-                          phaseProposalQuery.refetch()
-                        ]);
-                      }}
+                      onMessageComplete={refreshAfterInterviewerTurn}
+                      // Spoken turns run the same server-side post-turn
+                      // pipeline as typed ones, so they need the same refresh.
+                      onVoiceTurnsPersisted={() => void refreshAfterInterviewerTurn()}
+                      scene={sceneSummary}
+                      constraints={liveConstraintTexts}
+                      phaseLabel={currentPhaseDef.label}
                       initialMessages={(interviewMessagesQuery.data ?? [])
                         .filter((m): m is ChatMessage & { role: "user" | "assistant" } =>
                           isChatRole(m.role)

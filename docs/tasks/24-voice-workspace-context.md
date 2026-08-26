@@ -3,6 +3,14 @@
 **Area:** Voice · **Priority:** P2 · **Size:** M · **Depends on:** 20
 **Labels:** `agent-ready`, `voice`, `web`, `api`
 
+> **Status: DONE.** `contextFeed.ts` diffs against the last *sent* snapshot and injects a
+> `system` item over the data channel, prefixed with `VOICE_CONTEXT_ITEM_PREFIX` so
+> `TurnBuffer.drain` filters it out of the transcript, the debrief and `interview_messages`
+> in one place. Fifty rapid scene mutations are asserted to produce exactly one injection;
+> nothing is sent while `candidateSpeaking`; scope and phase changes bypass the rate limit.
+> Constraints come from the server's live set, never client state.
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 In the text path, every message carries a fresh snapshot of the workspace:

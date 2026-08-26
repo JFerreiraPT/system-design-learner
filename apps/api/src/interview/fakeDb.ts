@@ -72,13 +72,41 @@ export class FakeDb {
   insert(table: TableRef) {
     return {
       values: (values: FakeRow) => {
-        const inserted = { id: `row-${this.writes.length + 1}`, ...values };
-        this.writes.push({ kind: "insert", table, values: inserted });
-        const existing = this.tables.get(table);
-        if (existing) existing.push(inserted);
-        else this.tables.set(table, [inserted]);
-        const result = new Thenable(() => [inserted]);
-        return Object.assign(result, { returning: () => new Thenable(() => [inserted]) });
+        // Models the partial unique index on
+        // `interview_messages (interview_id, external_id) WHERE external_id IS
+        // NOT NULL`. Without this the idempotency of voice turns is untestable,
+        // and idempotency is the entire point of that index: reconnects and
+        // retries replay turns, and a duplicated candidate answer skews the
+        // debrief and double-counts discoveries.
+        const conflicts =
+          typeof values.externalId === "string" &&
+          this.rowsFor(table).some(
+            (row) =>
+              row.externalId === values.externalId && row.interviewId === values.interviewId
+          );
+
+        const commit = (ignoreConflict: boolean): FakeRow[] => {
+          if (conflicts && ignoreConflict) return [];
+          const inserted = { id: `row-${this.writes.length + 1}`, ...values };
+          this.writes.push({ kind: "insert", table, values: inserted });
+          const existing = this.tables.get(table);
+          if (existing) existing.push(inserted);
+          else this.tables.set(table, [inserted]);
+          return [inserted];
+        };
+
+        // A plain `insert().values()` awaited directly keeps the old behaviour:
+        // no conflict handling, because the text path has no external id.
+        const bare = new Thenable(() => commit(false));
+        return Object.assign(bare, {
+          returning: () => new Thenable(() => commit(false)),
+          onConflictDoNothing: () => {
+            const guarded = new Thenable(() => commit(true));
+            return Object.assign(guarded, {
+              returning: () => new Thenable(() => commit(true))
+            });
+          }
+        });
       }
     };
   }

@@ -3,6 +3,16 @@
 **Area:** Voice · **Priority:** P1 · **Size:** M · **Depends on:** 20
 **Labels:** `agent-ready`, `voice`, `api`, `web`, `db`
 
+> **Status: DONE.** Migration `0014_voice_turns` adds `source` / `external_id` plus the
+> partial unique index, and `interviews.voice_seconds`. `persistAssistantTurn` is the single
+> implementation of the post-turn pipeline; `saveAssistantMessage` is now a thin wrapper, so
+> the interview controller is untouched. `turnBuffer.ts` emits the longest complete prefix in
+> conversation order — tested against a transcript completing *after* its reply, a
+> transcript that never completes, and four turns finishing in scrambled order.
+> A replay is asserted to run the post-turn pipeline **zero** extra times, by counting
+> matcher invocations rather than rows. **`pnpm db:push` is required.**
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 With voice on WebRTC, audio flows browser ↔ OpenAI and **the server sees nothing**.

@@ -32,6 +32,7 @@ import {
 } from "@sdl/shared";
 import type {
   ConstraintProposal,
+  VoiceTurn,
   Difficulty,
   InterviewDebrief,
   InterviewPlan,
@@ -361,13 +362,28 @@ export class InterviewService {
     };
   }
 
-  async sendMessage(interviewId: string, content: string, workspaceContext?: WorkspaceContext) {
+  /**
+   * Everything the interviewer prompt needs for one turn, assembled once.
+   *
+   * Extracted from `sendMessage` because voice (task 20) needs the identical
+   * inputs to build its realtime session instructions. A second copy of this
+   * assembly would drift — and the specific things it would drift on are the
+   * server-authoritative constraint override and the criteria/discovery pairing,
+   * which are exactly the parts that must not differ between modalities.
+   *
+   * Read-only: no rows are written here, so it is safe to call for a session
+   * mint that may never produce a turn.
+   */
+  private async buildInterviewerTurnInputs(
+    interviewId: string,
+    workspaceContext?: WorkspaceContext
+  ) {
     const sessionRows = await this.db.select().from(interviews).where(eq(interviews.id, interviewId));
     const session = sessionRows[0];
     if (!session) throw new NotFoundException("Interview not found");
-    // Guard BEFORE the user row is inserted: a completed interview has a
-    // debrief written against a fixed transcript, so accepting one more
-    // message would silently invalidate it.
+    // Guard BEFORE anything is inserted: a completed interview has a debrief
+    // written against a fixed transcript, so accepting one more message would
+    // silently invalidate it.
     if (session.status !== "active") {
       throw new ConflictException(
         "This interview is completed. Start a new interview (or Replay) to keep practising."
@@ -383,17 +399,6 @@ export class InterviewService {
       .from(interviewMessages)
       .where(eq(interviewMessages.interviewId, interviewId))
       .orderBy(asc(interviewMessages.createdAt));
-
-    await this.db.insert(interviewMessages).values({
-      interviewId,
-      role: "user",
-      content
-    });
-
-    const sceneUnchanged = await this.markAndCompareSceneHash(
-      `interview:${interviewId}:sceneHash`,
-      workspaceContext?.sceneSummary
-    );
 
     // The server is the source of truth for live constraints during an
     // interview. Override whatever the client passed in workspaceContext so a
@@ -420,22 +425,60 @@ export class InterviewService {
 
     const pendingTransition = getPhaseProposalState(session.pendingPhaseProposalJson).pending;
 
-    const stream = this.aiService.streamInterviewer({
-      interviewerLevel: session.interviewerLevel,
-      problemStatement: problem.statement,
-      history: historyRows.map((row: any) => ({ role: row.role, content: row.content })),
-      message: content,
-      workspaceContext: augmentedContext,
-      sceneUnchanged,
+    return {
+      session,
+      problem,
+      history: historyRows.map((row: any) => ({
+        role: row.role as "user" | "assistant",
+        content: row.content as string
+      })),
+      augmentedContext,
+      liveConstraints,
       criteria,
       playbook,
-      currentPhaseId: workspaceContext?.phase?.id,
       discoveredCriterionIds,
       phaseTimeline,
       pendingPhaseTransition: pendingTransition
         ? { toLabel: pendingTransition.toLabel }
         : undefined,
       narrative: getProblemNarrative(problem.narrativeJson)
+    };
+  }
+
+  /** Public read-only view of the same inputs, for the voice module. Named
+   * separately so it is obvious at the call site that nothing is being written. */
+  async getInterviewerPromptInputs(interviewId: string) {
+    return this.buildInterviewerTurnInputs(interviewId);
+  }
+
+  async sendMessage(interviewId: string, content: string, workspaceContext?: WorkspaceContext) {
+    const inputs = await this.buildInterviewerTurnInputs(interviewId, workspaceContext);
+
+    await this.db.insert(interviewMessages).values({
+      interviewId,
+      role: "user",
+      content
+    });
+
+    const sceneUnchanged = await this.markAndCompareSceneHash(
+      `interview:${interviewId}:sceneHash`,
+      workspaceContext?.sceneSummary
+    );
+
+    const stream = this.aiService.streamInterviewer({
+      interviewerLevel: inputs.session.interviewerLevel,
+      problemStatement: inputs.problem.statement,
+      history: inputs.history,
+      message: content,
+      workspaceContext: inputs.augmentedContext,
+      sceneUnchanged,
+      criteria: inputs.criteria,
+      playbook: inputs.playbook,
+      currentPhaseId: workspaceContext?.phase?.id,
+      discoveredCriterionIds: inputs.discoveredCriterionIds,
+      phaseTimeline: inputs.phaseTimeline,
+      pendingPhaseTransition: inputs.pendingPhaseTransition,
+      narrative: inputs.narrative
     });
 
     return stream;
@@ -873,18 +916,47 @@ export class InterviewService {
     return { constraints, proposals: nextProposals };
   }
 
-  async saveAssistantMessage(
-    interviewId: string,
-    content: string,
+  /**
+   * Persist one assistant turn and run the post-turn pipeline against it.
+   *
+   * `source`/`externalId` are how a voice turn arrives (task 23). When an
+   * `externalId` is supplied the insert is idempotent, and the pipeline runs
+   * ONLY for a genuinely new row — a replayed turn that re-ran discovery would
+   * credit the same criterion twice and skew the debrief.
+   *
+   * Returns whether anything was inserted, so the caller can distinguish a
+   * replay from a write without a second query.
+   */
+  async persistAssistantTurn(opts: {
+    interviewId: string;
+    content: string;
     /** Phase snapshot from the turn that produced this reply. The timer is
      * client-owned, so pacing has to come in with the message. */
-    phase?: PhaseRuntimeInfo
-  ) {
-    await this.db.insert(interviewMessages).values({
-      interviewId,
-      role: "assistant",
-      content
-    });
+    phase?: PhaseRuntimeInfo;
+    source?: "voice";
+    externalId?: string;
+  }): Promise<boolean> {
+    const { interviewId, content, phase, source, externalId } = opts;
+
+    let inserted = true;
+    if (externalId) {
+      // ON CONFLICT DO NOTHING with no target so it satisfies the partial
+      // unique index (`WHERE external_id IS NOT NULL`) without Postgres having
+      // to infer the predicate. An empty `returning` means it was a replay.
+      const rows = await this.db
+        .insert(interviewMessages)
+        .values({ interviewId, role: "assistant", content, source: source ?? null, externalId })
+        .onConflictDoNothing()
+        .returning({ id: interviewMessages.id });
+      inserted = rows.length > 0;
+    } else {
+      await this.db
+        .insert(interviewMessages)
+        .values({ interviewId, role: "assistant", content, source: source ?? null });
+    }
+
+    if (!inserted) return false;
+
     // Run sequentially after the assistant row is persisted so:
     //  1. Discovery promotes criteria → live constraints before proposals run.
     //  2. The interview SSE finishes only after DB reflects discoveries, so a
@@ -898,8 +970,104 @@ export class InterviewService {
       await this.detectPhaseTransition(interviewId, phase);
     } catch (err) {
       const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-      console.error("[saveAssistantMessage] post-turn jobs:", msg);
+      console.error("[persistAssistantTurn] post-turn jobs:", msg);
     }
+    return true;
+  }
+
+  /** Text-path entry point. Kept so the interview controller is untouched. */
+  async saveAssistantMessage(interviewId: string, content: string, phase?: PhaseRuntimeInfo) {
+    await this.persistAssistantTurn({ interviewId, content, phase });
+  }
+
+  /**
+   * Persist a batch of completed spoken turns.
+   *
+   * Voice audio never reaches the server — the browser talks to OpenAI
+   * directly — so the client is the only witness to what was said and posts it
+   * back. That is the same trust model the phase-event log and the scene
+   * summaries already use.
+   *
+   * The batch is ordered by the caller in *conversation* order, not arrival
+   * order: transcription completes asynchronously with respect to response
+   * events, so an interviewer reply can land before the transcript of the
+   * question it answered. Persisting on arrival would store the interviewer
+   * answering a question the candidate had not yet asked, and the debrief is
+   * graded against that.
+   */
+  async persistVoiceTurns(
+    interviewId: string,
+    turns: VoiceTurn[]
+  ): Promise<{ persisted: number; duplicates: number }> {
+    const session = await this.requireInterview(interviewId);
+    if (session.status !== "active") {
+      throw new ConflictException(
+        "This interview is completed. Start a new interview (or Replay) to keep practising."
+      );
+    }
+
+    let persisted = 0;
+    let duplicates = 0;
+
+    for (const turn of turns) {
+      if (turn.role === "assistant") {
+        const inserted = await this.persistAssistantTurn({
+          interviewId,
+          content: turn.content,
+          phase: turn.phase,
+          source: "voice",
+          externalId: turn.externalId
+        });
+        inserted ? persisted++ : duplicates++;
+        continue;
+      }
+
+      const rows = await this.db
+        .insert(interviewMessages)
+        .values({
+          interviewId,
+          role: "user",
+          content: turn.content,
+          source: "voice",
+          externalId: turn.externalId
+        })
+        .onConflictDoNothing()
+        .returning({ id: interviewMessages.id });
+      rows.length > 0 ? persisted++ : duplicates++;
+    }
+
+    return { persisted, duplicates };
+  }
+
+  /**
+   * Add to this interview's accumulated voice time, clamped to `maxSeconds`.
+   *
+   * The ceiling is passed in rather than read here: it is configuration that
+   * belongs to the voice module, and this service has no ConfigService. Reading
+   * `process.env` directly would work in production and silently ignore test
+   * configuration, which is the worst of both.
+   *
+   * Monotonic by construction — a client reporting a negative or absurd delta
+   * cannot wind the meter back and buy itself more time.
+   */
+  async addVoiceSeconds(
+    interviewId: string,
+    deltaSeconds: number,
+    maxSeconds: number
+  ): Promise<{ accumulatedSeconds: number; ceilingReached: boolean }> {
+    const session = await this.requireInterview(interviewId);
+    const previous = Number(session.voiceSeconds ?? 0);
+    const delta = Number.isFinite(deltaSeconds) ? Math.max(0, Math.round(deltaSeconds)) : 0;
+    const accumulated = Math.min(previous + delta, maxSeconds);
+
+    if (accumulated !== previous) {
+      await this.db
+        .update(interviews)
+        .set({ voiceSeconds: accumulated })
+        .where(eq(interviews.id, interviewId));
+    }
+
+    return { accumulatedSeconds: accumulated, ceilingReached: accumulated >= maxSeconds };
   }
 
   /** Read the live transition offer (and what has already been answered for). */

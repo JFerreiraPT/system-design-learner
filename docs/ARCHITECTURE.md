@@ -47,6 +47,8 @@ Turbo orchestrates `dev`, `build`, `lint`, and Drizzle DB tasks (`db:generate`, 
 - **Client state:** `zustand` (`apps/web/src/lib/store.ts`)
 - **HTTP:** `axios` instance in `apps/web/src/lib/api.ts`
 - **Streaming chat:** `@ai-sdk/react` (SSE) for interviewer/tutor chat
+- **Voice:** `RTCPeerConnection` straight to the OpenAI Realtime API — audio never transits
+  this app's API, which is why spoken turns are posted back separately for persistence
 
 ### Pages
 
@@ -57,7 +59,13 @@ Turbo orchestrates `dev`, `build`, `lint`, and Drizzle DB tasks (`db:generate`, 
 ### Key components
 
 - `Board.tsx` — Excalidraw scene
-- `ChatPanel.tsx` — interviewer/tutor streaming chat (read-only once the interview ends)
+- `TranscriptView.tsx` — conversation rendering + scroll behaviour, shared by text and voice
+- `ChatPanel.tsx` — the typed composer + SSE send loop, rendered through `TranscriptView`
+  (read-only once the interview ends)
+- `VoicePanel.tsx` — Text/Voice toggle for the Interview tab; both modalities share ONE
+  transcript, and the composer stays live during a voice session because mixed input
+  ("the id looks like this" → typed) is the realistic mode, not a fallback
+- `VoiceBar.tsx` — connection + turn state, mic level, Hold to think, Go ahead, spend meter
 - `PhaseRibbon.tsx` — phase progress + the candidate-confirmed "ready to move on?" banner
 - `EstimationPanel.tsx`, `DimensionBreakdown.tsx`
 - `CriteriaReveal.tsx` — post-validate rubric reveal, paired with the reference's coverage lines
@@ -73,6 +81,18 @@ Turbo orchestrates `dev`, `build`, `lint`, and Drizzle DB tasks (`db:generate`, 
 - `lib/phaseEvents.ts` — fire-and-forget pacing telemetry (never surfaces an error)
 - `lib/constraintPills.ts` — tolerates a `discoveredFromCriterionId` left dangling by a
   rubric regeneration
+- `lib/voice/` — the spoken interview. `useRealtimeVoice.ts` owns the WebRTC session;
+  everything genuinely tricky is a pure module beside it, because a live WebRTC connection
+  cannot be unit tested:
+  - `turnState.ts` — whose turn it is. Its load-bearing rule: `speech_stopped` does **not**
+    end a turn, because under semantic VAD speech stops and resumes inside one turn all the
+    time (the candidate is drawing, or thinking)
+  - `turnBuffer.ts` — orders and pairs turns before persistence. Transcription completes
+    asynchronously with respect to response generation, so the interviewer's reply routinely
+    arrives before the transcript of the question it answered
+  - `contextFeed.ts` — pushes board deltas into a live session, debounced and never
+    mid-sentence
+  - `costMeter.ts` — elapsed time and estimated spend
 
 ## Backend (`apps/api`)
 
@@ -89,6 +109,7 @@ NestJS 11 application. `src/main.ts` bootstraps with CORS enabled, listens on po
 | `SolutionsModule` | `src/solutions` | Save and score user solutions |
 | `InterviewModule` | `src/interview` | Interview sessions and streamed messages |
 | `TutorModule` | `src/tutor` | Tutor sessions and streamed messages |
+| `VoiceModule` | `src/voice` | Mints realtime credentials and records spoken turns |
 
 ### REST surface
 
@@ -129,6 +150,12 @@ GET   /interviews/:id/phase-timeline            per-phase actual vs budget
 GET   /interviews/:id/criteria                  progress only (no hidden text)
 GET   /interviews/:id/criteria/reveal           gated on >= 1 validation
 POST  /interviews/:id/criteria/regenerate
+
+POST  /interviews/:id/voice/session             mint an ephemeral realtime credential
+                                                (instructions baked in server-side and
+                                                 NEVER returned — they carry the hidden rubric)
+POST  /interviews/:id/voice/turns               { turns[], audioSecondsDelta? }
+                                                idempotent on turns[].externalId
 
 POST  /tutor/sessions                           { title?, interviewId? }
 GET   /tutor/sessions
@@ -210,6 +237,9 @@ Schema lives in `apps/api/src/db/schema.ts`. Migrations are tracked in `apps/api
 - `reference_json` (jsonb) — interview-scoped reference answer (kept separate from the
   per-problem cache, since rubrics differ per level)
 - `debrief_json` (jsonb) — written close-out, generated once
+- `voice_seconds` (integer, default 0) — accumulated realtime audio for this interview.
+  Persisted rather than tracked client-side so the session ceiling survives a reload; a
+  ceiling reset by pressing F5 is decoration
 - `started_at`, `ended_at`
 
 **`interview_phase_events`** (append-only pacing telemetry)
@@ -225,6 +255,13 @@ Schema lives in `apps/api/src/db/schema.ts`. Migrations are tracked in `apps/api
 **`interview_messages`**
 - `id` (uuid, pk), `interview_id` → `interviews.id`
 - `role`, `content`, `created_at`
+- `source` (text, nullable) — `'voice'` on spoken turns; `NULL` = text, which is every row
+  written before voice existed and is deliberately not backfilled. Provenance only; nothing
+  downstream branches on it
+- `external_id` (text, nullable) — the realtime conversation item id, and the idempotency
+  key. Unique index on `(interview_id, external_id) WHERE external_id IS NOT NULL`: a
+  re-post is a no-op, because reconnects and retries replay turns and a duplicated answer
+  would skew the debrief and double-count discoveries
 
 **`tutor_sessions`**
 - `id` (uuid, pk), `title` (default `"Tutor Session"`)
@@ -308,6 +345,66 @@ The capture runs `exportToBlob` with a `getDimensions` callback that clamps the 
 When the browser sends a message to the interviewer or tutor, it includes the latest `sceneSummary` (and optionally an `imageBase64`). On the API, `InterviewService` / `TutorService` compute a SHA-1 of the canonical `(nodes, edges)` and compare it to the previous turn's hash stored in Redis under `interview:<id>:sceneHash` / `tutor:<id>:sceneHash` (TTL 4h).
 
 If the hash matches, `sceneUnchanged: true` is passed to `AiService`, which **omits the whiteboard description and image from the prompt for that turn**. This avoids re-sending hundreds to thousands of tokens of board context every chat turn when the candidate is just talking.
+
+
+## Voice: spoken interviews
+
+A system design interview is a spoken conversation held over a whiteboard. Voice is
+**speech-to-speech** over the OpenAI Realtime API (`gpt-realtime-2.1`), opt-in per
+interview, and it never gates anything: mic denied, no input device, connection failed, or
+minting refused all leave a fully working text interview.
+
+```text
+browser ──audio(WebRTC)──> OpenAI Realtime ──audio──> browser
+   │                              │
+   │            data channel: transcripts, VAD events, context deltas
+   ▼
+POST /interviews/:id/voice/turns ──> interview_messages
+                                     └─> the SAME post-turn pipeline as text:
+                                         detectDiscoveries → deriveConstraintProposals
+                                         → detectPhaseTransition
+```
+
+Four decisions carry the design.
+
+**The hidden rubric never reaches the browser.** `buildInterviewerPrompt` embeds every
+undiscovered hidden expectation verbatim, with its progressive nudges. So
+`POST /interviews/:id/voice/session` builds the instructions server-side, bakes them into
+an ephemeral credential (`POST /v1/realtime/client_secrets`), and returns only the
+credential plus non-secret knobs. A browser that assembled its own session config could
+read the whole hidden rubric out of devtools and `detectDiscoveries` would be measuring
+nothing. A candidate can still overwrite the instructions via `session.update` — that is
+self-sabotage, not a leak, and is out of scope.
+
+**Silence is the candidate thinking.** "So I'd put a queue here…" — eight seconds of
+drawing — "…and the consumers are idempotent." That is *one* turn, and the API's default
+500ms silence threshold cuts it in two. Turn detection is `semantic_vad` with
+`eagerness: "low"`, which scores how *finished* the speech sounds and waits longer when it
+trails off, plus an explicit **Hold to think** that disables the mic track locally.
+
+**Barge-in requires truncation.** `interrupt_response: true` stops the audio, but the
+assistant item still claims it said the whole sentence. Without `conversation.item.truncate`
+the interviewer refers back to a question the candidate never heard — and it reads like a
+prompt bug, not a transport bug.
+
+**Persistence is load-bearing, not polish.** Audio flows browser ↔ OpenAI, so the server
+sees nothing, and the debrief, the criterion matcher, `getTutorUsage` and the markdown
+export all read `interview_messages`. Spoken turns are posted back and land in that same
+table, indistinguishable to every consumer (`source = 'voice'` is provenance only). The
+`(interview_id, external_id)` unique index makes a re-post a no-op: reconnects, retries and
+strict-mode double-effects all replay turns, and a duplicated answer would skew the debrief
+and double-count discoveries.
+
+The client is the only witness to the audio, so it is trusted for the transcript — the same
+trust model the phase-event log and scene summaries already use.
+
+### Cost
+
+Unlike every other AI call here, a voice session is bounded by nothing: it bills for as long
+as its socket is open. Roughly $0.02 per minute heard and $0.08 per minute spoken, so a
+45-minute interview lands near $2. Hence a persisted per-interview ceiling
+(`interviews.voice_seconds`, so it survives a reload), an idle auto-close, and a visible
+spend meter.
 
 ## Caching
 
@@ -399,6 +496,10 @@ The PNG is captured lazily by `Board.tsx` via `captureSceneImage()` on demand, s
 - `DATABASE_URL` (e.g. `postgresql://sdl:sdl@postgres:5432/sdl`)
 - `REDIS_URL` (e.g. `redis://redis:6379`)
 - `POSTGRES_PORT`, `REDIS_PORT` — host port overrides for local conflicts
+- Per-purpose model overrides and the voice knobs (`AI_MODEL_*`, `AI_VOICE_NAME`,
+  `VOICE_TURN_DETECTION`, `VOICE_VAD_EAGERNESS`, `VOICE_MAX_SESSION_MINUTES`,
+  `VOICE_IDLE_TIMEOUT_SECONDS`) — all documented in `.env.example`, all falling back to a
+  documented default rather than throwing, because a typo in `.env` must not take the API down
 
 ## Notes and possible extensions
 
