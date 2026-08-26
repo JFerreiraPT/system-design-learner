@@ -179,6 +179,14 @@ export function VoiceBar({ session, onExit }: Props) {
             >
               Back to typing
             </button>
+            {/* The one failure browser echo cancellation cannot win: on
+                speakers, the interviewer's own voice returns through the mic,
+                turn detection reads it as the candidate, and it interrupts
+                itself in a loop. Stated once, before starting, rather than
+                nagged about during the session. */}
+            <span className="text-[11px] text-fg-faint">
+              Use headphones — on speakers the interviewer hears itself.
+            </span>
           </>
         )}
       </div>
