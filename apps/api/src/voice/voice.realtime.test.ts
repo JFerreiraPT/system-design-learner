@@ -3,11 +3,13 @@ import test from "node:test";
 import {
   DEFAULT_VOICE_NAME,
   resolveVoiceLimits,
+  resolveVoiceLanguages,
   resolveVoiceName,
   resolveVoiceTurnDetection,
   VOICE_DEFAULT_IDLE_TIMEOUT_SECONDS,
   VOICE_DEFAULT_MAX_SESSION_MINUTES,
   VOICE_DEFAULT_SILENCE_MS,
+  VOICE_DEFAULT_THRESHOLD,
   VOICE_SAMPLE_RATE
 } from "../ai/ai.models.js";
 import { buildRealtimeSessionConfig, VOICE_BASE_KEYWORDS } from "./voice.realtime.js";
@@ -47,12 +49,16 @@ test("barge-in is enabled: the candidate may talk over the interviewer", () => {
   assert.equal(c.audio.input.turn_detection.interrupt_response, true);
 });
 
-test("server_vad carries the generous silence window, not the API default", () => {
-  const c = config({ turnDetection: { type: "server_vad", silence_duration_ms: 2500 } });
-  const td = c.audio.input.turn_detection as { silence_duration_ms: number };
+test("server_vad carries a wider silence window and a noise gate", () => {
+  const c = config({
+    turnDetection: { type: "server_vad", threshold: 0.65, silence_duration_ms: 1500 }
+  });
+  const td = c.audio.input.turn_detection as { silence_duration_ms: number; threshold: number };
   // 500ms — the API default — cuts a candidate in half mid-design.
-  assert.equal(td.silence_duration_ms, 2500);
+  assert.equal(td.silence_duration_ms, 1500);
   assert.notEqual(td.silence_duration_ms, 500);
+  // And above 0.5, so a chair scrape does not open a turn.
+  assert.equal(td.threshold, 0.65);
 });
 
 test("instructions live in the session config, which is exactly why it stays server-side", () => {
@@ -89,38 +95,79 @@ test("a bad voice name falls back to the default instead of throwing", () => {
   assert.equal(resolveVoiceName(reader({})), DEFAULT_VOICE_NAME);
 });
 
-test("turn detection defaults to semantic_vad with low eagerness", () => {
+test("turn detection defaults to semantic_vad at medium eagerness", () => {
+  // `low` shipped first and was wrong in use: it pads the maximum wait, so a
+  // chair scrape opens a turn and the session then sits in it for seconds.
   assert.deepEqual(resolveVoiceTurnDetection(reader({})), {
     type: "semantic_vad",
-    eagerness: "low"
+    eagerness: "medium"
   });
-  assert.deepEqual(resolveVoiceTurnDetection(reader({ VOICE_VAD_EAGERNESS: "high" })), {
-    type: "semantic_vad",
-    eagerness: "high"
-  });
-  // Garbage eagerness keeps the deliberate default rather than the API's "auto".
+  for (const e of ["low", "high", "auto"]) {
+    assert.deepEqual(resolveVoiceTurnDetection(reader({ VOICE_VAD_EAGERNESS: e })), {
+      type: "semantic_vad",
+      eagerness: e
+    });
+  }
+  // Garbage keeps the deliberate default rather than the API's own "auto".
   assert.deepEqual(resolveVoiceTurnDetection(reader({ VOICE_VAD_EAGERNESS: "nope" })), {
     type: "semantic_vad",
-    eagerness: "low"
+    eagerness: "medium"
   });
 });
 
 test("server_vad is reachable as an escape hatch and tunable", () => {
   assert.deepEqual(resolveVoiceTurnDetection(reader({ VOICE_TURN_DETECTION: "server_vad" })), {
     type: "server_vad",
+    threshold: VOICE_DEFAULT_THRESHOLD,
     silence_duration_ms: VOICE_DEFAULT_SILENCE_MS
   });
   assert.deepEqual(
-    resolveVoiceTurnDetection(reader({ VOICE_TURN_DETECTION: "server_vad", VOICE_SILENCE_MS: "1800" })),
-    { type: "server_vad", silence_duration_ms: 1800 }
+    resolveVoiceTurnDetection(
+      reader({ VOICE_TURN_DETECTION: "server_vad", VOICE_SILENCE_MS: "1800", VOICE_VAD_THRESHOLD: "0.8" })
+    ),
+    { type: "server_vad", threshold: 0.8, silence_duration_ms: 1800 }
   );
-  // A malformed threshold must not become NaN and disable detection entirely.
-  assert.deepEqual(
-    resolveVoiceTurnDetection(reader({ VOICE_TURN_DETECTION: "server_vad", VOICE_SILENCE_MS: "soon" })),
-    { type: "server_vad", silence_duration_ms: VOICE_DEFAULT_SILENCE_MS }
-  );
+  // Malformed values must not become NaN and disable detection entirely.
+  for (const bad of ["soon", "0", "-1", ""]) {
+    const td = resolveVoiceTurnDetection(
+      reader({ VOICE_TURN_DETECTION: "server_vad", VOICE_SILENCE_MS: bad, VOICE_VAD_THRESHOLD: bad })
+    );
+    assert.deepEqual(td, {
+      type: "server_vad",
+      threshold: VOICE_DEFAULT_THRESHOLD,
+      silence_duration_ms: VOICE_DEFAULT_SILENCE_MS
+    }, `"${bad}" should fall back`);
+  }
+  // A threshold of 1 would never open a turn; 0 would treat silence as speech.
+  for (const bad of ["1", "1.5"]) {
+    assert.equal(
+      (resolveVoiceTurnDetection(reader({ VOICE_TURN_DETECTION: "server_vad", VOICE_VAD_THRESHOLD: bad })) as { threshold: number }).threshold,
+      VOICE_DEFAULT_THRESHOLD
+    );
+  }
   // An unknown mode is not a reason to lose semantic VAD.
   assert.equal(resolveVoiceTurnDetection(reader({ VOICE_TURN_DETECTION: "magic" })).type, "semantic_vad");
+});
+
+test("transcription language is pinned, not auto-detected", () => {
+  // Unset, gpt-live-transcribe guesses per utterance: a real session produced
+  // Japanese from an English speaker and drifted into Spanish for a Portuguese
+  // one, and every miss is a criterion the matcher then fails to match.
+  assert.deepEqual(resolveVoiceLanguages(reader({})), ["en"]);
+  assert.deepEqual(resolveVoiceLanguages(reader({ AI_VOICE_LANGUAGES: "en,pt" })), ["en", "pt"]);
+  assert.deepEqual(resolveVoiceLanguages(reader({ AI_VOICE_LANGUAGES: " EN , PT " })), ["en", "pt"]);
+  assert.deepEqual(resolveVoiceLanguages(reader({ AI_VOICE_LANGUAGES: "en,en,pt" })), ["en", "pt"]);
+  // Junk falls back rather than shipping an invalid `languages` array.
+  for (const bad of ["", "english,portuguese", "!!,??", ","]) {
+    assert.deepEqual(resolveVoiceLanguages(reader({ AI_VOICE_LANGUAGES: bad })), ["en"], bad);
+  }
+});
+
+test("the session config carries the pinned languages", () => {
+  assert.deepEqual(config({ languages: ["en", "pt"] }).audio.input.transcription.languages, [
+    "en",
+    "pt"
+  ]);
 });
 
 test("session limits parse minutes and reject nonsense", () => {

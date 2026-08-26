@@ -56,7 +56,7 @@ export type RealtimeSessionConfig = {
   audio: {
     input: {
       format: { type: "audio/pcm"; rate: number };
-      transcription: { model: string; prompt?: string; keywords?: string[] };
+      transcription: { model: string; prompt?: string; keywords?: string[]; languages?: string[] };
       turn_detection: VoiceTurnDetectionConfig & {
         create_response: true;
         interrupt_response: true;
@@ -74,6 +74,7 @@ export function buildRealtimeSessionConfig(input: {
   instructions: string;
   turnDetection: VoiceTurnDetectionConfig;
   keywords?: string[];
+  languages?: string[];
 }): RealtimeSessionConfig {
   return {
     type: "realtime",
@@ -86,7 +87,9 @@ export function buildRealtimeSessionConfig(input: {
           model: input.transcriptionModel,
           prompt:
             "A spoken system-design interview. The speaker is a software engineer reasoning aloud about distributed systems architecture while drawing on a whiteboard.",
-          keywords: dedupeKeywords([...(input.keywords ?? []), ...VOICE_BASE_KEYWORDS])
+          keywords: dedupeKeywords([...(input.keywords ?? []), ...VOICE_BASE_KEYWORDS]),
+          // Pinned rather than auto-detected — see DEFAULT_VOICE_LANGUAGES.
+          languages: input.languages
         },
         turn_detection: {
           ...input.turnDetection,

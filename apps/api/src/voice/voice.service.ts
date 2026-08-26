@@ -95,7 +95,11 @@ export class VoiceService {
       turnDetection:
         turnDetection.type === "semantic_vad"
           ? { type: "semantic_vad", eagerness: turnDetection.eagerness }
-          : { type: "server_vad", silenceDurationMs: turnDetection.silence_duration_ms },
+          : {
+              type: "server_vad",
+              silenceDurationMs: turnDetection.silence_duration_ms,
+              threshold: turnDetection.threshold
+            },
       accumulatedSeconds,
       maxSessionSeconds: limits.maxSessionSeconds
     };
@@ -109,7 +113,7 @@ export class VoiceService {
   async recordTurns(
     interviewId: string,
     turns: VoiceTurn[],
-    audioSecondsDelta?: number
+    audioSecondsTotal?: number
   ): Promise<VoiceTurnsResponse> {
     const { persisted, duplicates } = await this.interviewService.persistVoiceTurns(
       interviewId,
@@ -117,7 +121,7 @@ export class VoiceService {
     );
     const meter = await this.interviewService.addVoiceSeconds(
       interviewId,
-      audioSecondsDelta ?? 0,
+      audioSecondsTotal ?? 0,
       this.limits().maxSessionSeconds
     );
     return { persisted, duplicates, ...meter };

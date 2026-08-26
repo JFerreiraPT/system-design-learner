@@ -20,6 +20,6 @@ export class VoiceController {
    * retries replay turns, and a duplicated answer skews the debrief. */
   @Post(":id/voice/turns")
   recordTurns(@Param("id") id: string, @Body() body: VoiceTurnsDto) {
-    return this.voiceService.recordTurns(id, body.turns, body.audioSecondsDelta);
+    return this.voiceService.recordTurns(id, body.turns, body.audioSecondsTotal);
   }
 }

@@ -54,9 +54,18 @@ export function applyCommand(machine: TurnMachine, command: TurnCommand): TurnMa
     case "closed":
       return { ...INITIAL_TURN_MACHINE, lastEventType: machine.lastEventType };
     case "hold":
-      // Holding while the interviewer is mid-sentence is not a hold, it is a
-      // barge-in; leave the state alone so the caller still truncates.
-      return machine.state === "interviewerSpeaking" ? machine : { ...machine, state: "held" };
+      // Holding while the interviewer is mid-sentence is BOTH: a barge-in and a
+      // hold. The caller reads `truncationTarget` off the machine before
+      // applying this command, so entering `held` here does not lose the
+      // truncation — and not entering it used to leave the machine in
+      // `interviewerSpeaking`, so when the reply finished the UI said
+      // "Listening" while the mic track was still disabled.
+      return {
+        ...machine,
+        state: "held",
+        speakingItemId: null,
+        speakingSinceMs: null
+      };
     case "release":
       return machine.state === "held" ? { ...machine, state: "listening" } : machine;
     default:
@@ -64,15 +73,38 @@ export function applyCommand(machine: TurnMachine, command: TurnCommand): TurnMa
   }
 }
 
+/** Events that mean the interviewer has finished (or been stopped). */
+function isTurnEnd(type: string): boolean {
+  return (
+    type === "response.done" ||
+    type === "output_audio_buffer.stopped" ||
+    type === "response.output_audio.done" ||
+    type === "response.audio.done"
+  );
+}
+
 export function reduceTurn(machine: TurnMachine, timed: TimedEvent): TurnMachine {
   const { event, atMs } = timed;
   const type = event.type;
   const tagged = { ...machine, lastEventType: type };
 
-  // Held means the mic track is disabled, so no speech events should arrive at
-  // all — but a queued frame can land just after. Ignoring them keeps the hold
-  // honest rather than flickering out of it.
-  if (machine.state === "held" && type.startsWith("input_audio_buffer.")) return tagged;
+  // `held` is USER-owned: the mic track is disabled, and only an explicit
+  // release may end it. Server events are still recorded (the caller needs
+  // `lastEventType`, and a reply can legitimately finish while the candidate is
+  // holding) but must not move the state.
+  //
+  // Without this, a `response.done` landing during a hold flips the pill to
+  // "Listening" while the mic is still off — the candidate starts talking into a
+  // dead microphone and nothing on screen tells them.
+  if (machine.state === "held") {
+    return {
+      ...tagged,
+      // The interviewer's reply ending is still worth recording, so a release
+      // does not land the candidate back in a stale speaking state.
+      speakingItemId: isTurnEnd(type) ? null : machine.speakingItemId,
+      speakingSinceMs: isTurnEnd(type) ? null : machine.speakingSinceMs
+    };
+  }
 
   switch (true) {
     case type === "session.created" || type === "session.updated":
@@ -118,10 +150,7 @@ export function reduceTurn(machine: TurnMachine, timed: TimedEvent): TurnMachine
         playedMs: 0
       };
 
-    case type === "response.done" ||
-      type === "output_audio_buffer.stopped" ||
-      type === "response.output_audio.done" ||
-      type === "response.audio.done":
+    case isTurnEnd(type):
       return {
         ...tagged,
         state: "listening",

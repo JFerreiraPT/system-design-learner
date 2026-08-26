@@ -12,7 +12,7 @@ import {
   tutorSessions
 } from "../db/schema.js";
 import { FakeDb, fakeRedis, type FakeRow } from "./fakeDb.js";
-import { InterviewService, isRubricStale } from "./interview.service.js";
+import { InterviewService, isRubricStale, toInterviewSummary } from "./interview.service.js";
 
 const PLAN = DEFAULT_INTERVIEW_PLAN;
 const FIRST = PLAN.phases[0]!;
@@ -600,4 +600,175 @@ test("with no phase events recorded, the first-use phase is null rather than a g
   const usage = await service.getTutorUsage("interview-1");
   assert.equal(usage.firstUsedAtPhase, null);
   assert.deepEqual(usage.topics, ["caching"]);
+});
+
+// ---------------------------------------------------------------------------
+// The rubric must not leak through an interview response.
+//
+// `criteria_json` holds the answer key: every hidden expectation in full text,
+// its `satisfiedBy` answers, its `discoveryHints`, and three progressive nudges.
+// A candidate who can read that from the network tab is being scored on
+// expectations they were handed, and the visible/hidden split that the rest of
+// this service is careful about stops meaning anything.
+// ---------------------------------------------------------------------------
+
+/** Strings that exist ONLY inside the hidden rubric, so a hit is unambiguous. */
+const RUBRIC_SECRETS = {
+  text: "ZZ_HIDDEN_EXPECTATION_TEXT_ZZ",
+  hint: "ZZ_DISCOVERY_HINT_ZZ",
+  nudge: "ZZ_PROGRESSIVE_NUDGE_ZZ",
+  satisfiedBy: "ZZ_SATISFIED_BY_ZZ",
+  redFlag: "ZZ_RED_FLAG_ZZ",
+  band: "ZZ_SCORE_BAND_ZZ"
+};
+
+const secretCriteria: RubricCriterion[] = [
+  {
+    id: "secret_criterion",
+    text: RUBRIC_SECRETS.text,
+    dimension: "security",
+    importance: "core",
+    visibility: "hidden",
+    satisfiedBy: [RUBRIC_SECRETS.satisfiedBy],
+    discoveryHints: [RUBRIC_SECRETS.hint],
+    progressiveNudges: [RUBRIC_SECRETS.nudge, "sharper", "sharpest"] as [string, string, string]
+  }
+];
+
+const secretPlaybook = {
+  areasToProbe: [
+    {
+      id: "area",
+      label: "Area",
+      phaseRefs: [FIRST.id],
+      criterionRefs: ["secret_criterion"],
+      sampleQuestions: ["How is that enforced?"],
+      progressiveNudges: ["gentle probe", "firmer probe", "sharp probe"] as [
+        string,
+        string,
+        string
+      ],
+      greenFlags: ["Names the mechanism."],
+      redFlags: [RUBRIC_SECRETS.redFlag]
+    }
+  ],
+  scoreRubric: {
+    "1": RUBRIC_SECRETS.band,
+    "2": "Shallow answer.",
+    "3": "Meets the bar.",
+    "4": "Exceeds the bar."
+  }
+};
+
+/** Every secret that appears anywhere in a serialised response. */
+function leaks(response: unknown): string[] {
+  const body = JSON.stringify(response ?? null);
+  return Object.entries(RUBRIC_SECRETS)
+    .filter(([, secret]) => body.includes(secret))
+    .map(([name]) => name);
+}
+
+function secretFixture(overrides: FakeRow = {}) {
+  return makeFixture({
+    criteriaJson: { criteria: secretCriteria, playbook: secretPlaybook },
+    criteriaLevel: "standard",
+    ...overrides
+  });
+}
+
+test("starting an interview does not return the rubric", async () => {
+  // `start` builds its own criteria via the AI stub, so plant the secret on the
+  // problem's seeded rubric — the path a curated problem actually takes.
+  const { service, db } = secretFixture();
+  const problemRows = db.rowsFor(problems);
+  problemRows[0].seededRubricJson = { criteria: secretCriteria, playbook: secretPlaybook };
+
+  const response = await service.start({ problemId: "problem-1", interviewerLevel: "standard" });
+
+  assert.deepEqual(leaks(response), [], "the rubric reached the client");
+  // Still useful: the client reads `id`, and the rail reads the seeded scope.
+  assert.equal(typeof (response as { id: string }).id, "string");
+  assert.ok(Array.isArray((response as { liveConstraintsJson: unknown[] }).liveConstraintsJson));
+});
+
+test("changing the level does not return the rubric", async () => {
+  const { service } = secretFixture();
+  const response = await service.updateLevel("interview-1", "hard", false);
+
+  assert.deepEqual(leaks(response), []);
+  // The contract the client actually declares still holds.
+  assert.equal(response.interviewerLevel, "hard");
+  assert.equal(response.criteriaLevel, "standard");
+  assert.equal(response.rubricStale, true);
+});
+
+test("regenerating criteria returns counts, not criterion texts", async () => {
+  const { service, db } = secretFixture();
+  db.rowsFor(problems)[0].seededRubricJson = {
+    criteria: secretCriteria,
+    playbook: secretPlaybook
+  };
+
+  const response = await service.regenerateCriteria("interview-1");
+
+  assert.deepEqual(leaks(response), []);
+  assert.equal(response.generated, true);
+  assert.ok(response.count >= 1);
+  assert.equal(response.rubricStale, false);
+});
+
+test("the progress view still withholds undiscovered hidden texts", async () => {
+  const { service } = secretFixture();
+  const progress = await service.getCriteriaProgress("interview-1");
+
+  // Counts are safe and are the point of this endpoint.
+  assert.deepEqual(leaks(progress), []);
+  assert.equal((progress as { hidden: { total: number } }).hidden.total, 1);
+});
+
+test("a DISCOVERED hidden criterion may surface its text, but never its coaching", async () => {
+  const discovered: RubricCriterion[] = [
+    { ...secretCriteria[0], discoveredVia: { at: "2026-08-26T09:00:00.000Z", kind: "match" } }
+  ];
+  const { service } = makeFixture({
+    criteriaJson: { criteria: discovered, playbook: secretPlaybook },
+    criteriaLevel: "standard"
+  });
+
+  const progress = await service.getCriteriaProgress("interview-1");
+  // The expectation itself is fair game once the candidate has surfaced it —
+  // that is what the reveal is for. The nudges and answers are not.
+  assert.deepEqual(leaks(progress).sort(), ["text"]);
+});
+
+test("the summary is an allow-list, so a new column cannot leak by default", () => {
+  const summary = toInterviewSummary({
+    id: "i1",
+    problemId: "p1",
+    interviewerLevel: "standard",
+    status: "active",
+    criteriaJson: { criteria: secretCriteria, playbook: secretPlaybook },
+    referenceJson: { secret: RUBRIC_SECRETS.text },
+    debriefJson: { secret: RUBRIC_SECRETS.text },
+    // Stands in for whatever gets added to this table next.
+    someFutureSensitiveColumn: RUBRIC_SECRETS.text
+  });
+
+  assert.deepEqual(leaks(summary), []);
+  assert.deepEqual(Object.keys(summary).sort(), [
+    "criteriaLevel",
+    "endedAt",
+    "hasCriteria",
+    "id",
+    "interviewerLevel",
+    "liveConstraintsJson",
+    "pendingProposalsJson",
+    "problemId",
+    "startedAt",
+    "status",
+    "voiceSeconds"
+  ]);
+  // It still reports *whether* a rubric exists, which the client needs.
+  assert.equal(summary.hasCriteria, true);
+  assert.equal(toInterviewSummary({ id: "i", criteriaJson: null }).hasCriteria, false);
 });

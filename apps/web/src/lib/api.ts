@@ -382,12 +382,12 @@ export async function createVoiceSession(
 export async function postVoiceTurns(
   interviewId: string,
   turns: VoiceTurn[],
-  audioSecondsDelta?: number
+  audioSecondsTotal?: number
 ): Promise<VoiceTurnsResponse> {
   return (
     await api.post<VoiceTurnsResponse>(`/interviews/${interviewId}/voice/turns`, {
       turns,
-      audioSecondsDelta
+      audioSecondsTotal
     })
   ).data;
 }

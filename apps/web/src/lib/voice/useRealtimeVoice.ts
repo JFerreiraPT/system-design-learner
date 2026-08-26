@@ -83,7 +83,16 @@ type Options = {
 };
 
 const TICK_MS = 1000;
+/** Level-meter sampling interval. ~15Hz reads as smooth and costs a quarter of
+ * the renders a per-frame meter would. */
+const MIC_LEVEL_INTERVAL_MS = 66;
 const RECONNECT_ATTEMPTS = 3;
+/** Total reconnects allowed per session, however they are spread out. The
+ * per-burst counter resets once a connection proves stable, so without this a
+ * link that opens and drops every few seconds would reconnect forever. */
+const RECONNECT_ATTEMPTS_TOTAL = 8;
+/** How long a connection must survive before its burst counter is forgiven. */
+const STABLE_CONNECTION_MS = 60_000;
 const REMINT_LEAD_MS = 30_000;
 const CEILING_WARN_FRACTION = 0.8;
 const IDLE_TIMEOUT_MS = 300_000;
@@ -124,6 +133,8 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
   const expiresAtRef = useRef<number>(Number.POSITIVE_INFINITY);
   const lastVoiceActivityRef = useRef(Date.now());
   const attemptRef = useRef(0);
+  const totalAttemptsRef = useRef(0);
+  const liveSinceRef = useRef<number | null>(null);
   const closingRef = useRef(false);
   const accumulatedAtStartRef = useRef(0);
 
@@ -157,12 +168,13 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
       if (batch.length === 0) return;
       pendingPostsRef.current = [];
 
-      const billable = billableSeconds(meterRef.current);
-      const delta = Math.max(0, billable - reportedSecondsRef.current);
+      // Absolute total, including what earlier sessions already spent, so the
+      // server can dedupe it with a max() and a retried post cannot bill twice.
+      const total = accumulatedAtStartRef.current + billableSeconds(meterRef.current);
 
       try {
-        const result = await postVoiceTurns(interviewId, batch.slice(0, 20), delta);
-        reportedSecondsRef.current = billable;
+        const result = await postVoiceTurns(interviewId, batch.slice(0, 20), total);
+        reportedSecondsRef.current = total;
         postFailuresRef.current = 0;
         setTranscriptWarning(null);
         setCeilingWarning(
@@ -437,7 +449,10 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
       }
     });
     dc.addEventListener("open", () => {
-      attemptRef.current = 0;
+      // Do NOT forgive the burst counter here. An open socket is not yet a
+      // working one, and resetting on every open is what turns a flapping
+      // connection into an unbounded reconnect loop.
+      liveSinceRef.current = Date.now();
       setStatus("live");
       syncMachine(applyCommand(machineRef.current, { kind: "connected" }));
       // The mint already described this state in the instructions, so it must
@@ -449,12 +464,23 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
     pc.addEventListener("iceconnectionstatechange", () => {
       const state = pc.iceConnectionState;
       if (state !== "failed" && state !== "disconnected") return;
-      if (attemptRef.current >= RECONNECT_ATTEMPTS) {
+
+      // A connection that lasted a while has earned a fresh budget; one that
+      // dropped immediately has not.
+      const liveFor = liveSinceRef.current === null ? 0 : Date.now() - liveSinceRef.current;
+      if (liveFor >= STABLE_CONNECTION_MS) attemptRef.current = 0;
+      liveSinceRef.current = null;
+
+      if (
+        attemptRef.current >= RECONNECT_ATTEMPTS ||
+        totalAttemptsRef.current >= RECONNECT_ATTEMPTS_TOTAL
+      ) {
         setError("The voice connection dropped and could not be re-established. Continuing in text.");
         closeSessionRef.current("failed");
         return;
       }
       attemptRef.current += 1;
+      totalAttemptsRef.current += 1;
       setStatus("reconnecting");
       // A re-mint carries the transcript so far, because every turn has been
       // persisted — so the interviewer picks up rather than reintroducing itself.
@@ -502,7 +528,10 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
       // expired session has no request to fail and no banner to render.
       if (now > expiresAtRef.current - REMINT_LEAD_MS) {
         expiresAtRef.current = Number.POSITIVE_INFINITY;
-        attemptRef.current = Math.min(attemptRef.current, RECONNECT_ATTEMPTS - 1);
+        // A scheduled refresh is not a failure and must not consume the
+        // reconnect budget, or a long interview would exhaust it on expiry
+        // alone and drop the candidate into text for no reason.
+        attemptRef.current = 0;
         setStatus("reconnecting");
         closeSessionRef.current("reconnecting");
         void connectRef.current();
@@ -595,6 +624,8 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
   const start = useCallback(() => {
     if (status === "live" || status === "connecting") return;
     attemptRef.current = 0;
+    totalAttemptsRef.current = 0;
+    liveSinceRef.current = null;
     bufferRef.current = new TurnBuffer();
     feedRef.current = new ContextFeed();
     meterRef.current = initialMeter(Date.now(), "idle");
@@ -650,8 +681,24 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
   );
 }
 
-/** A simple RMS level meter. Not a waveform — the question it answers is
- * "is this thing hearing me?", and a number answers that. */
+/** Bars in the UI meter. The level is quantised to this many steps, because a
+ * meter with eight bars cannot render more resolution than eight steps — and
+ * every extra distinct value is a wasted React render. */
+const MIC_LEVEL_STEPS = 8;
+
+/**
+ * A simple RMS level meter. Not a waveform — the question it answers is "is this
+ * thing hearing me?", and a number answers that.
+ *
+ * The rate limiting is not cosmetic. `micLevel` is React state, so a naive
+ * `setMicLevel` per animation frame re-renders the conversation subtree sixty
+ * times a second for the entire session. `ChatPanel` already buffers streamed
+ * tokens at 60ms for exactly this reason; a level meter must not undo it.
+ *
+ * Two guards: sample at a fixed interval rather than per frame, and only push a
+ * value when the quantised step actually changes — so a candidate sitting in
+ * silence produces no renders at all.
+ */
 function startLevelMeter(
   stream: MediaStream,
   analyserRef: React.MutableRefObject<{ ctx: AudioContext; analyser: AnalyserNode } | null>,
@@ -666,15 +713,25 @@ function startLevelMeter(
     analyserRef.current = { ctx, analyser };
 
     const data = new Uint8Array(analyser.frequencyBinCount);
-    const loop = () => {
+    let lastStep = -1;
+    let lastSampleMs = 0;
+
+    const loop = (now: number) => {
+      rafRef.current = requestAnimationFrame(loop);
+      if (now - lastSampleMs < MIC_LEVEL_INTERVAL_MS) return;
+      lastSampleMs = now;
+
       analyser.getByteTimeDomainData(data);
       let sum = 0;
       for (const sample of data) {
         const centred = (sample - 128) / 128;
         sum += centred * centred;
       }
-      setMicLevel(Math.min(1, Math.sqrt(sum / data.length) * 4));
-      rafRef.current = requestAnimationFrame(loop);
+      const level = Math.min(1, Math.sqrt(sum / data.length) * 4);
+      const step = Math.round(level * MIC_LEVEL_STEPS);
+      if (step === lastStep) return;
+      lastStep = step;
+      setMicLevel(step / MIC_LEVEL_STEPS);
     };
     rafRef.current = requestAnimationFrame(loop);
   } catch {

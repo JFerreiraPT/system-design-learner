@@ -1461,8 +1461,11 @@ export type VoiceEagerness = z.infer<typeof VoiceEagernessSchema>;
 export const VoiceTurnDetectionSchema = z.object({
   type: VoiceTurnDetectionModeSchema,
   eagerness: VoiceEagernessSchema.optional(),
-  /** Only set for `server_vad`. */
-  silenceDurationMs: z.number().int().positive().optional()
+  /** Both only set for `server_vad`. */
+  silenceDurationMs: z.number().int().positive().optional(),
+  /** Loudness gate, 0..1. The only knob that rejects room noise — semantic VAD
+   * has no equivalent. */
+  threshold: z.number().positive().max(1).optional()
 });
 export type VoiceTurnDetection = z.infer<typeof VoiceTurnDetectionSchema>;
 
@@ -1549,9 +1552,20 @@ export type VoiceSessionRequest = z.infer<typeof VoiceSessionRequestSchema>;
 
 export const VoiceTurnsRequestSchema = z.object({
   turns: z.array(VoiceTurnSchema).min(1).max(20),
-  /** Audio seconds consumed since the last post, for the per-interview
-   * ceiling. Client-reported, like phase events. */
-  audioSecondsDelta: z.number().nonnegative().max(3600).optional()
+  /**
+   * Total audio seconds for this interview INCLUDING earlier sessions — an
+   * absolute running total, not a delta.
+   *
+   * Absolute because it makes the meter idempotent for free, which a delta
+   * cannot be: a client that retries a post whose response it never saw would
+   * add the same delta twice, so a deduplicated turn would still be billed
+   * twice. The server takes `max(stored, reported)`, so a replay is a no-op and
+   * the meter can never run backwards either.
+   *
+   * Client-reported, like phase events — the browser is the only witness to the
+   * audio. Never trusted for anything but this ceiling.
+   */
+  audioSecondsTotal: z.number().nonnegative().max(86_400).optional()
 });
 export type VoiceTurnsRequest = z.infer<typeof VoiceTurnsRequestSchema>;
 

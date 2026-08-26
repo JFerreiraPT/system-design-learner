@@ -44,6 +44,7 @@ import {
 } from "@sdl/shared";
 import {
   resolveAiModels,
+  resolveVoiceLanguages,
   resolveVoiceName,
   VOICE_SAMPLE_RATE,
   type AiModels,
@@ -1409,7 +1410,8 @@ ${input.statement}`
     turnDetection: VoiceTurnDetectionConfig;
     keywords?: string[];
   }): Promise<{ clientSecret: string; expiresAt: string; model: string; voice: string }> {
-    const voice = resolveVoiceName((key) => this.configService.get<string>(key));
+    const read = (key: string) => this.configService.get<string>(key);
+    const voice = resolveVoiceName(read);
     const model = this.models.interviewerVoice;
 
     const session = buildRealtimeSessionConfig({
@@ -1419,7 +1421,8 @@ ${input.statement}`
       sampleRate: VOICE_SAMPLE_RATE,
       instructions: input.instructions,
       turnDetection: input.turnDetection,
-      keywords: input.keywords
+      keywords: input.keywords,
+      languages: resolveVoiceLanguages(read)
     });
 
     const response = await fetch(REALTIME_CLIENT_SECRETS_URL, {

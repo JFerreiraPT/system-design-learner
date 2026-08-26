@@ -154,7 +154,7 @@ POST  /interviews/:id/criteria/regenerate
 POST  /interviews/:id/voice/session             mint an ephemeral realtime credential
                                                 (instructions baked in server-side and
                                                  NEVER returned — they carry the hidden rubric)
-POST  /interviews/:id/voice/turns               { turns[], audioSecondsDelta? }
+POST  /interviews/:id/voice/turns               { turns[], audioSecondsTotal? }
                                                 idempotent on turns[].externalId
 
 POST  /tutor/sessions                           { title?, interviewId? }

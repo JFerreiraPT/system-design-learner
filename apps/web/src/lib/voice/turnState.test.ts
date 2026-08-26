@@ -140,12 +140,50 @@ test("hold silences the mic and swallows stray speech frames", () => {
   assert.equal(applyCommand(stray, { kind: "release" }).state, "listening");
 });
 
-test("holding during the interviewer's turn is a barge-in, not a hold", () => {
+test("holding during the interviewer's turn is a barge-in AND a hold", () => {
   const speaking = run([["response.output_audio_transcript.delta", 0, { item_id: "i" }]]);
-  // Left as interviewerSpeaking so the caller still sees a truncation target.
+
+  // The caller reads the truncation target BEFORE applying the command, which
+  // is what lets the machine enter `held` here without losing the barge-in.
+  assert.deepEqual(truncationTarget(speaking, 1_500), { itemId: "i", audioEndMs: 1_500 });
+
   const held = applyCommand(speaking, { kind: "hold" });
-  assert.equal(held.state, "interviewerSpeaking");
-  assert.ok(truncationTarget(held, 1_500));
+  // Regression: this used to stay `interviewerSpeaking`, so when the reply
+  // finished the UI said "Listening" while the mic track was still disabled —
+  // the candidate talks into a dead mic and nothing tells them.
+  assert.equal(held.state, "held");
+  assert.equal(held.speakingItemId, null);
+  assert.equal(applyCommand(held, { kind: "release" }).state, "listening");
+
+  // And a `response.done` landing mid-hold must NOT flip the pill back to
+  // "Listening": the mic track is still disabled, so saying otherwise invites
+  // the candidate to talk into a dead microphone.
+  const afterDone = reduceTurn(held, { event: { type: "response.done" }, atMs: 2_000 });
+  assert.equal(afterDone.state, "held");
+  assert.equal(applyCommand(afterDone, { kind: "release" }).state, "listening");
+});
+
+test("a hold survives every server event until it is explicitly released", () => {
+  const held = applyCommand(run([["input_audio_buffer.committed", 0]]), { kind: "hold" });
+
+  const noisy = [
+    "input_audio_buffer.speech_started",
+    "input_audio_buffer.speech_stopped",
+    "input_audio_buffer.committed",
+    "response.created",
+    "response.output_audio_transcript.delta",
+    "response.done",
+    "session.updated"
+  ];
+  const after = noisy.reduce(
+    (m, type, i) => reduceTurn(m, { event: { type, item_id: "i" }, atMs: 100 * (i + 1) }),
+    held
+  );
+
+  assert.equal(after.state, "held", "only an explicit release ends a hold");
+  // Bookkeeping still tracked, so a release does not land in a stale state.
+  assert.equal(after.speakingItemId, null);
+  assert.equal(applyCommand(after, { kind: "release" }).state, "listening");
 });
 
 test("closing resets everything", () => {

@@ -278,19 +278,19 @@ test("the post-turn pipeline runs in dependency order for a spoken turn", async 
   assert.deepEqual(ai.calls, ["matchCriteriaDiscovery", "extractConstraintProposals"]);
 });
 
-test("accumulated voice seconds are persisted and clamped to the ceiling", async () => {
+test("voice seconds are an absolute total, clamped to the ceiling", async () => {
   const { voice, db } = makeFixture({ voiceSeconds: 100 }, { env: { VOICE_MAX_SESSION_MINUTES: "2" } });
 
   const first = await voice.recordTurns(
     "interview-1",
     [{ externalId: "i1", role: "user", content: "hello" }],
-    15
+    115
   );
   assert.equal(first.accumulatedSeconds, 115);
   assert.equal(first.ceilingReached, false);
   assert.equal(db.lastWrite(interviews, "voiceSeconds"), 115);
 
-  // Ceiling is 120s; a big delta clamps rather than overshooting, and reports
+  // Ceiling is 120s; a large total clamps rather than overshooting, and reports
   // the ceiling so the client closes the session.
   const second = await voice.recordTurns(
     "interview-1",
@@ -299,6 +299,42 @@ test("accumulated voice seconds are persisted and clamped to the ceiling", async
   );
   assert.equal(second.accumulatedSeconds, 120);
   assert.equal(second.ceilingReached, true);
+});
+
+test("the meter is idempotent: a replayed post does not bill twice", async () => {
+  const { voice } = makeFixture({ voiceSeconds: 0 });
+  const turn = [{ externalId: "i1", role: "user" as const, content: "spoken once" }];
+
+  const first = await voice.recordTurns("interview-1", turn, 12);
+  assert.equal(first.persisted, 1);
+  assert.equal(first.accumulatedSeconds, 12);
+
+  // Same turn, same total — a retry after a response the client never saw.
+  const replay = await voice.recordTurns("interview-1", turn, 12);
+  assert.equal(replay.persisted, 0, "the turn is deduped");
+  assert.equal(replay.duplicates, 1);
+  assert.equal(replay.accumulatedSeconds, 12, "and so is the meter");
+});
+
+test("the meter never runs backwards", async () => {
+  const { voice } = makeFixture({ voiceSeconds: 0 });
+  await voice.recordTurns("interview-1", [{ externalId: "a", role: "user", content: "x" }], 240);
+
+  // A stale tab, a session that lost its baseline, or an understated report:
+  // none of them may buy the candidate more voice time.
+  const stale = await voice.recordTurns(
+    "interview-1",
+    [{ externalId: "b", role: "user", content: "y" }],
+    10
+  );
+  assert.equal(stale.accumulatedSeconds, 240);
+
+  const negative = await voice.recordTurns(
+    "interview-1",
+    [{ externalId: "c", role: "user", content: "z" }],
+    0
+  );
+  assert.equal(negative.accumulatedSeconds, 240);
 });
 
 test("a completed interview refuses posted turns", async () => {

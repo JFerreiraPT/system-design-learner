@@ -96,6 +96,59 @@ type CriteriaProgressView = {
 
 const SCENE_HASH_TTL_SECONDS = 60 * 60 * 4;
 
+/** The candidate-safe view of an interview row.
+ *
+ * `interviews.criteria_json` holds the rubric that this interview is *measuring*
+ * — including every hidden expectation in full text, its `satisfiedBy` answers,
+ * its `discoveryHints`, and its three progressive nudges, plus the playbook's
+ * green and red flags. Handing that to the browser hands the candidate the
+ * answer key: `detectDiscoveries` would be scoring them on expectations they
+ * could read out of the network tab, and the whole visible/hidden split that
+ * `getCriteriaProgress` and `revealCriteria` are so careful about becomes
+ * decoration.
+ *
+ * So no endpoint returns a raw interview row. This is the shape they return
+ * instead — deliberately an allow-list, not a `delete` of the sensitive keys,
+ * because a column added later must not leak by default.
+ *
+ * The rubric reaches the client through exactly three doors, all narrower than
+ * this one: `getCriteriaProgress` (counts, plus hidden texts only once
+ * discovered), `revealCriteria` (everything, gated behind a submitted
+ * validation), and the interviewer's own prompt, which never leaves the server.
+ */
+export type InterviewSummary = {
+  id: string;
+  problemId: string;
+  interviewerLevel: InterviewerLevel;
+  status: string;
+  liveConstraintsJson: LiveConstraint[];
+  pendingProposalsJson: ConstraintProposal[];
+  /** Level the rubric was built for. A label, not rubric content. */
+  criteriaLevel: InterviewerLevel | null;
+  /** Whether a rubric exists at all — the client needs this to decide whether
+   * to offer "generate criteria", and it reveals nothing about their content. */
+  hasCriteria: boolean;
+  voiceSeconds: number;
+  startedAt: unknown;
+  endedAt: unknown;
+};
+
+export function toInterviewSummary(row: Record<string, any>): InterviewSummary {
+  return {
+    id: row.id,
+    problemId: row.problemId,
+    interviewerLevel: row.interviewerLevel,
+    status: row.status ?? "active",
+    liveConstraintsJson: (row.liveConstraintsJson as LiveConstraint[] | null) ?? [],
+    pendingProposalsJson: (row.pendingProposalsJson as ConstraintProposal[] | null) ?? [],
+    criteriaLevel: (row.criteriaLevel as InterviewerLevel | null) ?? null,
+    hasCriteria: getRubricCriteria(row.criteriaJson) !== null,
+    voiceSeconds: Number(row.voiceSeconds ?? 0),
+    startedAt: row.startedAt ?? null,
+    endedAt: row.endedAt ?? null
+  };
+}
+
 @Injectable()
 export class InterviewService {
   constructor(
@@ -162,7 +215,9 @@ export class InterviewService {
       content: welcome
     });
 
-    return session;
+    // Projected, never the raw row — see `toInterviewSummary`. The client only
+    // reads `id` from this anyway.
+    return toInterviewSummary(session);
   }
 
   /** Wrap criteria generation so a transient LLM failure doesn't break
@@ -355,10 +410,10 @@ export class InterviewService {
 
     const after = await this.requireInterview(interviewId);
     return {
-      ...(updated[0] ?? after),
+      ...toInterviewSummary(updated[0] ?? after),
       interviewerLevel,
-      rubricStale: isRubricStale(after.criteriaLevel, interviewerLevel),
-      criteriaLevel: after.criteriaLevel ?? null
+      criteriaLevel: after.criteriaLevel ?? null,
+      rubricStale: isRubricStale(after.criteriaLevel, interviewerLevel)
     };
   }
 
@@ -1040,25 +1095,28 @@ export class InterviewService {
   }
 
   /**
-   * Add to this interview's accumulated voice time, clamped to `maxSeconds`.
+   * Record this interview's total voice time, clamped to `maxSeconds`.
+   *
+   * Takes an absolute running total and stores `max(stored, reported)`, which
+   * makes it idempotent and monotonic in one stroke: a replayed post is a no-op
+   * (so a deduplicated turn is not billed twice), and a client reporting a
+   * smaller number — a stale tab, a fresh session that lost its baseline, or a
+   * deliberately understated one — cannot wind the meter back to buy more time.
    *
    * The ceiling is passed in rather than read here: it is configuration that
    * belongs to the voice module, and this service has no ConfigService. Reading
    * `process.env` directly would work in production and silently ignore test
    * configuration, which is the worst of both.
-   *
-   * Monotonic by construction — a client reporting a negative or absurd delta
-   * cannot wind the meter back and buy itself more time.
    */
   async addVoiceSeconds(
     interviewId: string,
-    deltaSeconds: number,
+    totalSeconds: number,
     maxSeconds: number
   ): Promise<{ accumulatedSeconds: number; ceilingReached: boolean }> {
     const session = await this.requireInterview(interviewId);
     const previous = Number(session.voiceSeconds ?? 0);
-    const delta = Number.isFinite(deltaSeconds) ? Math.max(0, Math.round(deltaSeconds)) : 0;
-    const accumulated = Math.min(previous + delta, maxSeconds);
+    const reported = Number.isFinite(totalSeconds) ? Math.max(0, Math.round(totalSeconds)) : 0;
+    const accumulated = Math.min(Math.max(previous, reported), maxSeconds);
 
     if (accumulated !== previous) {
       await this.db
@@ -1296,8 +1354,15 @@ export class InterviewService {
       .set({ criteriaJson: criteria, criteriaLevel: criteria ? level : null })
       .where(eq(interviews.id, interviewId));
 
+    // Counts, not criteria. The old shape returned the full criteria array —
+    // hidden texts, nudges and all — to a caller that discards it and refetches
+    // `getCriteriaProgress`, which is the endpoint designed to answer this
+    // safely.
+    const generated = criteria?.criteria ?? null;
     return {
-      criteria: criteria?.criteria ?? null,
+      generated: generated !== null,
+      count: generated?.length ?? 0,
+      hiddenCount: generated?.filter((c) => c.visibility === "hidden").length ?? 0,
       criteriaLevel: criteria ? level : null,
       rubricStale: false
     };

@@ -117,6 +117,31 @@ export function resolveVoiceName(read: ConfigReader): string {
   return raw && (VOICE_NAMES as readonly string[]).includes(raw) ? raw : DEFAULT_VOICE_NAME;
 }
 
+/**
+ * Languages the transcriber should expect, as ISO 639-1 codes.
+ *
+ * Not optional in practice. Left unset, `gpt-live-transcribe` auto-detects per
+ * utterance, and on a short or noisy one it guesses — a real session produced
+ * "これ の" from an English speaker and drifted into Spanish mid-sentence for a
+ * Portuguese one. Every such miss is also a criterion `detectDiscoveries` will
+ * fail to match, so the candidate says the right thing and gets no credit.
+ *
+ * Set more than one only if the candidate genuinely code-switches; each extra
+ * language widens the search and makes mis-detection likelier again.
+ */
+export const DEFAULT_VOICE_LANGUAGES = ["en"];
+
+export function resolveVoiceLanguages(read: ConfigReader): string[] {
+  const raw = read("AI_VOICE_LANGUAGES");
+  if (typeof raw !== "string") return DEFAULT_VOICE_LANGUAGES;
+  const codes = raw
+    .split(",")
+    .map((c) => c.trim().toLowerCase())
+    // ISO 639-1/639-3: two or three letters. Anything else is a mis-set value.
+    .filter((c) => /^[a-z]{2,3}$/.test(c));
+  return codes.length > 0 ? [...new Set(codes)].slice(0, 4) : DEFAULT_VOICE_LANGUAGES;
+}
+
 /** Audio sample rate for the input stream, in Hz. Not configurable — the
  * Realtime API's PCM contract is 24kHz and getting it wrong yields audio that
  * transcribes as gibberish rather than an error. */
@@ -124,28 +149,43 @@ export const VOICE_SAMPLE_RATE = 24000;
 
 export type VoiceTurnDetectionConfig =
   | { type: "semantic_vad"; eagerness: "low" | "medium" | "high" | "auto" }
-  | { type: "server_vad"; silence_duration_ms: number };
+  | { type: "server_vad"; threshold: number; silence_duration_ms: number };
 
-/** Why the defaults are what they are:
+/**
+ * Why the defaults are what they are.
  *
- * A candidate says "so I'd put a queue here…", spends eight seconds drawing the
- * queue and thinking about backpressure, then finishes "…and the consumers are
- * idempotent because retries." That is ONE turn. The API's own default of 500ms
- * cuts it in two, the interviewer answers the first half, and the candidate is
- * now defending a design they had not finished describing.
+ * The design tension: a candidate says "so I'd put a queue here…", spends eight
+ * seconds drawing it, then finishes "…and the consumers are idempotent." That is
+ * ONE turn, and the API's own 500ms silence default cuts it in two.
  *
- * `semantic_vad` scores how finished the speech *sounds* and waits longer when
- * it trails off; `eagerness: "low"` stretches that wait further. `server_vad`
- * cannot do this at all, so when it is selected the threshold is a deliberately
- * generous 2500ms rather than the API default.
+ * The first cut of this shipped `eagerness: "low"` to protect that pause, on the
+ * reasoning that being interrupted mid-design is worse than a slow reply. Real
+ * use said otherwise, and showed the two symptoms share a root cause: `low`
+ * stretches the maximum wait, so a non-speech noise — a chair scrape — opens a
+ * turn and then the session sits in it for seconds before replying. The
+ * candidate gets BOTH a false "you're speaking" and a sluggish interviewer.
+ *
+ * So `medium` is the default: still model-scored, so a genuine trailing-off
+ * still buys extra time, but without the padded ceiling. `low` remains one env
+ * var away for someone who really does think in long silences.
+ *
+ * `server_vad` is the escape hatch, and it is the only mode with a loudness
+ * `threshold` — which is the right tool if room noise, rather than pacing, is
+ * the problem.
  */
-export const VOICE_DEFAULT_EAGERNESS = "low" as const;
-export const VOICE_DEFAULT_SILENCE_MS = 2500;
+export const VOICE_DEFAULT_EAGERNESS = "medium" as const;
+export const VOICE_DEFAULT_SILENCE_MS = 1500;
+/** Above the API's 0.5 default: a chair scrape should not open a turn. */
+export const VOICE_DEFAULT_THRESHOLD = 0.65;
 
 export function resolveVoiceTurnDetection(read: ConfigReader): VoiceTurnDetectionConfig {
   const mode = usableModelId(read("VOICE_TURN_DETECTION"))?.toLowerCase();
   if (mode === "server_vad") {
-    return { type: "server_vad", silence_duration_ms: readPositiveInt(read, "VOICE_SILENCE_MS", VOICE_DEFAULT_SILENCE_MS) };
+    return {
+      type: "server_vad",
+      threshold: readUnitFraction(read, "VOICE_VAD_THRESHOLD", VOICE_DEFAULT_THRESHOLD),
+      silence_duration_ms: readPositiveInt(read, "VOICE_SILENCE_MS", VOICE_DEFAULT_SILENCE_MS)
+    };
   }
   const eagerness = usableModelId(read("VOICE_VAD_EAGERNESS"))?.toLowerCase();
   return {
@@ -155,6 +195,16 @@ export function resolveVoiceTurnDetection(read: ConfigReader): VoiceTurnDetectio
         ? eagerness
         : VOICE_DEFAULT_EAGERNESS
   };
+}
+
+/** A 0..1 knob. Anything outside that range is a mis-set variable, not a
+ * threshold — and a threshold of 0 would treat silence as speech. */
+function readUnitFraction(read: ConfigReader, key: string, fallback: number): number {
+  const raw = usableModelId(read(key));
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed >= 1) return fallback;
+  return parsed;
 }
 
 /** Session ceilings. A voice session bills for as long as a socket is open, so

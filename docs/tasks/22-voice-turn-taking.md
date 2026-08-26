@@ -3,8 +3,15 @@
 **Area:** Voice · **Priority:** P1 · **Size:** M · **Depends on:** 20
 **Labels:** `agent-ready`, `voice`, `web`
 
-> **Status: DONE.** `semantic_vad` / `eagerness: "low"` by default, `server_vad` at 2500ms
-> as an escape hatch. `turnState.ts` is a pure reducer with 13 tests; the load-bearing one
+> **Status: DONE, then corrected by real use.** `semantic_vad` /
+> `eagerness: "medium"` by default. This spec argued for `"low"`, and `"low"`
+> shipped first and was wrong: it pads the *maximum* wait, so a chair scrape
+> opened a turn and the session then sat in it for seconds — the candidate got a
+> false "you're speaking" AND a sluggish interviewer, which is both failure modes
+> at once. `server_vad` now also exposes a loudness `threshold` (default 0.65,
+> above the API's 0.5), because it is the only mode that can reject room noise.
+> Original text below kept as the reasoning that led there. `server_vad` at 1500ms `server_vad` at 2500ms
+> as an escape hatch. `turnState.ts` is a pure reducer with 14 tests; the load-bearing one
 > feeds `speech_started → speech_stopped → speech_started → committed` and asserts it yields
 > ONE turn that never flickers to `thinking`. Barge-in sends `conversation.item.truncate`
 > with real elapsed playback, derived from wall-clock because over WebRTC the audio never
