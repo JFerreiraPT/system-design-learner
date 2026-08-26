@@ -4,10 +4,13 @@ import {
   DEFAULT_VOICE_NAME,
   resolveVoiceLimits,
   resolveVoiceLanguages,
+  resolveVoiceMaxResponseTokens,
   resolveVoiceName,
+  resolveVoiceReasoningEffort,
   resolveVoiceTurnDetection,
   VOICE_DEFAULT_IDLE_TIMEOUT_SECONDS,
   VOICE_DEFAULT_MAX_SESSION_MINUTES,
+  VOICE_DEFAULT_MAX_RESPONSE_TOKENS,
   VOICE_DEFAULT_SILENCE_MS,
   VOICE_DEFAULT_THRESHOLD,
   VOICE_SAMPLE_RATE
@@ -23,7 +26,9 @@ function config(overrides: Partial<Parameters<typeof buildRealtimeSessionConfig>
     voice: "marin",
     sampleRate: VOICE_SAMPLE_RATE,
     instructions: "INSTRUCTIONS",
-    turnDetection: { type: "semantic_vad", eagerness: "low" },
+    turnDetection: { type: "semantic_vad", eagerness: "medium" },
+    maxResponseTokens: 400,
+    reasoningEffort: "low",
     ...overrides
   });
 }
@@ -59,6 +64,36 @@ test("server_vad carries a wider silence window and a noise gate", () => {
   assert.notEqual(td.silence_duration_ms, 500);
   // And above 0.5, so a chair scrape does not open a turn.
   assert.equal(td.threshold, 0.65);
+});
+
+test("a reply is capped and reasoning is kept cheap", () => {
+  const c = config();
+  // A backstop only: it truncates rather than shortens, so the prompt carries
+  // the real three-sentence budget.
+  assert.equal(c.max_output_tokens, 400);
+  // Reasoning runs before the first audio frame, so effort is silence the
+  // candidate sits through.
+  assert.deepEqual(c.reasoning, { effort: "low" });
+});
+
+test("response cap and reasoning effort fall back on nonsense", () => {
+  assert.equal(resolveVoiceMaxResponseTokens(reader({})), VOICE_DEFAULT_MAX_RESPONSE_TOKENS);
+  assert.equal(resolveVoiceMaxResponseTokens(reader({ VOICE_MAX_RESPONSE_TOKENS: "800" })), 800);
+  // Clamped into the API's own 1..4096 window, and away from values so small
+  // they would clip every reply mid-word.
+  assert.equal(resolveVoiceMaxResponseTokens(reader({ VOICE_MAX_RESPONSE_TOKENS: "9999" })), 4096);
+  assert.equal(resolveVoiceMaxResponseTokens(reader({ VOICE_MAX_RESPONSE_TOKENS: "5" })), 64);
+  for (const bad of ["", "lots", "-10", "1.5"]) {
+    assert.equal(
+      resolveVoiceMaxResponseTokens(reader({ VOICE_MAX_RESPONSE_TOKENS: bad })),
+      VOICE_DEFAULT_MAX_RESPONSE_TOKENS,
+      bad
+    );
+  }
+
+  assert.equal(resolveVoiceReasoningEffort(reader({})), "low");
+  assert.equal(resolveVoiceReasoningEffort(reader({ VOICE_REASONING_EFFORT: "high" })), "high");
+  assert.equal(resolveVoiceReasoningEffort(reader({ VOICE_REASONING_EFFORT: "turbo" })), "low");
 });
 
 test("instructions live in the session config, which is exactly why it stays server-side", () => {

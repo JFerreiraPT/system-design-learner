@@ -45,7 +45,9 @@ import {
 import {
   resolveAiModels,
   resolveVoiceLanguages,
+  resolveVoiceMaxResponseTokens,
   resolveVoiceName,
+  resolveVoiceReasoningEffort,
   VOICE_SAMPLE_RATE,
   type AiModels,
   type VoiceTurnDetectionConfig
@@ -1422,7 +1424,9 @@ ${input.statement}`
       instructions: input.instructions,
       turnDetection: input.turnDetection,
       keywords: input.keywords,
-      languages: resolveVoiceLanguages(read)
+      languages: resolveVoiceLanguages(read),
+      maxResponseTokens: resolveVoiceMaxResponseTokens(read),
+      reasoningEffort: resolveVoiceReasoningEffort(read)
     });
 
     const response = await fetch(REALTIME_CLIENT_SECRETS_URL, {

@@ -1305,6 +1305,42 @@ export function formatPhaseTimelineBlock(timeline?: PhaseTimeline): string {
  * latency asterisk asterisk tilde two hundred m s p ninety-nine". */
 export type InterviewerModality = "text" | "voice";
 
+/** The chat-panel answering contract, extracted verbatim.
+ *
+ * Note what it asks for: a four-part answer shape ("direct answer → v1
+ * decision → impact on the design → follow-up"), being "informative", and an
+ * "actionable checklist" for next-step questions. All correct for a teaching
+ * surface the candidate can re-read at leisure. All wrong out loud.
+ *
+ * Appending voice delivery rules AFTER this block did not fix it: the model
+ * dutifully obeyed both and produced a lecture that also told the candidate
+ * which questions they should be asking. Voice REPLACES this block. */
+const TEXT_ANSWERING_RULES = `Answering rule (applies to every level):
+- Default to ANSWERING clarifying questions with a concrete decision or a concrete number/range, not with another question.
+- You may turn a question back to the candidate ONLY when it is a genuine design judgement call that they should own — and only if you say so explicitly ("that's a judgement call I want you to make, then justify it"). Never bounce a question silently or with another question.
+- For product/scope questions, use this answer shape: direct answer → v1 decision/assumption → impact on the design or board → at most one follow-up question. Keep it concise, but be informative.
+- For "what do I need / what should I do next" questions, give a short actionable checklist tied to the current phase and UI (e.g. clarify users/features, fill estimation numbers, draw client/API/database and core flows). Do not answer with product features only.
+- One answer + at most one follow-up question per turn. Don't stack multiple open questions back at the candidate.
+- If the candidate hasn't asked anything, drive forward: comment on what they've drawn or said, then ask the next probing question aligned with the current phase.`;
+
+/** The spoken answering contract.
+ *
+ * A real interviewer is terse. They give you the number and wait. They do not
+ * restate your answer, do not narrate their reasoning, and above all do not
+ * hand you the list of questions you ought to be asking them — that is running
+ * the interview on the candidate's behalf, and it was the single thing that made
+ * the spoken version feel least like an interview. */
+const VOICE_ANSWERING_RULES = `Answering rule — this is a LIVE SPOKEN INTERVIEW and you are terse:
+- Answer a clarifying question with the decision or the number, in ONE sentence. "Assume ten million new links a day." Not a paragraph explaining why.
+- Then either stop, or ask ONE question. Never both explain at length and probe.
+- NEVER give the candidate a checklist, a plan, or a list of the questions they ought to be asking you. A real interviewer does not run the interview on the candidate's behalf. If they ask "what should I do next", name the single next thing in one sentence and stop — "start with scope: who uses this, and what do they do with it?"
+- Do not recap what the candidate just said. Acknowledge in three or four words, then move.
+- Do not explain your reasoning unless they ask for it. "Use a cache in front of the database." Not "use a cache in front of the database, because with a read/write ratio like that…".
+- Hard budget: at most THREE sentences per turn, and most turns should be one or two. If you need more than three you are lecturing — ask a question instead.
+- You may turn a question back ONLY when it is a genuine judgement call they should own, and say so plainly: "that one's yours to decide — tell me why."
+- If the candidate has not asked anything, react to what they said or drew in a few words, then ask the next probing question. Do not fill the gap with commentary.
+- After you ask something, STOP. Do not add "take your time", "let me know if that's unclear", or the same question again in other words.`;
+
 /** The chat-panel formatting contract. Extracted verbatim from the prompt body
  * so `voice` can swap it out without forking the whole prompt. */
 const TEXT_FORMATTING_RULES = `Formatting rule:
@@ -1440,13 +1476,7 @@ export const buildInterviewerPrompt = (
 1. The **product owner / hiring manager** who owns the spec. When the candidate asks clarifying questions about scope, users, features, scale, latency, consistency, or any product behavior, you have the answer and you give it. Pick a reasonable v1 grounded in the problem statement, constraints, and difficulty, and state it as a decision.
 2. The **interviewer** who probes the candidate's design.
 
-Answering rule (applies to every level):
-- Default to ANSWERING clarifying questions with a concrete decision or a concrete number/range, not with another question.
-- You may turn a question back to the candidate ONLY when it is a genuine design judgement call that they should own — and only if you say so explicitly ("that's a judgement call I want you to make, then justify it"). Never bounce a question silently or with another question.
-- For product/scope questions, use this answer shape: direct answer → v1 decision/assumption → impact on the design or board → at most one follow-up question. Keep it concise, but be informative.
-- For "what do I need / what should I do next" questions, give a short actionable checklist tied to the current phase and UI (e.g. clarify users/features, fill estimation numbers, draw client/API/database and core flows). Do not answer with product features only.
-- One answer + at most one follow-up question per turn. Don't stack multiple open questions back at the candidate.
-- If the candidate hasn't asked anything, drive forward: comment on what they've drawn or said, then ask the next probing question aligned with the current phase.
+${spoken ? VOICE_ANSWERING_RULES : TEXT_ANSWERING_RULES}
 
 Scope is LIVE (not the original problem statement):
 - The "Current scope (live constraints…)" block in the workspace context is the single source of truth for what the candidate is being asked to build.

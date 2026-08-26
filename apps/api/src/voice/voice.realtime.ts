@@ -53,6 +53,12 @@ export type RealtimeSessionConfig = {
   type: "realtime";
   model: string;
   instructions: string;
+  /** Backstop against a monologue. Truncates rather than shortens, so the
+   * prompt carries the real brevity requirement. */
+  max_output_tokens: number;
+  /** Reasoning happens before the first audio frame, so effort is latency the
+   * candidate hears as silence. */
+  reasoning: { effort: string };
   audio: {
     input: {
       format: { type: "audio/pcm"; rate: number };
@@ -75,11 +81,15 @@ export function buildRealtimeSessionConfig(input: {
   turnDetection: VoiceTurnDetectionConfig;
   keywords?: string[];
   languages?: string[];
+  maxResponseTokens: number;
+  reasoningEffort: string;
 }): RealtimeSessionConfig {
   return {
     type: "realtime",
     model: input.model,
     instructions: input.instructions,
+    max_output_tokens: input.maxResponseTokens,
+    reasoning: { effort: input.reasoningEffort },
     audio: {
       input: {
         format: { type: "audio/pcm", rate: input.sampleRate },

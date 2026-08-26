@@ -207,6 +207,46 @@ function readUnitFraction(read: ConfigReader, key: string, fallback: number): nu
   return parsed;
 }
 
+/**
+ * Hard ceiling on one spoken reply, in output tokens (audio included).
+ *
+ * A backstop, not the mechanism: the prompt does the real work of keeping turns
+ * short, because a token cap does not shorten a reply — it TRUNCATES it, and
+ * being cut off mid-sentence is worse than being verbose. This exists to catch
+ * the genuine monologue.
+ *
+ * Audio runs ~20 output tokens/second, so 400 is roughly twenty seconds of
+ * speech — comfortably past the three-sentence budget the prompt asks for, and
+ * well short of a lecture. Raise it if replies get clipped mid-word.
+ */
+export const VOICE_DEFAULT_MAX_RESPONSE_TOKENS = 400;
+
+export function resolveVoiceMaxResponseTokens(read: ConfigReader): number {
+  const value = readPositiveInt(
+    read,
+    "VOICE_MAX_RESPONSE_TOKENS",
+    VOICE_DEFAULT_MAX_RESPONSE_TOKENS
+  );
+  // The API accepts 1..4096; anything outside that would be rejected at mint.
+  return Math.min(4096, Math.max(64, value));
+}
+
+/**
+ * How hard the model thinks before speaking.
+ *
+ * `low` on purpose. Reasoning happens before the first audio frame, so every
+ * step of effort is silence the candidate sits through — and the interviewer's
+ * judgement is carried by the rubric and playbook in the prompt, not by
+ * deliberation at turn time. Raise it only if the questions get shallow.
+ */
+export const VOICE_DEFAULT_REASONING_EFFORT = "low" as const;
+const REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"];
+
+export function resolveVoiceReasoningEffort(read: ConfigReader): string {
+  const raw = usableModelId(read("VOICE_REASONING_EFFORT"))?.toLowerCase();
+  return raw && REASONING_EFFORTS.includes(raw) ? raw : VOICE_DEFAULT_REASONING_EFFORT;
+}
+
 /** Session ceilings. A voice session bills for as long as a socket is open, so
  * unlike every other AI call in this codebase it is bounded by nothing unless we
  * bound it. A tab left open over lunch keeps the mic hot and keeps charging. */

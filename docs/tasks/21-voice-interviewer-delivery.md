@@ -3,7 +3,18 @@
 **Area:** Voice · **Priority:** P1 · **Size:** S · **Depends on:** —
 **Labels:** `agent-ready`, `voice`, `prompts`
 
-> **Status: DONE.** `buildInterviewerPrompt(level, scope, { modality })`. Text output is
+> **Status: DONE, then sharpened by real use.** First cut only *appended* voice
+> delivery rules, which was not enough: the text block it sat under asks for a
+> four-part answer shape, to be "informative", and for "a short actionable
+> checklist" on next-step questions. The model obeyed both and lectured — worse,
+> it handed the candidate the list of questions they should be asking it, which
+> is running the interview on their behalf. Voice now **replaces** that block
+> (`VOICE_ANSWERING_RULES`): one-sentence answers, a hard three-sentence budget,
+> no checklists, no recaps, no unrequested reasoning. Backstopped by
+> `max_output_tokens` (400) and `reasoning.effort: low` on the session — the
+> latter also cuts the silence before the first word.
+>
+> `buildInterviewerPrompt(level, scope, { modality })`. Text output is
 > **byte-identical** to before — asserted across every level × scope combination, including
 > an explicit `{ modality: "text" }` and an omitted options object. `VOICE_DELIVERY_RULES`
 > replaces the chat-panel formatting contract rather than supplementing it, since a prompt

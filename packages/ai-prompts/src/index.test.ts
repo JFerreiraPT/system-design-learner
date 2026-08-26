@@ -1006,3 +1006,35 @@ test("voice phrases the phase-transition offer as one spoken sentence", () => {
     /one short spoken sentence/
   );
 });
+
+test("voice answers tersely and never hands the candidate a checklist", () => {
+  const text = buildInterviewerPrompt("standard", { criteria });
+  const voice = buildInterviewerPrompt("standard", { criteria }, { modality: "voice" });
+
+  // The chat-panel contract asks for a four-part answer shape and an
+  // "actionable checklist". Spoken, that produced an interviewer that lectured
+  // and told the candidate which questions to ask it.
+  assert.match(text, /short actionable checklist/);
+  assert.match(text, /Keep it concise, but be informative/);
+  assert.doesNotMatch(voice, /actionable checklist/);
+  assert.doesNotMatch(voice, /Keep it concise, but be informative/);
+
+  // Voice replaces the block rather than supplementing it — carrying both is
+  // what made the model obey both.
+  assert.doesNotMatch(voice, /Answering rule \(applies to every level\)/);
+  assert.match(voice, /LIVE SPOKEN INTERVIEW and you are terse/);
+  assert.match(voice, /at most THREE sentences per turn/);
+  assert.match(voice, /does not run the interview on the candidate's behalf/);
+  assert.match(voice, /Do not recap what the candidate just said/);
+  assert.match(voice, /Do not explain your reasoning unless they ask/);
+});
+
+test("voice keeps the parts of the answering contract that still matter", () => {
+  const voice = buildInterviewerPrompt("standard", { criteria }, { modality: "voice" });
+  // Still answers rather than bouncing questions back — that rule was never the
+  // verbosity problem, and dropping it would make the interviewer evasive.
+  assert.match(voice, /genuine judgement call they should own/);
+  assert.match(voice, /ask the next probing question/);
+  // And the product-owner/interviewer dual role is untouched.
+  assert.match(voice, /product owner \/ hiring manager/);
+});
