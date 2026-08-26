@@ -72,8 +72,21 @@ export type VoiceSessionView = {
 
 type Options = {
   interviewId: string;
-  /** Current workspace state, read on every tick. */
+  /** Current workspace state, read on every tick, for the live delta feed. */
   snapshot: () => ContextSnapshot;
+  /**
+   * The full workspace context to seed the session with, in the shape the
+   * server's `workspaceContextSchema` accepts.
+   *
+   * This is NOT the same thing as `snapshot()`. The delta feed only needs to
+   * know what changed; the mint has to hand the interviewer everything the text
+   * path attaches to every message — the board, the candidate's estimation
+   * numbers, the estimation checklist, the phase. Passing the delta shape here
+   * was a real bug: zod strips unknown keys, so `scene` and `phaseLabel` were
+   * silently dropped and the voice interviewer ran blind, unable to challenge an
+   * estimate it had never seen.
+   */
+  buildMintContext?: () => Promise<Record<string, unknown>> | Record<string, unknown>;
   /** Phase snapshot to attach to persisted turns, matching the text path. */
   phase?: () => unknown;
   /** Called after turns are persisted, so the workspace can refetch. */
@@ -395,7 +408,10 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
 
     let mint: Awaited<ReturnType<typeof createVoiceSession>>;
     try {
-      mint = await createVoiceSession(interviewId, optionsRef.current.snapshot() as never);
+      const mintContext = optionsRef.current.buildMintContext
+        ? await optionsRef.current.buildMintContext()
+        : undefined;
+      mint = await createVoiceSession(interviewId, mintContext);
     } catch (err) {
       // Voice never blocks the interview: fail loudly here and leave text alone.
       setError(mintMessage(err));

@@ -154,3 +154,67 @@ test("seeding the baseline stops the mint's own context being re-sent as news", 
   assert.match(String(after), /drew Queue/);
   assert.ok(!String(after).includes("Up to 500 tenants"));
 });
+
+// --- estimation ------------------------------------------------------------
+
+test("a number typed mid-interview reaches the interviewer, urgently", () => {
+  const delta = diffContext(
+    { ...base, estimation: {} },
+    { ...base, estimation: { writesPerSec: "12000", storagePerYear: "4 TB" } }
+  );
+
+  assert.ok(delta);
+  // Named fields with their values, so the interviewer can quote the figure
+  // back rather than being told "the estimation changed".
+  assert.match(delta.text, /writesPerSec = 12000/);
+  assert.match(delta.text, /storagePerYear = 4 TB/);
+  // Committing a number is a candidate decision worth interrupting for — it is
+  // the moment a calibration challenge is useful.
+  assert.equal(delta.urgent, true);
+});
+
+test("only changed estimation fields are reported", () => {
+  const delta = diffContext(
+    { ...base, estimation: { writesPerSec: "12000", readsPerSec: "1M" } },
+    { ...base, estimation: { writesPerSec: "12000", readsPerSec: "2M" } }
+  );
+  assert.match(delta!.text, /readsPerSec = 2M/);
+  assert.ok(!delta!.text.includes("writesPerSec"), "an unchanged field is not news");
+});
+
+test("blank and cleared estimation fields are not reported as figures", () => {
+  assert.equal(
+    diffContext({ ...base, estimation: {} }, { ...base, estimation: { a: "", b: null, c: undefined } }),
+    null
+  );
+});
+
+test("an unchanged estimation produces nothing", () => {
+  const estimation = { writesPerSec: "12000", derived: { qps: 3 } };
+  assert.equal(
+    diffContext({ ...base, estimation }, { ...base, estimation: { ...estimation } }),
+    null,
+    "a structurally equal value is not a change"
+  );
+});
+
+test("a nested derived block is named rather than dumped", () => {
+  const delta = diffContext({ ...base, estimation: {} }, { ...base, estimation: { derived: { qps: 3 } } });
+  assert.match(delta!.text, /derived = \(set\)/);
+  assert.ok(!delta!.text.includes("qps"), "the interviewer does not read JSON aloud");
+});
+
+test("the estimation baseline is seeded, so the mint's numbers are not re-announced", () => {
+  const feed = new ContextFeed();
+  const opening = { constraints: [], estimation: { writesPerSec: "12000" } };
+  feed.seed(opening);
+  assert.equal(feed.offer(opening, "listening", 50_000), null);
+
+  const after = feed.offer(
+    { constraints: [], estimation: { writesPerSec: "12000", readsPerSec: "2M" } },
+    "listening",
+    60_000
+  );
+  assert.match(String(after), /readsPerSec = 2M/);
+  assert.ok(!String(after).includes("writesPerSec"));
+});

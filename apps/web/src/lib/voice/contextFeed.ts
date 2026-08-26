@@ -33,6 +33,10 @@ export type ContextSnapshot = {
    * text path already enforces server-side. */
   constraints: string[];
   phaseLabel?: string;
+  /** The candidate's estimation figures, keyed by field. Changes here are
+   * exactly the moment the interviewer should push back on a number, so they
+   * must not wait for the next mint. */
+  estimation?: Record<string, unknown>;
 };
 
 export type ContextDelta = { text: string; urgent: boolean };
@@ -67,6 +71,13 @@ export function diffContext(previous: ContextSnapshot, next: ContextSnapshot): C
   if (addedConstraints.length > 0) parts.push(`scope now includes ${list(addedConstraints)}`);
   if (removedConstraints.length > 0) parts.push(`scope no longer includes ${list(removedConstraints)}`);
 
+  // Estimation is reported as named field changes, not as a JSON blob: the
+  // interviewer has to say the number out loud to challenge it.
+  const estimationChanges = diffEstimation(previous.estimation, next.estimation);
+  if (estimationChanges.length > 0) {
+    parts.push(`filled in ${list(estimationChanges)}`);
+  }
+
   const phaseChanged = Boolean(next.phaseLabel) && next.phaseLabel !== previous.phaseLabel;
   if (phaseChanged) parts.push(`now in the ${next.phaseLabel} phase`);
 
@@ -76,8 +87,9 @@ export function diffContext(previous: ContextSnapshot, next: ContextSnapshot): C
     // The prefix is what keeps these out of the transcript and out of the
     // debrief — see `TurnBuffer.drain`.
     text: `${VOICE_CONTEXT_ITEM_PREFIX} Since you last looked, the candidate ${parts.join("; ")}. Do not read this out or thank them for it; just take it into account.`,
-    // Scope and phase are candidate-initiated decisions, not drawing noise.
-    urgent: scopeChanged || phaseChanged
+    // Scope, phase and a committed number are candidate-initiated decisions,
+    // not drawing noise.
+    urgent: scopeChanged || phaseChanged || estimationChanges.length > 0
   };
 }
 
@@ -150,6 +162,32 @@ function edgeLabels(scene?: SceneSummary): string[] {
   });
 }
 
+/** Field-level estimation diff, rendered as "label = value" so the interviewer
+ * can quote the figure back. Only changed and newly-filled fields appear. */
+function diffEstimation(
+  previous: Record<string, unknown> | undefined,
+  next: Record<string, unknown> | undefined
+): string[] {
+  if (!next) return [];
+  const out: string[] = [];
+  for (const [key, value] of Object.entries(next)) {
+    if (value === null || value === undefined || value === "") continue;
+    const before = previous?.[key];
+    if (before === value) continue;
+    if (JSON.stringify(before) === JSON.stringify(value)) continue;
+    out.push(`${key} = ${formatValue(value)}`);
+  }
+  return out;
+}
+
+function formatValue(value: unknown): string {
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  // A nested object is a derived block; naming it is more useful than dumping it.
+  return "(set)";
+}
+
 function difference(a: string[], b: string[]): string[] {
   const seen = new Set(b);
   const out: string[] = [];
@@ -182,6 +220,7 @@ function cloneSnapshot(snapshot: ContextSnapshot): ContextSnapshot {
         }
       : undefined,
     constraints: [...snapshot.constraints],
-    phaseLabel: snapshot.phaseLabel
+    phaseLabel: snapshot.phaseLabel,
+    estimation: snapshot.estimation ? { ...snapshot.estimation } : undefined
   };
 }

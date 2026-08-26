@@ -3,7 +3,17 @@
 **Area:** Voice · **Priority:** P2 · **Size:** M · **Depends on:** 20
 **Labels:** `agent-ready`, `voice`, `web`, `api`
 
-> **Status: DONE.** `contextFeed.ts` diffs against the last *sent* snapshot and injects a
+> **Status: DONE, plus a gap found in real use.** The delta feed was built as
+> specified, but the *mint* was being handed the feed's own snapshot shape
+> (`{ scene, constraints, phaseLabel }`) — whose unknown keys `workspaceContextSchema`
+> strips — so a voice session opened with no board, no estimation, no checklist
+> and no phase, and the spoken interviewer could not challenge a number it had
+> never seen. The mint now sends the full workspace context (minus the
+> screenshot: realtime reads the board as text), and estimation changes are
+> pushed mid-session as named `field = value` deltas. Both are asserted with
+> sentinel strings.
+>
+> `contextFeed.ts` diffs against the last *sent* snapshot and injects a
 > `system` item over the data channel, prefixed with `VOICE_CONTEXT_ITEM_PREFIX` so
 > `TurnBuffer.drain` filters it out of the transcript, the debrief and `interview_messages`
 > in one place. Fifty rapid scene mutations are asserted to produce exactly one injection;

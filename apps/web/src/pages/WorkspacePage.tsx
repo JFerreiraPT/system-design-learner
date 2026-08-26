@@ -644,11 +644,14 @@ export function WorkspacePage() {
   const liveConstraintTexts =
     constraintsQuery.data?.constraints.filter((c) => c.status === "active").map((c) => c.text) ?? [];
 
-  const buildWorkspaceContext = async () => {
+  const buildWorkspaceContext = async (options?: { includeImage?: boolean }) => {
     // Capture the screenshot lazily, only when actually sending. Skipped when
-    // the board is empty so we don't waste a multimodal slot.
+    // the board is empty so we don't waste a multimodal slot — and skipped
+    // entirely for a voice session, which has no multimodal slot to waste: the
+    // realtime model reads the board as text.
+    const includeImage = options?.includeImage !== false;
     const imageBase64 =
-      !sceneIsEmpty && captureSceneImage ? await captureSceneImage() : undefined;
+      includeImage && !sceneIsEmpty && captureSceneImage ? await captureSceneImage() : undefined;
     // Prefer the live (active) constraint set when an interview is active so
     // the tutor sees the same scope the interviewer is working against. The
     // interviewer endpoint will also override server-side as the source of truth.
@@ -1011,6 +1014,14 @@ export function WorkspacePage() {
                       scene={sceneSummary}
                       constraints={liveConstraintTexts}
                       phaseLabel={currentPhaseDef.label}
+                      estimation={estimationPayload}
+                      // The mint needs everything the text path attaches to a
+                      // message — board, estimation, checklist, phase — or the
+                      // spoken interviewer cannot challenge a number it has
+                      // never seen. No screenshot: realtime reads text only.
+                      buildMintContext={async () =>
+                        (await buildWorkspaceContext({ includeImage: false })).workspaceContext
+                      }
                       initialMessages={(interviewMessagesQuery.data ?? [])
                         .filter((m): m is ChatMessage & { role: "user" | "assistant" } =>
                           isChatRole(m.role)

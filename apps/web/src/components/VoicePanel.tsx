@@ -31,6 +31,12 @@ type Props = {
   scene?: SceneSummary;
   constraints: string[];
   phaseLabel?: string;
+  /** Candidate estimation figures. Changes are pushed into a live session, so a
+   * number typed mid-interview can actually be challenged. */
+  estimation?: Record<string, unknown>;
+  /** Full workspace context for the session mint — see `buildMintContext` on
+   * the hook for why this is separate from the delta snapshot. */
+  buildMintContext: () => Promise<Record<string, unknown>>;
   /** Called after spoken turns are persisted, so the page can refetch history,
    * constraints, criteria and the phase proposal — the same post-turn refresh
    * the text path performs. */
@@ -48,6 +54,8 @@ export function VoicePanel({
   scene,
   constraints,
   phaseLabel,
+  estimation,
+  buildMintContext,
   onVoiceTurnsPersisted
 }: Props) {
   const [mode, setMode] = useState<"text" | "voice">("text");
@@ -55,12 +63,17 @@ export function VoicePanel({
   // The hook polls this on a timer; a ref keeps it current without making the
   // whole session depend on a new callback identity every render.
   const snapshotRef = useRef<ContextSnapshot>({ constraints });
-  snapshotRef.current = { scene, constraints, phaseLabel };
+  snapshotRef.current = { scene, constraints, phaseLabel, estimation };
   const snapshot = useCallback(() => snapshotRef.current, []);
+
+  // Same trick for the mint builder: the page rebuilds it every render.
+  const mintRef = useRef(buildMintContext);
+  mintRef.current = buildMintContext;
 
   const session = useRealtimeVoice({
     interviewId,
     snapshot,
+    buildMintContext: useCallback(() => mintRef.current(), []),
     onTurnsPersisted: onVoiceTurnsPersisted,
     onClosed: onVoiceTurnsPersisted
   });

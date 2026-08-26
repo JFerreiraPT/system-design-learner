@@ -186,6 +186,59 @@ test("a resumed interview does not reintroduce itself", async () => {
   assert.ok(!ai.lastInstructions?.includes("OPEN THE INTERVIEW"));
 });
 
+test("the spoken interviewer sees everything the typed one sees", async () => {
+  const { voice, ai } = makeFixture();
+
+  // Exactly what the text path attaches to every message.
+  await voice.createSession("interview-1", {
+    problemTitle: "Multi-tenant audit log",
+    sceneSummary: {
+      nodes: [{ id: "n1", label: "SENTINEL_QUEUE_ON_BOARD" }],
+      edges: [],
+      summaryText: "2 components, 1 connection"
+    },
+    notes: "SENTINEL_CANDIDATE_NOTE",
+    phase: {
+      id: "estimate",
+      label: "SENTINEL_PHASE_LABEL",
+      index: 1,
+      total: 4,
+      elapsedSec: 120,
+      durationSec: 300,
+      running: true
+    },
+    estimation: { writesPerSec: "SENTINEL_ESTIMATE_VALUE" },
+    estimationChecklist: {
+      intro: "Work these out",
+      fields: [{ key: "writesPerSec", label: "SENTINEL_CHECKLIST_FIELD" }]
+    }
+  } as never);
+
+  const instructions = ai.lastInstructions ?? "";
+
+  // The regression this test exists for: the mint used to be handed the delta
+  // snapshot ({ scene, constraints, phaseLabel }), whose unknown keys zod
+  // strips — so the spoken interviewer ran blind and could not challenge an
+  // estimate it had never seen.
+  for (const sentinel of [
+    "SENTINEL_QUEUE_ON_BOARD",
+    "SENTINEL_CANDIDATE_NOTE",
+    "SENTINEL_PHASE_LABEL",
+    "SENTINEL_ESTIMATE_VALUE",
+    "SENTINEL_CHECKLIST_FIELD"
+  ]) {
+    assert.ok(instructions.includes(sentinel), `${sentinel} never reached the voice prompt`);
+  }
+});
+
+test("an unparseable workspace context does not sink the session", async () => {
+  // zod strips what it does not recognise; the mint must still succeed with
+  // whatever survives, because voice must never block the interview.
+  const { voice, ai } = makeFixture();
+  await voice.createSession("interview-1", { garbage: true, phase: "not-a-phase" } as never);
+  assert.ok((ai.lastInstructions ?? "").includes("SERVER_SIDE_CONSTRAINT"));
+});
+
 // --- guards ---------------------------------------------------------------
 
 test("a completed interview refuses a voice session", async () => {
