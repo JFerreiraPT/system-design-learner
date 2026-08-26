@@ -1,4 +1,4 @@
-# Improvement tasks — exercises, estimation, flow, evaluation
+# Improvement tasks — exercises, estimation, flow, evaluation, voice
 
 Each file in this folder is a self-contained task spec, written so the body can be
 pasted **verbatim** into a GitHub issue for the autonomous runner
@@ -81,12 +81,52 @@ score. Several tasks below are pure harvest of data we already pay to produce.
 | [18](18-flow-tutor-usage-visibility.md) ✅ | Record tutor usage in the debrief | Flow |
 | [19](19-cleanup-dead-progressive-nudges.md) ✅ | Wire or remove dead `RubricCriterion.progressiveNudges` | Cleanup |
 
+### Voice — spoken interviews
+
+Not yet implemented; these are specs. A system design interview is a spoken
+conversation held over a whiteboard, and until now SDL has been a typing exercise.
+The architecture is **speech-to-speech**: the browser holds a WebRTC connection
+straight to OpenAI's Realtime API (`gpt-realtime-2.1`), the server mints
+short-lived credentials with the interviewer prompt baked in, and transcripts come
+back over a data channel into the existing chat transcript.
+
+Two constraints shape every task below:
+
+- **The hidden rubric must never reach the browser.** `buildInterviewerPrompt`
+  embeds undiscovered hidden expectations verbatim, so the session config is minted
+  server-side and the client only ever holds an opaque token — see 20.
+- **Silence is the candidate thinking.** Chat-tuned turn detection fires at 500ms
+  and would cut a candidate off mid-design. `semantic_vad` with `eagerness: "low"`,
+  plus an explicit hold — see 22.
+
+| # | Task | Area |
+|---|---|---|
+| [20](20-voice-realtime-transport.md) | Server-minted realtime sessions over WebRTC | Voice |
+| [21](21-voice-interviewer-delivery.md) | Voice-native interviewer delivery rules | Voice |
+| [22](22-voice-turn-taking.md) | Silence tolerance, hold-to-think, barge-in truncation | Voice |
+| [23](23-voice-transcript-persistence.md) | Persist voice turns into the existing transcript | Voice |
+| [24](24-voice-workspace-context.md) | Feed the live whiteboard into a voice conversation | Voice |
+| [25](25-voice-workspace-ui.md) | Mode toggle, turn state, live transcript in chat | Voice |
+| [26](26-voice-cost-ceiling-resilience.md) | Cost ceiling, expiry and reconnect | Voice |
+
+Build order: **20 → 23 → 22 → 25** is the shortest path to a usable spoken
+interview. 21 is independent and can land first — it is cheap and every voice turn
+is worse without it. 23 is not optional polish: the debrief, the rubric matcher and
+the export all read `interview_messages`, so a voice session that persists nothing
+silently produces an empty debrief and a rubric where nothing is ever discovered.
+
+> **Re-verify the Realtime API before implementing.** Every field path in 20–26 was
+> checked against `developers.openai.com` in **August 2026**. That surface has
+> already been reshaped once — `turn_detection` and `input_audio_transcription`
+> moved under `session.audio.input.*`, and the docs host moved off
+> `platform.openai.com`.
+
 ## Status
 
-**All 19 tasks are implemented and verified** on the working tree: `pnpm -w lint`,
+**Tasks 01-19 are implemented and verified** on the working tree: `pnpm -w lint`,
 `pnpm -w turbo run typecheck` and `pnpm -w turbo run test` are green across all
 workspaces (212 tests). Every task file carries a `Status: DONE` banner naming
-what landed.
+what landed. **Tasks 20-26 (Voice) are specs only — nothing is implemented yet.**
 
 Two caveats worth carrying into review:
 
@@ -130,11 +170,20 @@ Two caveats worth carrying into review:
 07 ──┬─> 16
 08 ──┴─> 09
 10 ──> 12
+
+21
+20 ──┬─> 22 ──┬─> 25
+     ├─> 23 ──┘
+     ├─> 24
+     └─> 26
 ```
 
 Tasks with no inbound edge can start immediately and in parallel.
 `01` is the one true blocker: it changes the meaning of `score`, and `02`, `03`,
 `06` and `15` all write into the same feedback object.
+`20` is the same kind of blocker for Voice: it owns the transport every other
+voice task consumes. `21` has no inbound edge and no outbound one — it only
+touches the prompt package.
 
 ## Conventions for every task
 
