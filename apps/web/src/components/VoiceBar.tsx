@@ -27,6 +27,9 @@ export function VoiceBar({ session, onExit }: Props) {
     status,
     turnState,
     micLevel,
+    gateOpen,
+    gateEnabled,
+    setGateEnabled,
     muted,
     held,
     error,
@@ -89,7 +92,13 @@ export function VoiceBar({ session, onExit }: Props) {
           {live ? turnStateLabel(held ? "held" : turnState) : voiceStatusLabel(status)}
         </p>
 
-        {live ? <MicMeter level={muted || held ? 0 : micLevel} muted={muted || held} /> : null}
+        {live ? (
+          <MicMeter
+            level={muted || held ? 0 : micLevel}
+            muted={muted || held}
+            transmitting={gateOpen && !muted && !held}
+          />
+        ) : null}
 
         <div className="ml-auto flex items-center gap-2 text-[11px] text-fg-faint">
           {live ? (
@@ -135,6 +144,24 @@ export function VoiceBar({ session, onExit }: Props) {
               className="rounded-lg border border-line bg-surface px-2.5 py-1 text-xs font-medium text-fg-muted transition hover:border-violet-400/50 disabled:opacity-40"
             >
               Go ahead
+            </button>
+
+            <button
+              type="button"
+              aria-pressed={gateEnabled}
+              onClick={() => setGateEnabled(!gateEnabled)}
+              title={
+                gateEnabled
+                  ? "Noise gate on: short sounds — furniture, pets, keyboard — never reach the interviewer. Turn off if it clips your speech."
+                  : "Noise gate off: every sound reaches the interviewer."
+              }
+              className={`rounded-lg border px-2.5 py-1 text-xs font-medium transition ${
+                gateEnabled
+                  ? "border-line bg-surface text-fg-muted hover:border-violet-400/50"
+                  : "border-amber-400/60 bg-amber-400/15 text-fg"
+              }`}
+            >
+              {gateEnabled ? "Gate on" : "Gate off"}
             </button>
 
             <button
@@ -246,17 +273,44 @@ function StatusPill({
   );
 }
 
-/** The only honest answer to "is this thing hearing me?". */
-function MicMeter({ level, muted }: { level: number; muted: boolean }) {
+/**
+ * The only honest answer to "is this thing hearing me?" — and, now, to "why did
+ * nothing happen when the cat jumped on the desk?".
+ *
+ * Level and transmission are shown separately on purpose. Amber means the mic
+ * hears something the gate is holding back; green means it is actually reaching
+ * the interviewer. Collapsing the two would make a working gate look like a
+ * broken microphone.
+ */
+function MicMeter({
+  level,
+  muted,
+  transmitting
+}: {
+  level: number;
+  muted: boolean;
+  transmitting: boolean;
+}) {
   const bars = 8;
   const lit = Math.round(level * bars);
+  const litColour = muted ? "bg-line" : transmitting ? "bg-emerald-400" : "bg-amber-400/70";
   return (
-    <span className="flex items-end gap-[2px]" aria-hidden title={muted ? "Mic off" : "Mic level"}>
+    <span
+      className="flex items-end gap-[2px]"
+      aria-hidden
+      title={
+        muted
+          ? "Mic off"
+          : transmitting
+            ? "Reaching the interviewer"
+            : "Below the noise gate — not sent"
+      }
+    >
       {Array.from({ length: bars }, (_, i) => (
         <span
           key={i}
           className={`w-[3px] rounded-sm transition-[height,background-color] duration-75 ${
-            i < lit ? "bg-emerald-400" : "bg-line"
+            i < lit ? litColour : "bg-line"
           }`}
           style={{ height: `${5 + i * 1.6}px` }}
         />

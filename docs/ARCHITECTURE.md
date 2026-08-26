@@ -92,6 +92,12 @@ Turbo orchestrates `dev`, `build`, `lint`, and Drizzle DB tasks (`db:generate`, 
     arrives before the transcript of the question it answered
   - `contextFeed.ts` — pushes board deltas into a live session, debounced and never
     mid-sentence
+  - `noiseGate.ts` — gates the microphone before the model ever hears it.
+    `semantic_vad` decides *when a turn ends*, never *whether a sound was
+    speech*, so a chair scrape or a pet opens a turn and the interviewer answers
+    a noise. Rejects transients by minimum duration rather than loudness alone
+    (a thud is louder than speech and shorter), with hysteresis so word gaps do
+    not chop sentences and lookahead so the gate opens before the first syllable
   - `costMeter.ts` — elapsed time and estimated spend
 
 ## Backend (`apps/api`)
@@ -375,6 +381,14 @@ credential plus non-secret knobs. A browser that assembled its own session confi
 read the whole hidden rubric out of devtools and `detectDiscoveries` would be measuring
 nothing. A candidate can still overwrite the instructions via `session.update` — that is
 self-sabotage, not a leak, and is out of scope.
+
+**Noise is not speech.** Turn detection answers "has the turn ended", never "was
+that a voice", and it has no loudness threshold at all — so furniture, a keyboard
+or a cat opens a turn and the interviewer dutifully replies to it. Neither VAD
+knob fixes this: more eagerness answers noise faster, and `server_vad`'s
+threshold buys a gate at the cost of the semantic pause tolerance. So the
+microphone is gated client-side before the model hears anything, keyed on
+duration as much as level.
 
 **Silence is the candidate thinking.** "So I'd put a queue here…" — eight seconds of
 drawing — "…and the consumers are idempotent." That is *one* turn, and the API's default

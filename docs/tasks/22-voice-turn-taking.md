@@ -10,6 +10,17 @@
 > false "you're speaking" AND a sluggish interviewer, which is both failure modes
 > at once. `server_vad` now also exposes a loudness `threshold` (default 0.65,
 > above the API's 0.5), because it is the only mode that can reject room noise.
+> A third correction, also from real use: it reacted to furniture and to pets.
+> Neither VAD mode can prevent that — turn detection answers "has the turn
+> ended", never "was that speech", and `semantic_vad` has no threshold at all.
+> Added `noiseGate.ts`: a client-side gate ahead of the peer connection that
+> rejects transients by **duration** (a thud is louder than speech and shorter),
+> with hysteresis so word gaps do not chop sentences and 200ms of lookahead so
+> the gate opens before the first syllable. Nine tests, including a cat walking
+> across a desk as twelve separate bursts. The meter now distinguishes "heard but
+> gated" (amber) from "reaching the interviewer" (green), so a working gate does
+> not look like a broken microphone.
+>
 > Original text below kept as the reasoning that led there. `server_vad` at 1500ms `server_vad` at 2500ms
 > as an escape hatch. `turnState.ts` is a pure reducer with 14 tests; the load-bearing one
 > feeds `speech_started → speech_stopped → speech_started → committed` and asserts it yields

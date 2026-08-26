@@ -22,6 +22,7 @@ import {
   type TurnMachine
 } from "./turnState";
 import { TurnBuffer } from "./turnBuffer";
+import { createNoiseGate, type NoiseGate } from "./noiseGate";
 import {
   isAssistantTranscriptDelta,
   isAssistantTranscriptDone,
@@ -48,8 +49,15 @@ import {
 export type VoiceSessionView = {
   status: VoiceConnectionStatus;
   turnState: VoiceTurnState;
-  /** 0..1, for the level meter. The only honest answer to "is it hearing me?". */
+  /** 0..1, for the level meter. The only honest answer to "is it hearing me?".
+   * Measured PRE-gate, so a candidate whose voice is being gated out still sees
+   * the meter move rather than a dead bar with no explanation. */
   micLevel: number;
+  /** Whether audio is currently passing the noise gate. */
+  gateOpen: boolean;
+  /** Whether the gate is engaged at all. */
+  gateEnabled: boolean;
+  setGateEnabled: (enabled: boolean) => void;
   muted: boolean;
   held: boolean;
   error: string | null;
@@ -117,6 +125,8 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
   const [status, setStatus] = useState<VoiceConnectionStatus>("idle");
   const [turnState, setTurnState] = useState<VoiceTurnState>("idle");
   const [micLevel, setMicLevel] = useState(0);
+  const [gateOpen, setGateOpen] = useState(false);
+  const [gateEnabled, setGateEnabledState] = useState(true);
   const [muted, setMutedState] = useState(false);
   const [held, setHeldState] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -133,6 +143,7 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
   const micRef = useRef<MediaStream | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const analyserRef = useRef<{ ctx: AudioContext; analyser: AnalyserNode } | null>(null);
+  const gateRef = useRef<NoiseGate | null>(null);
   const rafRef = useRef<number | null>(null);
   const tickRef = useRef<number | null>(null);
 
@@ -383,6 +394,8 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
 
       void analyserRef.current?.ctx.close().catch(() => {});
       analyserRef.current = null;
+      void gateRef.current?.dispose().catch(() => {});
+      gateRef.current = null;
 
       if (audioRef.current) {
         audioRef.current.srcObject = null;
@@ -392,6 +405,7 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
       syncMachine(applyCommand(machineRef.current, { kind: "closed" }));
       setStatus(reason === "failed" ? "failed" : "closed");
       setMicLevel(0);
+      setGateOpen(false);
       setHeldState(false);
       closingRef.current = false;
       optionsRef.current.onClosed?.();
@@ -451,8 +465,15 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
       audio.srcObject = e.streams[0] ?? null;
     };
 
-    const track = mic.getAudioTracks()[0];
-    if (track) pc.addTrack(track, mic);
+    // The model must never hear the noise at all. Gating here — rather than
+    // trying to filter turns afterwards — is what makes a cat or a chair a
+    // non-event: below the gate the model receives digital silence, so no turn
+    // can open and there is nothing to respond to.
+    const gate = createNoiseGate(mic);
+    gateRef.current = gate;
+    const outbound = gate?.stream ?? mic;
+    const track = outbound.getAudioTracks()[0];
+    if (track) pc.addTrack(track, outbound);
 
     // Exact channel name — anything else connects and never delivers an event.
     const dc = pc.createDataChannel("oai-events");
@@ -517,7 +538,14 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
       return;
     }
 
-    startLevelMeter(mic, analyserRef, rafRef, setMicLevel);
+    if (gate) {
+      startGatedMeter(gate, rafRef, setMicLevel, setGateOpen);
+    } else {
+      startLevelMeter(mic, analyserRef, rafRef, setMicLevel);
+      // No Web Audio, no gate: report it as permanently open rather than
+      // implying noise is being filtered when it is not.
+      setGateOpen(true);
+    }
   }, [handleEvent, interviewId, syncMachine]);
 
   const connectRef = useRef(connect);
@@ -637,6 +665,12 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
     lastVoiceActivityRef.current = Date.now();
   }, [send]);
 
+  const setGateEnabled = useCallback((enabled: boolean) => {
+    setGateEnabledState(enabled);
+    gateRef.current?.setEnabled(enabled);
+    if (!enabled) setGateOpen(true);
+  }, []);
+
   const start = useCallback(() => {
     if (status === "live" || status === "connecting") return;
     attemptRef.current = 0;
@@ -660,6 +694,9 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
       status,
       turnState,
       micLevel,
+      gateOpen,
+      gateEnabled,
+      setGateEnabled,
       muted,
       held,
       error,
@@ -679,8 +716,11 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
       ceilingWarning,
       elapsedSeconds,
       error,
+      gateEnabled,
+      gateOpen,
       goAhead,
       held,
+      setGateEnabled,
       liveTurns,
       maxSessionSeconds,
       meter,
@@ -695,6 +735,39 @@ export function useRealtimeVoice(options: Options): VoiceSessionView {
       turnState
     ]
   );
+}
+
+/** Drives the meter from the gate, which already computes the level it needs to
+ * make its decision — running a second analyser over the same stream would be
+ * pure duplication. Same rate limiting as `startLevelMeter`, and for the same
+ * reason: `micLevel` is React state. */
+function startGatedMeter(
+  gate: NoiseGate,
+  rafRef: React.MutableRefObject<number | null>,
+  setMicLevel: (level: number) => void,
+  setGateOpen: (open: boolean) => void
+) {
+  let lastStep = -1;
+  let lastOpen: boolean | null = null;
+  let lastSampleMs = 0;
+
+  const loop = (now: number) => {
+    rafRef.current = requestAnimationFrame(loop);
+    if (now - lastSampleMs < MIC_LEVEL_INTERVAL_MS) return;
+    lastSampleMs = now;
+
+    const step = Math.round(gate.level() * MIC_LEVEL_STEPS);
+    if (step !== lastStep) {
+      lastStep = step;
+      setMicLevel(step / MIC_LEVEL_STEPS);
+    }
+    const open = gate.isOpen();
+    if (open !== lastOpen) {
+      lastOpen = open;
+      setGateOpen(open);
+    }
+  };
+  rafRef.current = requestAnimationFrame(loop);
 }
 
 /** Bars in the UI meter. The level is quantised to this many steps, because a
