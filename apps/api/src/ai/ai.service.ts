@@ -5,8 +5,10 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { z } from "zod";
 import {
   buildCriteriaPrompt,
+  buildDebriefPrompt,
   buildDiscoveryMatchPrompt,
   buildInterviewerPrompt,
+  buildProblemNarrativePrompt,
   buildProblemPrompt,
   buildReferenceSolutionPrompt,
   buildValidationPrompt,
@@ -15,22 +17,32 @@ import {
   TAG_VOCABULARY_SNIPPET,
   tutorSystemPrompt
 } from "@sdl/ai-prompts";
+import type { DebriefEvidence } from "@sdl/ai-prompts";
 import type {
   Difficulty,
+  InterviewDebrief,
   InterviewerPlaybook,
   InterviewRubric,
   InterviewerLevel,
   PhaseRuntimeInfo,
+  PhaseTimeline,
+  ProblemNarrative,
+  ProcessAssessment,
   RubricCriterion,
-  SceneSummary
+  SceneSummary,
+  Track
 } from "@sdl/shared";
 import {
   EstimationProblemSpecSchema,
+  getProblemNarrative,
+  getTrack,
+  TrackSchema,
   InterviewerPlaybookSchema,
   InterviewPlanSchema,
   normalizeEstimationSpec,
   RubricCriterionSchema
 } from "@sdl/shared";
+import { resolveAiModels, type AiModels } from "./ai.models.js";
 
 type WorkspaceContext = {
   problemId?: string;
@@ -147,14 +159,62 @@ function formatSceneSummaryForValidation(summary: SceneSummary): string {
   return lines.join("\n");
 }
 
+/** Loose narrative shape for model output. Bounds are wider than
+ * `ProblemNarrativeSchema` so an over-long framing paragraph is trimmed by
+ * `repairNarrative` rather than discarding the whole generated problem. */
+const GeneratedNarrativeSchema = z.object({
+  framingScript: z.string().max(4000).optional(),
+  signatureChallenge: z.string().max(2000).optional(),
+  progressiveReveals: z.array(z.string().max(1200)).max(6).optional()
+});
+
 const GeneratedProblemSchema = z.object({
   title: z.string(),
   statement: z.string(),
   constraints: z.array(z.string()),
   tags: z.array(z.string()).min(2).max(5),
+  framingScript: z.string().max(4000).optional(),
+  signatureChallenge: z.string().max(2000).optional(),
+  progressiveReveals: z.array(z.string().max(1200)).max(6).optional(),
   estimationSpec: EstimationProblemSpecSchema,
   interviewPlan: InterviewPlanSchema
 });
+
+/**
+ * Coerce loose narrative output into the strict schema, field by field.
+ *
+ * Each field is independent: an over-long framing script must not cost us the
+ * signature challenge, and two reveals instead of three must not cost us
+ * either. Anything that cannot be made schema-valid is dropped, and consumers
+ * already treat a missing field as "behave as before".
+ */
+export function repairNarrative(
+  raw: z.infer<typeof GeneratedNarrativeSchema> | undefined
+): ProblemNarrative | null {
+  if (!raw) return null;
+
+  const framing = raw.framingScript?.trim();
+  const signature = raw.signatureChallenge?.trim();
+  const reveals = (raw.progressiveReveals ?? [])
+    .map((r) => r.trim())
+    .filter((r) => r.length >= 20)
+    .map((r) => r.slice(0, 300));
+
+  const candidate: ProblemNarrative = {
+    // Bounds mirror ProblemNarrativeSchema; too-short values are genuinely
+    // unusable (an 8-word "framing script" is not a framing script), so they
+    // are dropped rather than padded.
+    ...(framing && framing.length >= 80 ? { framingScript: framing.slice(0, 900) } : {}),
+    ...(signature && signature.length >= 40
+      ? { signatureChallenge: signature.slice(0, 400) }
+      : {}),
+    ...(reveals.length >= 3
+      ? { progressiveReveals: [reveals[0]!, reveals[1]!, reveals[2]!] as [string, string, string] }
+      : {})
+  };
+
+  return getProblemNarrative(candidate);
+}
 
 // Scores from the validator are nullable per dimension — see
 // packages/shared ValidationDimensionsSchema for the contract.
@@ -191,11 +251,61 @@ const FlagObservationOutputSchema = z.object({
   evidence: z.string().optional()
 });
 
+/** Model-side process assessment. Enum values are validated strictly (they
+ * drive fixed UI copy, so an unknown value has nothing to render) but the free
+ * text is loose and trimmed by `sanitizeProcessAssessment`. */
+const ProcessAssessmentOutputSchema = z.object({
+  clarifiedBeforeDesigning: z.enum(["yes", "partially", "no"]),
+  decisiveness: z.enum([
+    "decides_and_justifies",
+    "lists_without_choosing",
+    "avoids_committing"
+  ]),
+  surfacedOwnLimitations: z.boolean(),
+  adaptedWhenChallenged: z.enum(["yes", "partially", "not_tested", "no"]),
+  drove: z.enum(["candidate_led", "balanced", "interviewer_led"]),
+  observations: z
+    .array(z.object({ signal: z.string().max(1200), evidence: z.string().max(2000) }))
+    .max(8)
+});
+
+/**
+ * Trim a model process assessment to the persisted schema.
+ *
+ * Returns `undefined` when there was no transcript, regardless of what the
+ * model returned: without a conversation there is no process to assess, and a
+ * fabricated one is worse than an absent field. Also returns `undefined` when
+ * every observation is blank — the schema requires at least one, and an
+ * assessment with no evidence is exactly what the prompt forbids.
+ */
+export function sanitizeProcessAssessment(
+  raw: z.infer<typeof ProcessAssessmentOutputSchema> | undefined,
+  hasTranscript: boolean
+): ProcessAssessment | undefined {
+  if (!raw || !hasTranscript) return undefined;
+
+  const observations = raw.observations
+    .map((o) => ({ signal: o.signal.trim().slice(0, 240), evidence: o.evidence.trim().slice(0, 400) }))
+    .filter((o) => o.signal.length > 0 && o.evidence.length > 0)
+    .slice(0, 4);
+  if (observations.length === 0) return undefined;
+
+  return {
+    clarifiedBeforeDesigning: raw.clarifiedBeforeDesigning,
+    decisiveness: raw.decisiveness,
+    surfacedOwnLimitations: raw.surfacedOwnLimitations,
+    adaptedWhenChallenged: raw.adaptedWhenChallenged,
+    drove: raw.drove,
+    observations
+  };
+}
+
 const ValidationSchema = z.object({
   dimensions: ValidationDimensionsSchema,
   dimensionNotes: z.record(z.string(), z.string()).optional(),
   criteriaEvaluations: z.array(CriterionEvaluationSchema).optional(),
   flagObservations: z.array(FlagObservationOutputSchema).optional(),
+  processAssessment: ProcessAssessmentOutputSchema.optional(),
   strengths: z.array(z.string()),
   gaps: z.array(z.string()),
   nextSteps: z.array(z.string())
@@ -521,6 +631,27 @@ const DiscoveryMatchSchema = z.object({
     .max(6)
 });
 
+/** Model-side debrief shape. `generatedAt` is deliberately absent — the server
+ * stamps it, so the model can never backdate or omit it. Bounds are looser than
+ * `InterviewDebriefSchema` so a slightly-long bullet is trimmed rather than
+ * throwing away the whole narrative. */
+const GeneratedDebriefSchema = z.object({
+  strongestSignal: z.string().min(1).max(1200),
+  recommendation: z.enum(["strong_yes", "yes", "no", "strong_no"]),
+  whatWentWell: z.array(z.string()).min(1).max(10),
+  whereTheyStruggled: z.array(z.string()).max(10),
+  riskAreas: z.array(z.string()).max(8),
+  studyPlan: z
+    .array(
+      z.object({
+        topic: z.string().min(1).max(400),
+        why: z.string().min(1).max(1200),
+        suggestedNextProblem: z.string().max(600).optional()
+      })
+    )
+    .max(8)
+});
+
 const ReferenceSolutionSchema = z.object({
   summary: z.string(),
   components: z.array(
@@ -532,28 +663,76 @@ const ReferenceSolutionSchema = z.object({
   ),
   dataFlow: z.string(),
   keyTradeoffs: z.array(z.string()),
-  deepDives: z.array(z.string())
+  deepDives: z.array(z.string()),
+  criterionCoverage: z
+    .array(
+      z.object({
+        criterionId: z.string().max(200),
+        howAddressed: z.string().max(1200)
+      })
+    )
+    .max(60)
+    .optional()
 });
+
+/**
+ * Keep only coverage entries that resolve to a real criterion in this rubric.
+ *
+ * The UI joins these back to criterion ids to render "you missed this → this is
+ * what covering it looks like". An invented id would render as a coverage line
+ * attached to nothing, or worse, to the wrong criterion — so unresolvable
+ * entries are dropped, exactly like hallucinated flag addresses.
+ */
+export function resolveCriterionCoverage(
+  raw: Array<{ criterionId: string; howAddressed: string }> | undefined,
+  criteria: RubricCriterion[] | undefined
+): Array<{ criterionId: string; howAddressed: string }> | undefined {
+  if (!raw || raw.length === 0 || !criteria || criteria.length === 0) return undefined;
+
+  const known = new Set(criteria.map((c) => c.id));
+  const seen = new Set<string>();
+  const resolved: Array<{ criterionId: string; howAddressed: string }> = [];
+
+  for (const entry of raw) {
+    const id = entry.criterionId.trim();
+    if (!known.has(id) || seen.has(id)) continue;
+    const howAddressed = entry.howAddressed.trim().slice(0, 300);
+    if (howAddressed.length === 0) continue;
+    seen.add(id);
+    resolved.push({ criterionId: id, howAddressed });
+  }
+
+  return resolved.length > 0 ? resolved : undefined;
+}
 
 @Injectable()
 export class AiService {
   private readonly openai;
+  /** Purpose -> model id. See `ai.models.ts`; no model id is spelled out below. */
+  private readonly models: AiModels;
 
   constructor(@Inject(ConfigService) private readonly configService: ConfigService) {
     this.openai = createOpenAI({
       apiKey: this.configService.getOrThrow<string>("OPENAI_API_KEY")
     });
+    this.models = resolveAiModels((key) => this.configService.get<string>(key));
   }
 
   async generateProblem(input: {
     difficulty: Difficulty;
     topic?: string;
+    track?: Track;
     existingProblems?: Array<{ title: string; tags: string[]; gist: string }>;
   }) {
     const result = await generateObject({
-      model: this.openai("gpt-4o-mini"),
+      model: this.openai(this.models.problemGeneration),
       schema: GeneratedProblemSchema,
-      prompt: buildProblemPrompt(input.difficulty, input.topic, input.existingProblems)
+      prompt: buildProblemPrompt(
+        input.difficulty,
+        input.topic,
+        input.existingProblems,
+        input.track
+      )
     });
 
     // Drop incoherent unit/magnitude metadata before it is persisted, so a
@@ -561,8 +740,30 @@ export class AiService {
     // band that would mark correct answers wrong.
     return {
       ...result.object,
-      estimationSpec: normalizeEstimationSpec(result.object.estimationSpec)
+      estimationSpec: normalizeEstimationSpec(result.object.estimationSpec),
+      narrative: repairNarrative({
+        framingScript: result.object.framingScript,
+        signatureChallenge: result.object.signatureChallenge,
+        progressiveReveals: result.object.progressiveReveals
+      })
     };
+  }
+
+  /** Backfill the narrative layer for a problem that predates it. Uses the
+   * same rules as generation so a backfilled problem is indistinguishable from
+   * a freshly generated one. */
+  async inferProblemNarrative(input: {
+    title: string;
+    statement: string;
+    difficulty: Difficulty;
+    constraints: string[];
+  }): Promise<ProblemNarrative | null> {
+    const result = await generateObject({
+      model: this.openai(this.models.backfill),
+      schema: GeneratedNarrativeSchema,
+      prompt: buildProblemNarrativePrompt(input)
+    });
+    return repairNarrative(result.object);
   }
 
   async validateSolution(input: {
@@ -585,6 +786,9 @@ export class AiService {
      * present it REPLACES the raw estimation dump — the model should be told
      * facts about the numbers, not asked to infer them. */
     estimationDigest?: string;
+    /** Interviewer level in play, used only to calibrate the process
+     * assessment's `drove` judgement. */
+    interviewerLevel?: InterviewerLevel;
   }) {
     const estimationText =
       input.estimationDigest && input.estimationDigest.trim().length > 0
@@ -601,7 +805,8 @@ export class AiService {
       criteria: sortedCriteria,
       legacyRubric: input.legacyRubric,
       interviewTranscript: input.interviewTranscript,
-      playbook: input.playbook
+      playbook: input.playbook,
+      interviewerLevel: input.interviewerLevel
     });
 
     const contentParts: Array<{ type: "text"; text: string }> = [
@@ -611,13 +816,23 @@ export class AiService {
     ];
 
     const result = await generateObject({
-      model: this.openai("gpt-4o"),
+      model: this.openai(this.models.validation),
       schema: ValidationSchema,
       messages: [{ role: "user", content: contentParts }],
       ...GRADING_OBJECT_SETTINGS
     });
 
-    return result.object;
+    // Drop the process assessment when there was no transcript to read it
+    // from, even if the model emitted one anyway.
+    const processAssessment = sanitizeProcessAssessment(
+      result.object.processAssessment,
+      Boolean(input.interviewTranscript?.trim())
+    );
+
+    return {
+      ...result.object,
+      processAssessment
+    };
   }
 
   /** Generate the per-interview rubric. Called once at interview start (and
@@ -636,6 +851,11 @@ export class AiService {
       visibility: "visible" | "hidden";
       importance: "core" | "expected" | "stretch";
     }>;
+    /** The problem's signature difficulty, when it has one — the rubric must
+     * grade it or it is grading the wrong problem. */
+    signatureChallenge?: string;
+    /** Role archetype, so criteria target the right concerns. */
+    track?: Track;
     /** If set, prepended to the prompt as a hard correction (used by the
      * server-side retry when the first attempt produced too few hiddens). */
     regenerationReason?: string;
@@ -648,6 +868,8 @@ export class AiService {
       seedConstraints: input.seedConstraints,
       phases: input.phases,
       existingCriteria: input.existingCriteria,
+      signatureChallenge: input.signatureChallenge,
+      track: input.track,
       regenerationReason: input.regenerationReason
     });
 
@@ -656,7 +878,7 @@ export class AiService {
     // omits required fields entirely. A single re-roll fixes ~all of those.
     const callModel = () =>
       generateObject({
-        model: this.openai("gpt-4o-mini"),
+        model: this.openai(this.models.criteriaGeneration),
         schema: GeneratedRubricSchema,
         prompt
       });
@@ -706,7 +928,7 @@ export class AiService {
     if (input.undiscovered.length === 0) return [];
     try {
       const result = await generateObject({
-        model: this.openai("gpt-4o-mini"),
+        model: this.openai(this.models.discoveryMatch),
         schema: DiscoveryMatchSchema,
         prompt: buildDiscoveryMatchPrompt(input),
         ...GRADING_OBJECT_SETTINGS
@@ -718,24 +940,161 @@ export class AiService {
     }
   }
 
+  /** Write the end-of-interview debrief.
+   *
+   * One call, at the moment the candidate ends the interview, over everything
+   * the session produced. Failures propagate: unlike the per-turn best-effort
+   * jobs, there is nothing to degrade to here — the caller decides whether to
+   * fail the request or leave the interview active. */
+  async generateDebrief(input: DebriefEvidence): Promise<InterviewDebrief> {
+    const result = await generateObject({
+      model: this.openai(this.models.debrief),
+      schema: GeneratedDebriefSchema,
+      prompt: buildDebriefPrompt(input),
+      ...GRADING_OBJECT_SETTINGS
+    });
+
+    const raw = result.object;
+    const clip = (value: string, max: number) => value.trim().slice(0, max);
+    const clipList = (values: string[], max: number, count: number) =>
+      values.map((v) => clip(v, max)).filter((v) => v.length > 0).slice(0, count);
+
+    const whatWentWell = clipList(raw.whatWentWell, 400, 6);
+
+    return {
+      strongestSignal: clip(raw.strongestSignal, 300),
+      recommendation: raw.recommendation,
+      // The schema requires at least one entry; a model that returns only
+      // blank strings would otherwise fail strict validation and lose the
+      // whole debrief over a formatting slip.
+      whatWentWell:
+        whatWentWell.length > 0
+          ? whatWentWell
+          : ["You completed the attempt end to end and submitted it for review."],
+      whereTheyStruggled: clipList(raw.whereTheyStruggled, 400, 6),
+      riskAreas: clipList(raw.riskAreas, 400, 4),
+      studyPlan: raw.studyPlan
+        .map((item) => ({
+          topic: clip(item.topic, 120),
+          why: clip(item.why, 300),
+          ...(item.suggestedNextProblem
+            ? { suggestedNextProblem: clip(item.suggestedNextProblem, 160) }
+            : {})
+        }))
+        .filter((item) => item.topic.length > 0 && item.why.length > 0)
+        .slice(0, 5),
+      generatedAt: new Date().toISOString()
+    };
+  }
+
+  /** Generate a reference answer.
+   *
+   * With `criteria` the answer is built against one interview's live scope and
+   * rubric; without them the behaviour (and the prompt) is exactly what it was
+   * before rubrics existed, so the per-problem cache stays valid. */
   async generateReference(input: {
     title: string;
     statement: string;
     difficulty: Difficulty;
     constraints: string[];
+    criteria?: RubricCriterion[];
+    signatureChallenge?: string;
   }) {
     const result = await generateObject({
-      model: this.openai("gpt-4o"),
+      model: this.openai(this.models.reference),
       schema: ReferenceSolutionSchema,
       prompt: buildReferenceSolutionPrompt(input)
     });
-    return result.object;
+
+    const criterionCoverage = resolveCriterionCoverage(
+      result.object.criterionCoverage,
+      input.criteria
+    );
+
+    return {
+      ...result.object,
+      ...(criterionCoverage ? { criterionCoverage } : { criterionCoverage: undefined })
+    };
+  }
+
+  /** Infer the role archetype for a problem generated before tracks existed.
+   * Returns `null` when nothing fits — an unspecified track is a perfectly
+   * valid state, so guessing would be worse than leaving it blank. */
+  async inferTrack(input: {
+    title: string;
+    statement: string;
+    difficulty: Difficulty;
+    tags: string[];
+  }): Promise<Track | null> {
+    const TrackOnlySchema = z.object({
+      track: z.string().max(60),
+      confident: z.boolean()
+    });
+    const result = await generateObject({
+      model: this.openai(this.models.backfill),
+      schema: TrackOnlySchema,
+      ...GRADING_OBJECT_SETTINGS,
+      prompt: [
+        "Classify which engineering role archetype this system design problem is written for.",
+        `Allowed values: ${TrackSchema.options.join(", ")}.`,
+        "- backend: shared mutable state across processes, delivery/ordering guarantees, datastore topology.",
+        "- frontend: client-side conflict resolution, render/state boundaries, network chattiness, a11y.",
+        "- fullstack: the seam between the UX and the data — what the client may assume vs what the server confirms.",
+        "- devops: pipeline topology, deployment strategy and blast radius, signal quality and alerting.",
+        "- ai-engineering: retrieval quality, model fallback, evaluation as infrastructure, cost per request.",
+        "",
+        'Set `confident: false` if the problem does not clearly belong to one of these. An unspecified track is a valid outcome — do NOT force a guess, since a wrong track steers future generation and grading in the wrong direction.',
+        "",
+        `Title: ${input.title}`,
+        `Difficulty: ${input.difficulty}`,
+        `Tags: ${input.tags.length > 0 ? input.tags.join(", ") : "(none)"}`,
+        "Statement:",
+        input.statement,
+        "",
+        "Return JSON: { track, confident }"
+      ].join("\n")
+    });
+
+    return result.object.confident ? getTrack(result.object.track) : null;
+  }
+
+  /** Summarise what a tutor session was actually about, as up to five short
+   * topic labels. Called at most once per session (the result is cached on the
+   * row), and failures degrade to `[]` — a missing topic list is a cosmetic
+   * loss, not a reason to fail a read. */
+  async summariseTutorTopics(input: { candidateTurns: string[] }): Promise<string[]> {
+    if (input.candidateTurns.length === 0) return [];
+    const TopicsSchema = z.object({ topics: z.array(z.string().max(120)).max(8) });
+    try {
+      const result = await generateObject({
+        model: this.openai(this.models.backfill),
+        schema: TopicsSchema,
+        ...GRADING_OBJECT_SETTINGS,
+        prompt: [
+          "These are the questions a candidate asked a system-design tutor during one practice session.",
+          "Summarise what they were asking ABOUT, as up to 5 short topic labels (1-3 words each), most asked-about first.",
+          'Use design vocabulary, e.g. "partitioning", "idempotency", "cache invalidation", "queue delivery guarantees".',
+          "Do not judge, do not advise, and do not invent topics that were not asked about. Fewer accurate labels beat five padded ones.",
+          "",
+          "Questions:",
+          ...input.candidateTurns.map((turn) => `- ${turn.slice(0, 600)}`),
+          "",
+          "Return JSON: { topics: string[] }"
+        ].join("\n")
+      });
+      return result.object.topics
+        .map((t) => t.trim().slice(0, 60))
+        .filter((t) => t.length > 0)
+        .slice(0, 5);
+    } catch {
+      return [];
+    }
   }
 
   async inferTags(input: { title: string; statement: string; difficulty: Difficulty }) {
     const TagOnlySchema = z.object({ tags: z.array(z.string()).min(2).max(5) });
     const result = await generateObject({
-      model: this.openai("gpt-4o-mini"),
+      model: this.openai(this.models.backfill),
       schema: TagOnlySchema,
       prompt: `Given this system design problem, assign 2-5 tags.
 ${TAG_VOCABULARY_SNIPPET}
@@ -756,7 +1115,7 @@ ${input.statement}`
   }) {
     const constraintsBlock = input.constraints.map((c) => "- " + c).join("\n");
     const result = await generateObject({
-      model: this.openai("gpt-4o-mini"),
+      model: this.openai(this.models.backfill),
       schema: EstimationProblemSpecSchema,
       prompt: [
         "You tailor back-of-envelope estimation checklists for system design interviews.",
@@ -828,7 +1187,7 @@ ${input.statement}`
 
     try {
       const result = await generateObject({
-        model: this.openai("gpt-4o-mini"),
+        model: this.openai(this.models.proposals),
         schema: ProposalSchema,
         ...GRADING_OBJECT_SETTINGS,
         prompt: [
@@ -874,7 +1233,7 @@ ${input.statement}`
   }) {
     const constraintsBlock = input.constraints.map((c) => "- " + c).join("\n");
     const result = await generateObject({
-      model: this.openai("gpt-4o-mini"),
+      model: this.openai(this.models.backfill),
       schema: InterviewPlanSchema,
       prompt: [
         "Design an interview phase plan for THIS system design question only.",
@@ -889,7 +1248,8 @@ ${input.statement}`
         "Return JSON:",
         "- intro (optional): how you tailored the flow to this problem",
         "- phases: 3-8 ordered steps. Each: id (snake_case), label (short), durationSec (60-3600, sum roughly match typical interview length for difficulty), candidateGuide (markdown-lite: goals + which tabs/board/Validate to use)",
-        "Skip or merge generic phases that do not apply (e.g. no separate API phase for purely batch/analytics if irrelevant)."
+        "Skip or merge generic phases that do not apply (e.g. no separate API phase for purely batch/analytics if irrelevant).",
+        "The LAST phase MUST be a short closing phase (3-5 minutes) where the CANDIDATE summarises their own design, says what they would change at 10x scale, and names what they would tackle next."
       ].join("\n")
     });
     return result.object;
@@ -913,6 +1273,13 @@ ${input.statement}`
     /** IDs of criteria already discovered; the prompt only nudges toward
      * the complement of this set. */
     discoveredCriterionIds?: string[];
+    /** Server-recorded pacing across phases, so the interviewer can reference
+     * how the session was spent rather than only the current phase. */
+    phaseTimeline?: PhaseTimeline;
+    /** Set when a phase-transition offer is live for the candidate. */
+    pendingPhaseTransition?: { toLabel: string };
+    /** Problem narrative — supplies the stall ladder. */
+    narrative?: ProblemNarrative | null;
   }) {
     const ctx = args.workspaceContext;
     const includeScene = Boolean(ctx) && !args.sceneUnchanged;
@@ -931,11 +1298,14 @@ ${input.statement}`
       criteria: args.criteria,
       playbook: args.playbook,
       currentPhaseId: args.currentPhaseId,
-      discoveredCriterionIds: args.discoveredCriterionIds
+      discoveredCriterionIds: args.discoveredCriterionIds,
+      phaseTimeline: args.phaseTimeline,
+      pendingPhaseTransition: args.pendingPhaseTransition,
+      narrative: args.narrative
     });
 
     return streamText({
-      model: this.openai("gpt-4o"),
+      model: this.openai(this.models.interviewerChat),
       system: `${systemPrompt}\nProblem:\n${args.problemStatement}${contextText}`,
       messages: [...args.history, { role: "user", content: userContent }]
     });
@@ -960,10 +1330,10 @@ ${input.statement}`
       includeScene ? ctx?.imageBase64 : undefined
     );
 
-    // gpt-4o-mini is multimodal too and ~10x cheaper than gpt-4o; the tutor
-    // is the lower-stakes surface, so we keep mini and just add the image.
+    // The tutor is the lower-stakes surface, so it stays on the cheap
+    // multimodal tier (see `AI_MODEL_DEFAULTS.tutorChat`).
     return streamText({
-      model: this.openai("gpt-4o-mini"),
+      model: this.openai(this.models.tutorChat),
       system: `${tutorSystemPrompt}${contextText}`,
       messages: [...args.history, { role: "user", content: userContent }]
     });

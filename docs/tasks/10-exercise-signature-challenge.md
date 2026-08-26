@@ -3,6 +3,9 @@
 **Area:** Exercises · **Priority:** P2 · **Size:** M · **Depends on:** —
 **Labels:** `agent-ready`, `exercises`, `api`, `shared`
 
+> **Status: DONE.** `problems.narrative_json` holds `framingScript` / `signatureChallenge` / `progressiveReveals`, repaired field-by-field by `repairNarrative`. The criteria prompt requires a `core` criterion covering the signature challenge; the interviewer prompt gets it as an ordered stall ladder; the welcome opens with the framing script. `POST /problems/backfill-narrative` shares the generation rules verbatim. `signatureChallenge` never reaches the candidate UI.
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 **Generated problems have no signature difficulty.** Every problem in the

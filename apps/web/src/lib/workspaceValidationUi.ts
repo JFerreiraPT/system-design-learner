@@ -103,6 +103,41 @@ export function compareCriterionRows(a: CriterionRow, b: CriterionRow) {
   return score(a) - score(b);
 }
 
+/** Header for the rubric-outcome table in the exported report. */
+export const CRITERION_TABLE_HEADER = [
+  "| Criterion | Importance | Dimension | Visibility | Surfaced | Covered | Evidence |",
+  "|---|---|---|---|---|---|---|"
+].join("\n");
+
+/** One criterion as a markdown table row.
+ *
+ * Lives here, next to `joinCriteriaWithEvaluations` and `compareCriterionRows`,
+ * so the exported table and the on-screen reveal are computed from the same
+ * join and the same ordering — two implementations of "what was graded" would
+ * eventually disagree, and the export is the copy the user keeps.
+ */
+export function criterionRowToMarkdown(row: CriterionRow): string {
+  const { criterion: c, evaluation: ev, neverDiscovered } = row;
+  const surfaced =
+    c.visibility === "hidden" ? (neverDiscovered ? "never asked" : "discovered") : "shown upfront";
+  const covered = ev ? (ev.covered ? "yes" : "**no**") : "not judged";
+  const cells = [
+    c.text,
+    c.importance,
+    DIM_LABELS[c.dimension] ?? c.dimension,
+    c.visibility,
+    surfaced,
+    covered,
+    ev?.evidence ?? "—"
+  ];
+  return `| ${cells.map(escapeTableCell).join(" | ")} |`;
+}
+
+/** Pipes and newlines would break the table structure. */
+function escapeTableCell(value: string): string {
+  return value.replace(/\|/g, "\\|").replace(/\r?\n/g, " ").trim();
+}
+
 export function markdownFromReference(ref: ReferenceSolution) {
   return [
     `## Summary\n\n${ref.summary}`,

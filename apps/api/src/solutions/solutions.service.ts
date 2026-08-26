@@ -7,8 +7,10 @@ import {
 import { ConfigService } from "@nestjs/config";
 import type {
   Difficulty,
+  InterviewerLevel,
   InterviewerPlaybook,
   LiveConstraint,
+  ProcessAssessment,
   RubricCriterion,
   ValidationDimensions
 } from "@sdl/shared";
@@ -16,6 +18,7 @@ import { getRubricCriteria, getRubricPlaybook, projectSceneJson } from "@sdl/sha
 import { and, asc, desc, eq } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import { AiService } from "../ai/ai.service.js";
+import { buildInterviewTranscript } from "../common/transcript.js";
 import { DB } from "../db/db.module.js";
 import { interviewMessages, interviews, problems, solutions } from "../db/schema.js";
 import { buildEstimationDigest } from "./estimationDigest.js";
@@ -48,32 +51,6 @@ const DEFAULT_DIMENSIONS = {
  * once we have feel for the scoring. */
 const DEFAULT_DESIGN_WEIGHT = 0.7;
 
-/** Hard cap keeps validation prompts inside practical context limits. */
-const MAX_INTERVIEW_TRANSCRIPT_CHARS = 120_000;
-
-function formatInterviewTranscript(
-  rows: Array<{ role: string; content: string }>
-): string {
-  const parts: string[] = [];
-  for (const m of rows) {
-    if (m.role !== "user" && m.role !== "assistant") continue;
-    const label = m.role === "user" ? "Candidate" : "Interviewer";
-    parts.push(`[${label}]\n${m.content.trim()}`);
-  }
-  return parts.join("\n\n---\n\n");
-}
-
-function truncateInterviewTranscript(text: string): string {
-  const t = text.trim();
-  if (t.length === 0) return "";
-  if (t.length <= MAX_INTERVIEW_TRANSCRIPT_CHARS) return t;
-  const omitted = t.length - MAX_INTERVIEW_TRANSCRIPT_CHARS;
-  return (
-    `[Earlier transcript truncated (~${omitted} characters omitted)]\n\n` +
-    t.slice(-MAX_INTERVIEW_TRANSCRIPT_CHARS)
-  );
-}
-
 type ValidatorLlmOutput = {
   dimensions: ValidationDimensions;
   dimensionNotes?: Record<string, string>;
@@ -92,6 +69,9 @@ type ValidatorLlmOutput = {
     fired: boolean;
     evidence?: string;
   }>;
+  /** How the candidate worked. Present only when a transcript existed;
+   * reported, never scored. */
+  processAssessment?: ProcessAssessment;
   strengths: string[];
   gaps: string[];
   nextSteps: string[];
@@ -167,6 +147,7 @@ export class SolutionsService {
     let criteria: RubricCriterion[] | null = null;
     let playbook: InterviewerPlaybook | null = null;
     let interviewTranscript: string | null = null;
+    let interviewerLevel: InterviewerLevel | undefined;
 
     if (input.interviewId) {
       const interviewRows = await this.db
@@ -185,6 +166,7 @@ export class SolutionsService {
       }
       criteria = getRubricCriteria(interview.criteriaJson);
       playbook = getRubricPlaybook(interview.criteriaJson);
+      interviewerLevel = interview.interviewerLevel as InterviewerLevel;
 
       const msgRows = await this.db
         .select({
@@ -195,9 +177,7 @@ export class SolutionsService {
         .where(eq(interviewMessages.interviewId, input.interviewId))
         .orderBy(asc(interviewMessages.createdAt));
 
-      const rawTx = formatInterviewTranscript(msgRows);
-      const clipped = truncateInterviewTranscript(rawTx);
-      interviewTranscript = clipped.length > 0 ? clipped : null;
+      interviewTranscript = buildInterviewTranscript(msgRows);
     }
 
     const sceneSummary = projectSceneJson(input.sceneJson);
@@ -241,7 +221,8 @@ export class SolutionsService {
           estimationDigest: buildEstimationDigest({
             estimationSpecJson: problem.estimationSpecJson,
             estimation: estimationNorm
-          })
+          }),
+          interviewerLevel
         });
 
     const evaluation = this.computeServerScores(rawEvaluation, criteria, playbook);
@@ -363,6 +344,7 @@ export class SolutionsService {
     interviewTranscript?: string;
     playbook?: InterviewerPlaybook;
     estimationDigest?: string;
+    interviewerLevel?: InterviewerLevel;
   }) {
     try {
       return await this.aiService.validateSolution(input);

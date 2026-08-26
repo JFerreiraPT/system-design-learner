@@ -3,6 +3,9 @@
 **Area:** Flow · **Priority:** P3 · **Size:** S · **Depends on:** 07 (soft)
 **Labels:** `agent-ready`, `flow`, `evaluation`, `api`, `web`
 
+> **Status: DONE.** `tutor_sessions.interview_id` + `topics_json`; `GET /interviews/:id/tutor-usage` returns zeros (not a 404) with no session, resolves `firstUsedAtPhase` from the phase-event log, and summarises topics at most once per session (asserted: no repeat AI call). Never scored, never gated. Surfaced as a chip in the Validate tab, a context-only line in the debrief, and an export section.
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 The workspace offers a **Tutor** tab alongside the Interviewer during a scored

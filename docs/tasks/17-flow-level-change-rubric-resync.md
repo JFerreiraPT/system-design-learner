@@ -3,6 +3,9 @@
 **Area:** Flow · **Priority:** P3 · **Size:** S · **Depends on:** —
 **Labels:** `agent-ready`, `flow`, `bug`, `api`, `web`
 
+> **Status: DONE.** `interviews.criteria_level` written on both generation paths; `PATCH /interviews/:id` accepts `regenerateCriteria`. `rubricStale` is true only when the recorded level differs — `NULL` reports false. The mid-interview selector always opens a three-outcome dialog stating that regeneration resets discovery progress; a stale rubric shows a persistent notice. `resolveConstraintPill` drops the pill for a dangling `discoveredFromCriterionId` (tested).
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 The workspace exposes a **Level (next message)** dropdown during a live interview

@@ -3,6 +3,9 @@
 **Area:** Flow · **Priority:** P1 · **Size:** L · **Depends on:** —
 **Labels:** `agent-ready`, `flow`, `api`, `web`
 
+> **Status: DONE.** `POST /interviews/:id/end` completes the interview, stamps `endedAt` and persists `interviews.debrief_json` (idempotent — a second call returns the stored copy). `wrap_up` phase added to `DEFAULT_INTERVIEW_PLAN`; generated plans are required to end with a closing phase. Transcript helpers now live only in `apps/api/src/common/transcript.ts`. Messages on a completed interview return `409` before any row is written. UI: End-interview button + `ConfirmDialog`, `InterviewDebrief.tsx`, disabled composer.
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 **Interviews never end.** `interviews.status` defaults to `"active"`

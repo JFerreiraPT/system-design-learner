@@ -3,6 +3,10 @@
 **Area:** Exercises · **Priority:** P2 · **Size:** S · **Depends on:** —
 **Labels:** `agent-ready`, `exercises`, `prompts`
 
+> **Status: DONE.** All five difficulties now use the same six slots, with an *avoid* ladder and a concrete component count each; `buildProblemPrompt` carries the anti-compression rule. `CRITERIA_BUDGET_BY_DIFFICULTY` untouched.
+> Note: the real-key generation spot-check in the Verification note below was **not** run — it needs a live `OPENAI_API_KEY`.
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 `DIFFICULTY_CONTEXT_SNIPPETS` (`packages/ai-prompts/src/index.ts:10-19`) is wildly

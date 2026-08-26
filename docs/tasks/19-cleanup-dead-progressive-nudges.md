@@ -3,6 +3,9 @@
 **Area:** Cleanup · **Priority:** P3 · **Size:** S · **Depends on:** —
 **Labels:** `agent-ready`, `cleanup`, `prompts`
 
+> **Status: DONE — Option A (wire it up).** Criterion-level nudges beat area-level ones for the coaching path, which acts on one undiscovered criterion at a time and previously had only flat `discoveryHints`. `buildInterviewerPrompt` now emits them with an explicit escalation rule (falling back to hints when absent — both branches asserted), and `CriteriaReveal` prefers the gentle nudge as its study prompt. `grep -rn progressiveNudges` over `apps` and `packages` shows two real consumers, so nothing is generated-and-never-read.
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 There are **two** `progressiveNudges` fields. One is used; one is dead.

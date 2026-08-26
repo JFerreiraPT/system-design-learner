@@ -1,4 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { resolveConstraintPill } from "../lib/constraintPills";
+import { TrackBadge } from "./TrackBadge";
 import type {
   ConstraintProposal,
   CriteriaProgress,
@@ -10,6 +12,8 @@ type Props = {
   problemId: string;
   title?: string;
   difficulty?: string;
+  /** Role archetype. Renders no badge when unspecified. */
+  track?: unknown;
   statement?: string;
   /** Seed (problem-level) constraints. Used as a read-only fallback before an
    * interview has started, when there is no live set yet. */
@@ -59,6 +63,7 @@ export function WorkspaceProblemRail({
   problemId,
   title,
   difficulty,
+  track,
   statement,
   constraints,
   liveConstraints,
@@ -70,6 +75,13 @@ export function WorkspaceProblemRail({
   onDismissProposal,
   difficultyBadgeClass
 }: Props) {
+  // Criterion ids we can actually resolve. Used to drop discovery pills whose
+  // criterion vanished when the rubric was regenerated.
+  const knownCriterionIds = useMemo(() => {
+    if (!criteriaProgress) return undefined;
+    return new Set(criteriaProgress.discoveredCriterionIds);
+  }, [criteriaProgress]);
+
   const storageKey = `workspace:${problemId}:problemRailOpen:v3`;
   const [open, setOpen] = useState(() => {
     try {
@@ -113,6 +125,7 @@ export function WorkspaceProblemRail({
             {difficulty ? (
               <span className={difficultyBadgeClass(difficulty)}>{difficulty}</span>
             ) : null}
+            <TrackBadge track={track} />
           </div>
           <p className="mt-0.5 truncate text-sm font-semibold leading-tight text-fg" title={title}>
             {title ?? "Loading…"}
@@ -256,19 +269,21 @@ export function WorkspaceProblemRail({
                 </p>
               ) : (
                 <ul className="mt-1 space-y-1 border-l-2 border-violet-400/40 pl-2 text-[11px] leading-snug text-fg-muted">
-                  {activeLive.map((c) => (
+                  {activeLive.map((c) => {
+                    const pill = resolveConstraintPill(c, knownCriterionIds);
+                    return (
                     <li key={c.id} className="group flex items-start gap-2">
                       <span className="flex-1 break-words">{c.text}</span>
-                      {c.importance ? (
+                      {pill ? (
                         <span
-                          className={`shrink-0 rounded-full px-1.5 py-0 text-[9px] font-semibold ${IMPORTANCE_BADGE_CLASS[c.importance]}`}
+                          className={`shrink-0 rounded-full px-1.5 py-0 text-[9px] font-semibold ${IMPORTANCE_BADGE_CLASS[pill.importance]}`}
                           title={
-                            c.discoveredFromCriterionId
-                              ? `Discovered ${IMPORTANCE_LABEL[c.importance]} expectation`
-                              : IMPORTANCE_LABEL[c.importance]
+                            pill.discovered
+                              ? `Discovered ${IMPORTANCE_LABEL[pill.importance]} expectation`
+                              : IMPORTANCE_LABEL[pill.importance]
                           }
                         >
-                          {IMPORTANCE_LABEL[c.importance]}
+                          {IMPORTANCE_LABEL[pill.importance]}
                         </span>
                       ) : null}
                       <span
@@ -289,7 +304,8 @@ export function WorkspaceProblemRail({
                         </button>
                       ) : null}
                     </li>
-                  ))}
+                    );
+                  })}
                 </ul>
               )}
 

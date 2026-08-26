@@ -1,10 +1,35 @@
 import type {
+  CriterionEvaluation,
   Difficulty,
+  ProblemNarrative,
+  ProcessAssessment,
+  Track,
+  TutorUsage,
+  FlagObservation,
   InterviewerPlaybook,
   InterviewerLevel,
   InterviewPlan,
-  RubricCriterion
+  PhaseTimeline,
+  RubricCriterion,
+  ScoreBand
 } from "@sdl/shared";
+
+/** The six slots every difficulty must fill.
+ *
+ * `beginner` originally got this treatment because it was failing loudly, and
+ * the four levels actually used in practice got one sentence each — which is
+ * why `medium` and `hard` problems came out looking alike. The generator needs
+ * something concrete to differentiate on, and the slot that does most of that
+ * work is **Avoid altogether**: each level is defined partly by what belongs to
+ * the level above it. */
+export const DIFFICULTY_SLOTS = [
+  "Tone",
+  "Problem choice",
+  "Avoid altogether",
+  "Expected answer breadth",
+  "constraints",
+  "tags"
+] as const;
 
 const DIFFICULTY_CONTEXT_SNIPPETS: Record<Difficulty, string> = {
   beginner: `Tone: absolute beginner warmup; no prior system design jargon required.
@@ -13,14 +38,95 @@ Avoid altogether: globe-scale assumptions, geo-distributed deploys, sharding/par
 Expected answer breadth: Roughly two to four labeled boxes suffice (typically web/mobile client, one API/backend layer, one database, optionally one blob store or trivial cache)—do not implicitly expect microservices fleets.
 constraints: Produce 3-4 concise bullets grounded in weekly homework scale (small team or school project), never five-nines SLO wording.
 tags: Exactly two strings from the vocabulary below; strongly prefer pairing from {api-design, storage, transactional} when they fit.`,
-  easy: `Standard junior-friendly single-region product sketch; include clear users and main flows without enterprise-only complexity.`,
-  medium: `Realistic midsize SaaS breadth; multiple services or datastores may appear with coherent trade-offs and scale.`,
-  hard: `Large-scale assumptions, sharper constraints, and probing failure/scaling angles without hand-holding.`,
-  expert: `Cutting-edge or multi-region mission-critical narratives (compliance when natural), principal-level ambiguity.`
+
+  easy: `Tone: junior engineer who has shipped a CRUD product but never owned scale; assumes HTTP, a relational database, and a cache exist, nothing more.
+Problem choice: A single-region product with clear users and two or three real flows (URL-preview service, team expense tracker, appointment booking for a clinic chain, image thumbnailer, a small job board with search).
+Avoid altogether: multi-region, sharding or partitioning strategies, consensus/leader election, event sourcing, CDN fleets, stream processing, exactly-once semantics, compliance regimes. Those are the level above.
+Expected answer breadth: Four to six labeled boxes — client, API/service layer, one primary datastore, one cache OR one queue (not both), plus object storage if media is involved. One clear read path and one write path.
+constraints: 3-5 bullets at product altitude (who the users are, the must-have flows, one hard product limit such as "single company, up to 5k employees"). At most one number, and it should be a modest one.
+tags: 2-3 tags, biased toward {api-design, storage, transactional, caching, search}.`,
+
+  medium: `Tone: mid-level engineer who has operated a service in production; expects to be asked about caching, failure, and a data-model trade-off, and to justify choices rather than list them.
+Problem choice: A realistic midsize system where two or three concerns genuinely interact. Calibrated against the reference standard: "an API rate limiter shared across microservices with per-user and per-endpoint limits, burst allowances, and three plan tiers". Similar breadth: notification fan-out with user preferences, a collaborative document's presence and sync, a marketplace search-and-ranking path, a metering/billing pipeline.
+Avoid altogether: active-active multi-region, custom consensus protocols, regulatory/compliance regimes (GDPR/HIPAA/PCI narratives), exotic or purpose-built storage engines. Those are the level above.
+Expected answer breadth: Six to nine labeled boxes — client, gateway or LB, two or three services with distinct responsibilities, a primary store plus one specialised store (cache, search index, or queue), and at least one asynchronous path. The candidate should be able to name where state lives and what happens when one component is slow.
+constraints: 4-6 bullets that pin down the interacting concerns, including one concrete scale figure and one behavioural requirement that creates real tension (e.g. "limits must hold across all service instances", "preferences apply within a minute of being changed").
+tags: 3-4 tags; the combination should reflect the interacting concerns rather than one theme (e.g. {rate-limiting, caching, consistency}).`,
+
+  hard: `Tone: senior engineer expected to drive; the interviewer supplies facts, not structure. Assumes fluency in partial failure, coordination cost, and operational blast radius.
+Problem choice: Take a medium-shaped system and add the concern that makes it genuinely hard — a decision with no safe default. Calibrated against the reference standard: the same shared rate limiter, but "~100 microservices and millions of API calls per minute", where the Redis cluster can be lost and the candidate must choose fail-open or fail-closed and defend it. Similar shape: ordered event delivery with a slow consumer, a cache whose invalidation is correctness-critical, a write path that must survive a datastore failover.
+Avoid altogether: compliance-driven narratives unless the domain genuinely implies them (payments, health records), and research-grade novelty — the problem must be answerable by a strong senior engineer in half an hour, not require a paper.
+Expected answer breadth: Eight to twelve labeled boxes, and more importantly TWO areas the candidate can go deep on: one about state (partitioning, replication, ordering, or consistency boundary) and one about failure (what degrades, what it degrades to, and how you find out). Expect explicit trade-off statements, not a component list.
+constraints: 5-7 bullets. Include the sharp one — the constraint that removes the easy answer (a hard latency budget, a correctness guarantee under partition, a dependency that is allowed to disappear). State it plainly and do not soften it.
+tags: 3-5 tags, at least one from {consistency, replication, sharding, leader-election, streaming} to reflect where the difficulty actually lives.`,
+
+  expert: `Tone: principal-level. The candidate is expected to define the problem, not just solve it: choose which requirement to sacrifice, and say what they would need to know before committing.
+Problem choice: Genuine principal-level ambiguity — a system where two legitimate architectures lead to different products, and the right call depends on a judgement the statement deliberately leaves open. Multi-region mission-critical narratives and compliance-shaped domains are fair game here. Examples: a global ledger where regional data residency conflicts with a single ordering guarantee; a control plane that must keep working while its own configuration store is being migrated; a multi-tenant platform where one tenant's traffic pattern threatens everyone else's SLO.
+Avoid altogether: nothing is excluded by subject. The one thing to avoid is FAKE difficulty — a medium problem with bigger numbers. Difficulty here must come from irreducible tension between requirements, not from scale inflation.
+Expected answer breadth: Ten to fifteen labeled boxes, plus an explicit statement of what is deliberately NOT built and why. Expect three deep areas, at least one of which is organisational or operational (migration path, blast radius, rollback, cost per tenant) rather than purely architectural.
+constraints: 5-8 bullets, including at least two that are in genuine tension with each other. Do not resolve the tension in the statement — that is the exercise.
+tags: 3-5 tags spanning at least two families (e.g. {geo-distributed, consistency, compliance, cost-optimization}).`
 };
 
 function difficultyContextBlock(difficulty: Difficulty): string {
   return `Difficulty guidance for ${difficulty}:\n${DIFFICULTY_CONTEXT_SNIPPETS[difficulty]}`;
+}
+
+/** The four slots every track must fill. Structured like
+ * `DIFFICULTY_SLOTS` so the two axes are directly comparable. */
+export const TRACK_SLOTS = [
+  "Domain examples",
+  "What the design is about",
+  "Component vocabulary",
+  "Avoid"
+] as const;
+
+/**
+ * Per-track generation guidance.
+ *
+ * `tags` already exist, but they are an OUTPUT used for grouping and dedup —
+ * they never steer the archetype, which is why generation drifts toward
+ * generic backend-ish problems and a frontend practitioner cannot practise the
+ * design work they actually do.
+ *
+ * Composes with difficulty rather than replacing it: **difficulty owns
+ * breadth, track owns subject**. The `Component vocabulary` slot does the
+ * heaviest lifting — it is what stops a frontend problem being answered with
+ * three microservices and a Postgres.
+ */
+const TRACK_CONTEXT_SNIPPETS: Record<Track, string> = {
+  backend: `Domain examples: a distributed rate limiter shared across services, notification fan-out with per-user preferences, a distributed cache with an invalidation contract, an idempotent payment intake, a job scheduler with at-least-once delivery.
+What the design is about: shared mutable state across processes; delivery and ordering guarantees; where the source of truth lives; what happens to in-flight work when a node dies; consistent hashing and rebalancing.
+Component vocabulary: services, API gateways, queues and topics, primary datastores, replicas, caches, schedulers, workers, coordination stores. Data paths and their guarantees are the substance of the answer.
+Avoid: browser rendering, component state management, and CSS/a11y concerns (frontend); pipeline and deployment topology (devops); model serving and prompt/eval design (ai-engineering).`,
+
+  frontend: `Domain examples: a collaborative rich-text or spreadsheet editor, a design-system component library consumed by many teams, a typeahead search box over a large catalogue, a realtime dashboard with thousands of updating cells, an offline-capable mobile web client.
+What the design is about: conflict resolution when two clients edit the same thing (CRDT vs OT vs last-write-wins, and what that means for the user); the render/state boundary and what re-renders; network chattiness — debouncing, batching, optimistic updates and rollback; connection lifecycle (reconnect, resume, backfill); accessibility and keyboard semantics as design constraints, not polish.
+Component vocabulary: client stores and caches, normalised local state, service workers, IndexedDB / local persistence, sync channels (WebSocket / SSE / long-poll), a BFF or API layer, CDN-served assets, virtualised lists, render boundaries. A frontend design has stores, workers, caches and sync channels — NOT three microservices and a Postgres.
+Avoid: database sharding and replication topology, consensus, queue delivery semantics (backend); CI/CD and deployment topology (devops); model training or serving (ai-engineering).`,
+
+  fullstack: `Domain examples: an end-to-end e-commerce checkout, a multi-tenant SaaS dashboard with per-tenant configuration, a booking product where availability must look live, a content platform with drafts, preview and publish.
+What the design is about: the SEAM between the UX and the data — what the client is allowed to assume, what must be confirmed server-side, and what the user sees while the two disagree. Optimistic UI versus authoritative state; where validation lives (and why it lives in both places); the shape of the API as a product decision; per-tenant configuration reaching the client.
+Component vocabulary: client stores, a BFF or API layer, domain services, a primary datastore, a cache, background jobs for anything the user should not wait on, plus the explicit contract between client and server.
+Avoid: deep single-tier rabbit holes — a fullstack answer that never crosses the seam is a backend or frontend answer wearing a different label. Also avoid pipeline topology (devops) and model serving (ai-engineering).`,
+
+  devops: `Domain examples: a CI/CD pipeline for a few dozen services with independent deploys, monitoring and alerting for a system nobody fully understands, a secrets and configuration distribution story, a multi-environment infrastructure promotion path, a disaster-recovery plan with a stated RTO.
+What the design is about: pipeline topology and what can run in parallel; deployment strategy and its blast radius (rolling, blue-green, canary — and how you decide to stop); rollback as a first-class path rather than an afterthought; signal quality across the three pillars (metrics, logs, traces) and alert fatigue as a real failure mode; who gets paged and on what evidence.
+Component vocabulary: source triggers, build and test stages, artifact registries, environments, deployment controllers, feature flags, metric and log pipelines, trace collectors, alert routing and on-call rotations, runbooks.
+Avoid: application-level data modelling and API design (backend/fullstack); UI concerns (frontend); model architecture (ai-engineering).`,
+
+  "ai-engineering": `Domain examples: a retrieval-augmented answering service over a private corpus, an LLM-backed classification pipeline with a human review loop, a multi-step agent with tool access and a cost ceiling, an evaluation harness that decides whether a new prompt or model ships.
+What the design is about: what happens when the model is wrong — detection, fallback, and the human in the loop; retrieval quality and freshness (chunking, embedding refresh, index staleness); evaluation as infrastructure, not a spreadsheet; cost and latency per request as hard design constraints; prompt and model versioning, and how you roll one back.
+Component vocabulary: ingestion and chunking jobs, embedding stores and vector indexes, retrievers and rerankers, an inference gateway with routing and fallback, prompt/version registries, caches keyed on semantic identity, eval datasets and offline scoring jobs, feedback capture.
+Avoid: training-from-scratch narratives and model architecture research (this is engineering AROUND models, not building them); UI-only concerns (frontend); pipeline/deployment topology as the main subject (devops).`
+};
+
+export function trackContextBlock(track: Track): string {
+  return [
+    `Track guidance for ${track}:`,
+    TRACK_CONTEXT_SNIPPETS[track],
+    "Where difficulty guidance and track guidance appear to conflict: difficulty wins on BREADTH (how many components, how sharp the trade-offs), track wins on SUBJECT (what the design is about and what belongs on the board)."
+  ].join("\n");
 }
 
 export const TAG_VOCABULARY_SNIPPET = `
@@ -64,10 +170,27 @@ export const ESTIMATION_DERIVED_FORMULA_RULES = [
   '  - unitKind: the family of the RESULT. displayUnit (optional): how to label it, e.g. "req/s", "GB".'
 ].join("\n");
 
+/** Rules for the interviewer-facing narrative layer.
+ *
+ * Shared verbatim by problem generation and the narrative backfill, so a
+ * backfilled problem is held to the same bar as a generated one. */
+export const PROBLEM_NARRATIVE_RULES = [
+  '- framingScript: the paragraph you would SAY to open the interview. Second person, conversational, 3-5 sentences. Set the scene, name the system, and end by handing control over ("start wherever makes sense to you"). This is spoken framing, NOT a restatement of the statement — if it reads like a spec, rewrite it.',
+  '- signatureChallenge: the ONE thing that makes this problem hard — the place a strong candidate visibly separates from a mediocre one. One or two sentences, and it MUST name a concrete mechanism: a race, a partial failure, an ordering guarantee, a hot key, a consistency boundary, a fail-open/fail-closed call. "Must be scalable", "needs good architecture" and "handle lots of users" are NOT signature challenges — they name no mechanism and could be pasted onto any problem. It must also be REACHABLE at this difficulty: a beginner problem\'s signature challenge is something like "two people editing the same row at once", never sharding.',
+  "- progressiveReveals: exactly THREE interviewer lines, always in this order and usable verbatim as spoken sentences:",
+  '    [0] a SCALE nudge ("let\'s say this now serves ~100 services and millions of calls a minute")',
+  '    [1] a FAILURE-MODE nudge ("how would this change if the store you rely on went down?")',
+  '    [2] a DEBUG / OPERATIONAL nudge ("a user says they are being limited but shouldn\'t be — how do you find out why?")',
+  "    Each must be specific to THIS system, and each must be answerable without having already been given the answer."
+].join("\n");
+
 export const buildProblemPrompt = (
   difficulty: Difficulty,
   topic?: string,
-  existingProblems?: Array<{ title: string; tags: string[]; gist: string }>
+  existingProblems?: Array<{ title: string; tags: string[]; gist: string }>,
+  /** Optional role archetype. Omitted leaves the prompt byte-identical to the
+   * pre-track version. */
+  track?: Track
 ) => {
   const phaseBudgetNote =
     difficulty === "beginner"
@@ -109,13 +232,20 @@ export const buildProblemPrompt = (
         ].join("\n")
       : "";
 
+  const trackBlock = track ? `Track: ${track}\n${trackContextBlock(track)}\n` : "";
+  const trackPlanLine = track
+    ? `\n  - Shape the phases around the ${track} track: replace phases that do not fit with ones that do (a frontend interview wants a component/state-model phase, a devops interview a pipeline-topology phase, an ai-engineering interview a retrieval-and-evaluation phase).`
+    : "";
+
   return `
 Generate one system design interview problem.
 Difficulty: ${difficulty}
 ${difficultyContextBlock(difficulty)}
-${topicLine}
+${trackBlock}${topicLine}
 ${existingBlock}
 ${TAG_VOCABULARY_SNIPPET}
+
+Difficulty is expressed through the NUMBER OF INTERACTING CONCERNS and the SHARPNESS OF THE TRADE-OFFS, never through inflating the user count. A hard problem is not a medium problem with more zeros: if you can raise a problem's difficulty by editing one number in the statement, it was not really harder. Adding a requirement that removes the easy answer is what raises difficulty.
 
 Return:
 - title
@@ -128,6 +258,7 @@ ${estimationFieldsLine}
 ${ESTIMATION_FIELD_RULES}
 ${derivedHintsLine}
 ${ESTIMATION_DERIVED_FORMULA_RULES}
+${PROBLEM_NARRATIVE_RULES}
 - interviewPlan: object for this problem only:
   - intro (optional): one sentence on how YOU structured the flow for THIS prompt (e.g. data-heavy vs API-heavy)
   - phases:${phasesBullet} Each:
@@ -135,14 +266,49 @@ ${ESTIMATION_DERIVED_FORMULA_RULES}
     - label: short UI title (2-4 words)
     - durationSec: suggested timer budget (integer seconds). ${phaseBudgetNote}
     - candidateGuide: 2-5 sentences in markdown-lite. Say what the candidate should accomplish in THIS phase and exactly which parts of the app to use: **Problem**, **Interviewer**, **Tutor**, **Estimation**, **Board**, **Validate**, **phase bar** (Start / Next phase / Reset). Omit or merge phases that do not fit the problem (e.g. skip a dedicated API phase for offline batch systems; replace with "ingest & storage contracts" or similar).
+  - The LAST phase MUST be a short closing phase (3-5 minutes) in which the CANDIDATE does the summarising: restate the design, say what they would change at 10x scale, and name what they would tackle next. Give it whatever id and label fits the problem (\`wrap_up\`, \`closing\`, \`review\`). Without it the interview has no ending and the candidate never has to defend their own design as a whole.${trackPlanLine}
 `;
 };
+
+/** Backfill prompt for the narrative layer on a problem that predates it.
+ *
+ * Shares its rules with `buildProblemPrompt` verbatim (see
+ * `PROBLEM_NARRATIVE_RULES`) so a backfilled problem is indistinguishable from
+ * a freshly generated one — two divergent sets of rules here would produce two
+ * classes of problem. */
+export function buildProblemNarrativePrompt(input: {
+  title: string;
+  statement: string;
+  difficulty: Difficulty;
+  constraints: string[];
+}): string {
+  return [
+    "You add the interviewer-facing narrative layer to an existing system design problem.",
+    "Do NOT rewrite the statement or the constraints — they are fixed. Work from what is already there.",
+    `Difficulty: ${input.difficulty}`,
+    difficultyContextBlock(input.difficulty),
+    `Title: ${input.title}`,
+    "Statement:",
+    input.statement,
+    "",
+    "Constraints:",
+    input.constraints.length > 0 ? input.constraints.map((c) => `- ${c}`).join("\n") : "(none)",
+    "",
+    "Return JSON with:",
+    PROBLEM_NARRATIVE_RULES
+  ].join("\n");
+}
 
 export function getCriteriaHiddenMin(difficulty: Difficulty): number {
   return CRITERIA_BUDGET_BY_DIFFICULTY[difficulty].hiddenMin;
 }
 
-const CRITERIA_BUDGET_BY_DIFFICULTY: Record<
+/** Rubric size budget per difficulty.
+ *
+ * Exported so hand-authored (seeded) rubrics can be validated against exactly
+ * the same budget the generator is instructed to respect — otherwise a curated
+ * rubric could be looser than a generated one and nothing would catch it. */
+export const CRITERIA_BUDGET_BY_DIFFICULTY: Record<
   Difficulty,
   {
     total: [number, number];
@@ -215,6 +381,12 @@ export function buildCriteriaPrompt(input: {
     visibility?: "visible" | "hidden";
     importance?: "core" | "expected" | "stretch";
   }>;
+  /** The problem's signature difficulty, when it has one. This is the single
+   * mechanism that stops rubrics drifting into generic best-practice lists. */
+  signatureChallenge?: string;
+  /** Role archetype. Keeps criteria on the right concerns — a frontend
+   * problem must not be graded on sharding. */
+  track?: Track;
   regenerationReason?: string;
 }): string {
   const budget = CRITERIA_BUDGET_BY_DIFFICULTY[input.difficulty];
@@ -250,6 +422,23 @@ export function buildCriteriaPrompt(input: {
           ""
         ].join("\n")
       : "";
+  const signatureBlock = input.signatureChallenge?.trim()
+    ? [
+        "",
+        "THIS PROBLEM'S SIGNATURE CHALLENGE (interviewer-private — never restate it to the candidate):",
+        input.signatureChallenge.trim(),
+        '- At least ONE criterion with importance="core" MUST cover this. It is the place a strong candidate separates from a mediocre one, so a rubric that does not grade it is grading the wrong problem.',
+        "- Its `satisfiedBy` bullets must name what addressing the mechanism looks like on the board or in the notes, not merely that it was mentioned.",
+        "- Prefer visibility=\"hidden\" for it unless a seed constraint already spells the mechanism out."
+      ].join("\n")
+    : "";
+  const trackBlock = input.track
+    ? [
+        "",
+        trackContextBlock(input.track),
+        `- Criteria must target ${input.track} concerns. Do NOT require expertise that belongs to a different track — the "Avoid" list above says which those are.`
+      ].join("\n")
+    : "";
   const capacityRule = hasEstimationPhase(input.phases)
     ? [
         "",
@@ -277,6 +466,8 @@ export function buildCriteriaPrompt(input: {
     "Interview phases available for playbook phaseRefs:",
     phaseBlock,
     existingCriteriaBlock,
+    trackBlock,
+    signatureBlock,
     "",
     "Rubric shape:",
     `- Total criteria: ${budget.total[0]}-${budget.total[1]}.`,
@@ -416,6 +607,10 @@ export function buildValidationPrompt(
     /** Interview playbook, when this attempt belongs to an interview that has
      * one. Supplies the green/red flags for the observation pass. */
     playbook?: InterviewerPlaybook;
+    /** Interviewer level in play. Needed to calibrate `drove`: at `guided` the
+     * interviewer is SUPPOSED to lead, so `interviewer_led` is not a negative
+     * there. Only used alongside a transcript. */
+    interviewerLevel?: InterviewerLevel;
   }
 ): string {
   const constraintsBlock =
@@ -506,6 +701,10 @@ export function buildValidationPrompt(
     : "";
 
   const flagsBlock = formatFlagsForObservation(scope.playbook);
+  const processBlock = formatProcessAssessmentBlock(
+    scope.interviewTranscript,
+    scope.interviewerLevel
+  );
 
   return [
     "You are a senior system design reviewer.",
@@ -516,6 +715,7 @@ export function buildValidationPrompt(
     estimationBlock,
     transcriptBlock,
     flagsBlock,
+    processBlock,
     "",
     "Scoring rules:",
     "- **Do not compute numeric scores.** The server derives `score`, `designScore`, `discoveryScore`, `coreCovered`, and `coreMissed` deterministically from your per-criterion judgments.",
@@ -538,7 +738,58 @@ export function buildValidationPrompt(
       ? [
           "- flagObservations: array of { areaId, kind, index, text, fired, evidence? } — one entry per flag listed in the OBSERVABLE FLAGS block, echoing its exact areaId / kind / index"
         ]
+      : []),
+    ...(processBlock
+      ? [
+          "- processAssessment: object with { clarifiedBeforeDesigning, decisiveness, surfacedOwnLimitations, adaptedWhenChallenged, drove, observations } exactly as specified in the PROCESS ASSESSMENT block"
+        ]
       : [])
+  ].join("\n");
+}
+
+/** Per-level calibration for `drove`. Without this the assessment would punish
+ * a guided candidate for being guided, which is the interviewer's job at that
+ * level, not the candidate's failing. */
+const DROVE_CALIBRATION_BY_LEVEL: Record<InterviewerLevel, string> = {
+  guided:
+    'At GUIDED the interviewer is supposed to lead — answering decisively and volunteering the next question. `interviewer_led` is therefore NEUTRAL here, not a negative, and `candidate_led` is exceptional.',
+  standard:
+    "At STANDARD a good session reads as `balanced`: the interviewer answers and asks one follow-up, the candidate carries the design forward between turns.",
+  hard:
+    "At HARD the interviewer deliberately withholds structure, so `interviewer_led` is a real finding — it means the candidate needed structure that was not being offered.",
+  staff:
+    "At STAFF driving the conversation is the expectation, not a bonus. Anything short of `candidate_led` is the headline observation about this attempt."
+};
+
+/**
+ * Process-assessment block for the validator.
+ *
+ * Emitted ONLY when a transcript exists. A bare board validation has no
+ * process to assess, and inventing one from an empty transcript is strictly
+ * worse than omitting the field — it would manufacture a behavioural verdict
+ * out of a diagram.
+ */
+function formatProcessAssessmentBlock(
+  transcript?: string,
+  interviewerLevel?: InterviewerLevel
+): string {
+  if (!transcript?.trim()) return "";
+
+  return [
+    "",
+    "PROCESS ASSESSMENT — judge HOW the candidate worked, from the TRANSCRIPT ONLY:",
+    "- The diagram is scored elsewhere. A beautiful diagram is not evidence of good process, and a messy one is not evidence of bad process. If the transcript does not show it, you did not observe it.",
+    "- This assessment is REPORTED to the candidate, never scored. Do not let it influence your dimension scores or criterion judgments, and do not let those influence it.",
+    "- clarifiedBeforeDesigning: 'yes' | 'partially' | 'no' — did scope questions come before design commitments, in that order in the transcript?",
+    "- decisiveness: 'decides_and_justifies' | 'lists_without_choosing' | 'avoids_committing'. Listing alternatives and moving on without picking one is `lists_without_choosing`, even when the alternatives are correct.",
+    "- surfacedOwnLimitations: true only if the candidate named a weakness of THEIR OWN design without being asked. Answering a question about a weakness does not count.",
+    "- adaptedWhenChallenged: 'yes' | 'partially' | 'not_tested' | 'no'. Use `not_tested` when the interviewer never actually challenged an assumption — that is the correct answer, not a hedge. NEVER infer rigidity from silence.",
+    "- drove: 'candidate_led' | 'balanced' | 'interviewer_led' — who set the agenda across the session as a whole.",
+    interviewerLevel
+      ? `  ${DROVE_CALIBRATION_BY_LEVEL[interviewerLevel]}`
+      : "  No interviewer level was supplied; judge `drove` descriptively and do not treat `interviewer_led` as a fault.",
+    "- observations: 1-4 items of { signal, evidence }. `evidence` MUST quote or closely paraphrase a specific line from the transcript. An observation you cannot point at is a guess — drop it.",
+    ""
   ].join("\n");
 }
 
@@ -578,13 +829,65 @@ function formatFlagsForObservation(playbook?: InterviewerPlaybook): string {
   ].join("\n");
 }
 
+/**
+ * Reference answer prompt.
+ *
+ * The interview-scoped form exists to fix a real contradiction: the candidate
+ * is penalised for missing `per_user_isolation`, then unlocks a "here is what
+ * good looks like" answer that never mentions isolation. A reference built
+ * without the rubric it is being compared against actively undermines the
+ * score. When `criteria` are supplied the answer must address them, and must
+ * say HOW — that mapping is the part the UI pairs with each missed criterion.
+ *
+ * Without `criteria` / `signatureChallenge` the prompt is byte-identical to the
+ * pre-rubric version, so the cached per-problem references stay valid.
+ */
 export function buildReferenceSolutionPrompt(input: {
   title: string;
   statement: string;
   difficulty: Difficulty;
   constraints: string[];
+  /** Full rubric for one interview (visible AND hidden). When present the
+   * reference is graded against the same scope the candidate was. */
+  criteria?: RubricCriterion[];
+  signatureChallenge?: string;
 }): string {
   const constraintsBlock = input.constraints.map((c) => "- " + c).join("\n");
+  const criteria = input.criteria ?? [];
+
+  const criteriaBlock =
+    criteria.length > 0
+      ? [
+          "",
+          "THE RUBRIC THIS ATTEMPT WAS GRADED AGAINST. Your answer is the candidate's model of what 'good' means here, so it must not contradict the grade:",
+          ...criteria.map((c) => {
+            const satisfied =
+              c.satisfiedBy && c.satisfiedBy.length > 0
+                ? ` :: satisfiedBy: ${c.satisfiedBy.join(" | ")}`
+                : "";
+            return `- id=${c.id} (${c.importance}, ${c.dimension})\n    ${c.text}${satisfied}`;
+          }),
+          "",
+          'Every criterion with importance="core" MUST be explicitly addressed somewhere in the answer — in a component, in the data flow, or in a trade-off. A reference that silently skips a core criterion the candidate was marked down for is worse than no reference.'
+        ].join("\n")
+      : "";
+
+  const signatureBlock = input.signatureChallenge?.trim()
+    ? [
+        "",
+        "THIS PROBLEM'S SIGNATURE CHALLENGE:",
+        input.signatureChallenge.trim(),
+        "Discuss it explicitly in `keyTradeoffs` or `deepDives`, and take a position — this is the decision the whole problem bends around, so 'it depends' is not an answer."
+      ].join("\n")
+    : "";
+
+  const coverageOutput =
+    criteria.length > 0
+      ? [
+          "- criterionCoverage: one entry per core criterion above, as { criterionId, howAddressed }. `criterionId` must be copied verbatim from the list — invented ids are discarded. `howAddressed` is ONE sentence naming the concrete thing in your answer that satisfies it, so a candidate who missed that criterion can see exactly what covering it looks like."
+        ]
+      : [];
+
   return [
     "You are a principal engineer. Produce a concise reference answer for this system design problem.",
     `Difficulty: ${input.difficulty}`,
@@ -592,19 +895,246 @@ export function buildReferenceSolutionPrompt(input: {
     "Statement:",
     input.statement,
     "",
-    "Constraints:",
+    criteria.length > 0
+      ? "Active scope (the live constraint set this attempt was graded against):"
+      : "Constraints:",
     constraintsBlock,
+    criteriaBlock,
+    signatureBlock,
     "",
     "Return JSON with:",
     "- summary (2-4 sentences)",
     "- components: array of { name, role, tradeoffs } for the main building blocks",
     "- dataFlow: short narrative of read/write paths",
     "- keyTradeoffs: array of bullet-grade trade-off statements",
-    "- deepDives: array of 3-5 follow-up angles if the interviewer probes deeper"
+    "- deepDives: array of 3-5 follow-up angles if the interviewer probes deeper",
+    ...coverageOutput
+  ]
+    .filter((part) => part !== "")
+    .join("\n");
+}
+
+/** Everything the debrief is allowed to reason from. Each part is optional
+ * because an interview can legitimately lack any of it (no rubric on legacy
+ * sessions, no timeline when the timer never ran, no flags without a
+ * playbook) — and the prompt omits the corresponding block rather than
+ * inviting the model to invent it. */
+export type DebriefEvidence = {
+  problemTitle: string;
+  problemStatement: string;
+  difficulty: Difficulty;
+  interviewerLevel: InterviewerLevel;
+  /** Live scope at the moment the interview ended — what the candidate was
+   * actually asked to build, not the seed statement. */
+  activeConstraints: string[];
+  criteria?: RubricCriterion[];
+  playbook?: InterviewerPlaybook;
+  scoring?: {
+    score?: number;
+    designScore?: number;
+    discoveryScore?: number;
+    scoringMode?: "rubric" | "dimensions";
+    scoreBand?: { band: ScoreBand; label: string };
+    criteriaEvaluations?: CriterionEvaluation[];
+    coreMissed?: string[];
+    coreCovered?: string[];
+    flagObservations?: FlagObservation[];
+    strengths?: string[];
+    gaps?: string[];
+    /** How the candidate worked. A qualitative signal that is deliberately
+     * kept out of the score — the debrief narrative is where it belongs. */
+    processAssessment?: ProcessAssessment;
+  };
+  transcript?: string;
+  phaseTimeline?: PhaseTimeline;
+  /** Tutor consultation during the session. Context, never a deduction. */
+  tutorUsage?: TutorUsage;
+};
+
+function debriefScoringBlock(scoring: DebriefEvidence["scoring"]): string {
+  if (!scoring) return "";
+  const lines: string[] = [];
+  if (typeof scoring.score === "number") lines.push(`- Overall score: ${scoring.score}/100`);
+  if (scoring.scoreBand) {
+    lines.push(`- Band: ${scoring.scoreBand.band} of 4 — ${scoring.scoreBand.label}`);
+  }
+  if (typeof scoring.designScore === "number") {
+    lines.push(`- Design subscore: ${scoring.designScore}/100`);
+  }
+  if (typeof scoring.discoveryScore === "number") {
+    lines.push(`- Discovery subscore (share of hidden scope they surfaced): ${scoring.discoveryScore}/100`);
+  }
+  if (scoring.scoringMode) {
+    lines.push(
+      scoring.scoringMode === "rubric"
+        ? "- These numbers come from weighted rubric coverage."
+        : "- These numbers come from the dimension-average FALLBACK (no rubric was available); treat them as coarse."
+    );
+  }
+  if (lines.length === 0) return "";
+  return ["", "AUTOMATED SCORING FOR THIS ATTEMPT (do not restate the numbers; explain them):", ...lines].join("\n");
+}
+
+function debriefCriteriaBlock(
+  criteria: RubricCriterion[] | undefined,
+  evaluations: CriterionEvaluation[] | undefined
+): string {
+  if (!criteria || criteria.length === 0) return "";
+  const byId = new Map((evaluations ?? []).map((e) => [e.criterionId, e] as const));
+  const rows = criteria.map((c) => {
+    const ev = byId.get(c.id);
+    const covered = ev ? (ev.covered ? "covered" : "MISSED") : "not judged";
+    const surfaced =
+      c.visibility === "hidden"
+        ? c.discoveredVia
+          ? "surfaced in conversation"
+          : "NEVER surfaced"
+        : "visible from the start";
+    const evidence = ev?.evidence ? ` :: evidence: ${ev.evidence}` : "";
+    return `- ${c.id} (${c.importance}, ${c.dimension}): ${covered}, ${surfaced}${evidence}\n    ${c.text}`;
+  });
+  return [
+    "",
+    "RUBRIC OUTCOME (the ground truth for what was expected and what landed):",
+    ...rows
   ].join("\n");
 }
 
-export function buildInterviewerWelcome(problemTitle: string, plan: InterviewPlan): string {
+function debriefFlagsBlock(observations: FlagObservation[] | undefined): string {
+  const fired = (observations ?? []).filter((f) => f.fired);
+  if (fired.length === 0) return "";
+  const greens = fired.filter((f) => f.kind === "green").map((f) => `- GREEN: ${f.text}${f.evidence ? ` — ${f.evidence}` : ""}`);
+  const reds = fired.filter((f) => f.kind === "red").map((f) => `- RED: ${f.text}${f.evidence ? ` — ${f.evidence}` : ""}`);
+  return ["", "OBSERVED BEHAVIOURAL SIGNALS (already evidenced — safe to cite):", ...greens, ...reds].join("\n");
+}
+
+function debriefProcessBlock(process: ProcessAssessment | undefined): string {
+  if (!process) return "";
+  return [
+    "",
+    "HOW THEY WORKED (already judged from the transcript — cite it, do not re-derive it):",
+    `- Clarified before designing: ${process.clarifiedBeforeDesigning}`,
+    `- Decisiveness: ${process.decisiveness}`,
+    `- Surfaced their own limitations unprompted: ${process.surfacedOwnLimitations ? "yes" : "no"}`,
+    `- Adapted when challenged: ${process.adaptedWhenChallenged}`,
+    `- Who drove the session: ${process.drove}`,
+    ...process.observations.map((o) => `- ${o.signal} — ${o.evidence}`),
+    "Proactiveness is the strongest seniority signal, so if `drove` or `surfacedOwnLimitations` is the most informative thing here, it belongs in `strongestSignal`."
+  ].join("\n");
+}
+
+function debriefTutorBlock(usage: TutorUsage | undefined): string {
+  if (!usage || usage.candidateTurns === 0) return "";
+  const topics = usage.topics.length > 0 ? `, mostly about ${usage.topics.join(", ")}` : "";
+  const phase = usage.firstUsedAtPhase ? ` First opened during ${usage.firstUsedAtPhase}.` : "";
+  return [
+    "",
+    "TUTOR USE DURING THE SESSION:",
+    `The candidate consulted the tutor ${usage.candidateTurns} ${usage.candidateTurns === 1 ? "time" : "times"} across ${usage.sessions} ${usage.sessions === 1 ? "session" : "sessions"}${topics}.${phase}`,
+    "This is CONTEXT, not a deduction. This is a practice tool and using the tutor is often the right move — it is why the tutor exists. Do NOT treat it as cheating, do not lower your recommendation for it, and do not mention it in `whereTheyStruggled` or `riskAreas`.",
+    "What it IS good for: a topic that needed tutor help is a topic to practise, so fold those topics into `studyPlan` where they fit."
+  ].join("\n");
+}
+
+function debriefPacingBlock(timeline: PhaseTimeline | undefined): string {
+  if (!timeline || timeline.totalSec <= 0) return "";
+  const rows = timeline.phases
+    .filter((p) => p.actualSec > 0 || p.budgetSec > 0)
+    .map((p) => {
+      const spent = Math.round(p.actualSec / 60);
+      const budget = Math.round(p.budgetSec / 60);
+      const over = p.overBudget ? " (over budget)" : "";
+      return `- ${p.label}: ~${spent}m spent vs ~${budget}m suggested${over}`;
+    });
+  return [
+    "",
+    "PACING (how the session was actually spent):",
+    ...rows,
+    "Pacing is a real seniority signal — 22 minutes clarifying and 3 on the deep dive says something specific. Mention it ONLY if the shape is genuinely lopsided, and never as a scored item."
+  ].join("\n");
+}
+
+/**
+ * Prompt for the end-of-interview written debrief.
+ *
+ * The point of this artefact is that it is *narrative* — the score already
+ * exists, in more detail than a human would ever produce. What the candidate
+ * cannot get from eight bars and three bullet lists is a reading of the
+ * session as a whole: what the strongest signal was, where it went wrong, and
+ * what to go practise. So the prompt's hardest rule is traceability: every
+ * bullet has to point at something in the evidence above it, because an
+ * ungrounded narrative is worse than no narrative.
+ */
+export function buildDebriefPrompt(input: DebriefEvidence): string {
+  const constraintsBlock =
+    input.activeConstraints.length > 0
+      ? ["", "SCOPE AS IT STOOD AT THE END (live constraints — this, not the statement, is what they were asked to build):", ...input.activeConstraints.map((c) => `- ${c}`)].join("\n")
+      : "";
+
+  const transcriptBlock = input.transcript?.trim()
+    ? ["", "TRANSCRIPT (chronological, candidate ↔ interviewer):", input.transcript.trim()].join("\n")
+    : "";
+
+  const strengthsGaps = (() => {
+    const s = input.scoring?.strengths ?? [];
+    const g = input.scoring?.gaps ?? [];
+    if (s.length === 0 && g.length === 0) return "";
+    return [
+      "",
+      "VALIDATOR NOTES (per-attempt, already grounded in the diagram):",
+      ...s.map((x) => `- strength: ${x}`),
+      ...g.map((x) => `- gap: ${x}`)
+    ].join("\n");
+  })();
+
+  return [
+    "You are writing the interviewer's written debrief for a system-design mock interview that has just ended.",
+    "This is a PRACTICE tool for a single learner reviewing their own session, so write to them, plainly, in the second person. No corporate hedging.",
+    "",
+    `Problem: ${input.problemTitle}`,
+    `Difficulty: ${input.difficulty}`,
+    `Interviewer level in play: ${input.interviewerLevel}`,
+    "Statement:",
+    input.problemStatement,
+    constraintsBlock,
+    debriefScoringBlock(input.scoring),
+    debriefCriteriaBlock(input.criteria, input.scoring?.criteriaEvaluations),
+    debriefFlagsBlock(input.scoring?.flagObservations),
+    strengthsGaps,
+    debriefProcessBlock(input.scoring?.processAssessment),
+    debriefTutorBlock(input.tutorUsage),
+    debriefPacingBlock(input.phaseTimeline),
+    transcriptBlock,
+    "",
+    "HARD RULES:",
+    "- **Every bullet must be traceable to a specific observable**: a diagram element, a quoted or closely-paraphrased transcript line, or a criterion id in parentheses. A verdict you cannot point at is not a verdict, it is a guess — drop it rather than pad the list.",
+    "- Do NOT restate the numeric score, the band number, or the subscores. The candidate can already see those. Explain what produced them.",
+    "- Calibrate to the interviewer level in play. At `guided` the interviewer was supposed to lead, so being led is not a weakness there; at `staff` it is the finding.",
+    "- Calibrate to the difficulty. Do not fault a `beginner` attempt for skipping sharding.",
+    "- `whereTheyStruggled` and `riskAreas` are different things: struggled = what visibly went wrong in this session; risk areas = what would bite them in a real interview or a real system even though it did not surface today.",
+    "- If a hidden expectation was never surfaced, say so in the candidate's own terms (\"you never asked whether…\") rather than by criterion id alone. The point is to teach the question, not the label.",
+    "- studyPlan is the payload of the whole document: order it by what would move the next attempt most, and make each `why` reference something that actually happened here. `suggestedNextProblem` is a short problem *description* (\"a multi-tenant audit log\"), not a link or a title from a catalogue.",
+    "- recommendation: one of strong_yes | yes | no | strong_no, judged against the bar for THIS difficulty and level.",
+    "",
+    "Return strict JSON:",
+    "- strongestSignal: ONE sentence naming the single most informative thing about this attempt, positive or negative.",
+    "- recommendation: strong_yes | yes | no | strong_no",
+    "- whatWentWell: 1-6 bullets",
+    "- whereTheyStruggled: 0-6 bullets",
+    "- riskAreas: 0-4 bullets",
+    "- studyPlan: 0-5 items of { topic, why, suggestedNextProblem? }, most valuable first"
+  ]
+    .filter((part) => part !== "")
+    .join("\n");
+}
+
+export function buildInterviewerWelcome(
+  problemTitle: string,
+  plan: InterviewPlan,
+  /** When the problem has a spoken framing, it replaces the bare title line.
+   * Absent on every problem generated before narratives existed. */
+  narrative?: ProblemNarrative | null
+): string {
   const firstLabel = plan.phases[0]?.label ?? "the first phase";
 
   const phaseBlocks = plan.phases
@@ -619,10 +1149,17 @@ export function buildInterviewerWelcome(problemTitle: string, plan: InterviewPla
       `\n\n**How this problem is staged:** ${plan.intro.trim()}`
     : "";
 
+  // The framing script is what a real interviewer would SAY; the title line is
+  // what a form would print. Prefer the former when we have it.
+  const framing = narrative?.framingScript?.trim();
+  const opening = framing
+    ? `${framing}\n\nWe're working on: **${problemTitle}**.${planIntro}`
+    : `We're working on: **${problemTitle}**.${planIntro}`;
+
   return [
     "## Interview workspace",
     "",
-    `We're working on: **${problemTitle}**.${planIntro}`,
+    opening,
     "",
     "### How I'll run this",
     "",
@@ -727,6 +1264,38 @@ function formatPlaybookBlock(playbook?: InterviewerPlaybook, currentPhaseId?: st
   ].join("\n");
 }
 
+/** Compact cross-phase pacing summary for the interviewer.
+ *
+ * `PhaseRuntimeInfo` only ever describes the phase the candidate is in right
+ * now, so the interviewer could see "over budget here" but never "you spent 22
+ * of your 30 minutes clarifying". This block supplies that history.
+ *
+ * Returns "" when nothing has been recorded (every legacy interview, and every
+ * session where the timer was never started), which keeps the prompt
+ * byte-identical to today for those cases. */
+export function formatPhaseTimelineBlock(timeline?: PhaseTimeline): string {
+  if (!timeline) return "";
+  const recorded = timeline.phases.filter((phase) => phase.actualSec > 0);
+  if (recorded.length === 0 || timeline.totalSec <= 0) return "";
+
+  const rows = timeline.phases.map((phase) => {
+    const spent = Math.round(phase.actualSec / 60);
+    const budget = Math.round(phase.budgetSec / 60);
+    const share = Math.round((phase.actualSec / timeline.totalSec) * 100);
+    const flag = phase.overBudget ? " OVER" : "";
+    const budgetText = phase.budgetSec > 0 ? `~${budget}m suggested` : "no suggested budget";
+    return `- ${phase.label}: ~${spent}m spent of ${budgetText} (${share}% of the session so far)${flag}`;
+  });
+
+  return [
+    "",
+    "PACING HISTORY ACROSS PHASES (private — same rule as the current-phase line: never quote these numbers at the candidate):",
+    ...rows,
+    `Total recorded: ~${Math.round(timeline.totalSec / 60)}m.`,
+    "Read it for shape, not for nagging: a session that spent most of its time clarifying and almost none on the deep dive should get pointed follow-ups on the parts that were skipped, not a lecture about the clock."
+  ].join("\n");
+}
+
 /** Build the interviewer system prompt.
  *
  * `criteria` and `discoveredCriterionIds` are optional so legacy interviews
@@ -739,6 +1308,14 @@ export const buildInterviewerPrompt = (
     discoveredCriterionIds?: string[];
     playbook?: InterviewerPlaybook;
     currentPhaseId?: string;
+    /** Server-recorded pacing history. Optional — absent for legacy
+     * interviews and for sessions that never ran the timer. */
+    phaseTimeline?: PhaseTimeline;
+    /** Set when the candidate is currently being offered the next phase. */
+    pendingPhaseTransition?: { toLabel: string };
+    /** Problem-level narrative. Supplies the stall ladder; `framingScript` is
+     * used by the welcome message, not here. */
+    narrative?: ProblemNarrative | null;
   }
 ) => {
   const drill =
@@ -754,23 +1331,54 @@ Hard/Staff drilling rule: Parse sceneJson. Identify ONE component the candidate 
     (c) => c.visibility === "hidden" && !discoveredIds.has(c.id)
   );
 
+  const anyNudges = undiscoveredHidden.some((c) => c.progressiveNudges);
   const undiscoveredBlock =
     undiscoveredHidden.length > 0
       ? "\n\nUndiscovered HIDDEN expectations (do not paste these texts at the candidate; use them to shape probes per the coaching rule):\n" +
         undiscoveredHidden
           .map((c) => {
+            // Ordered nudges beat flat hints for coaching, because the coaching
+            // rules act on ONE criterion at a time and need somewhere to go if
+            // the gentle version doesn't land.
+            const nudges = c.progressiveNudges
+              ? `\n    nudges (gentle -> sharp, escalate across turns): 1. ${c.progressiveNudges[0]} | 2. ${c.progressiveNudges[1]} | 3. ${c.progressiveNudges[2]}`
+              : "";
             const hints =
               c.discoveryHints && c.discoveryHints.length > 0
                 ? `\n    hints: ${c.discoveryHints.join(" | ")}`
                 : "";
-            return `- id=${c.id} (${c.importance}, ${c.dimension})\n    expectation: ${c.text}${hints}`;
+            return `- id=${c.id} (${c.importance}, ${c.dimension})\n    expectation: ${c.text}${nudges}${hints}`;
           })
-          .join("\n")
+          .join("\n") +
+        (anyNudges
+          ? "\nNudge escalation rule: start at nudge 1 for a given expectation. Move to nudge 2 only if the candidate stays on that same topic in a later turn without surfacing it, and to nudge 3 only after that. Never emit two nudges for the same expectation in one turn, and never skip ahead — a sharp nudge used first gives the answer away. Where an expectation has no nudges, use its hints instead."
+          : "")
       : criteria.length > 0
         ? "\n\nAll hidden expectations have already been surfaced. Do not invent new ones; probe the design itself."
         : "";
 
   const playbookBlock = formatPlaybookBlock(scope?.playbook, scope?.currentPhaseId);
+  const timelineBlock = formatPhaseTimelineBlock(scope?.phaseTimeline);
+  // A transition is on the table, so the useful move is to land the current
+  // thread — opening a new line of questioning here would either be abandoned
+  // a turn later or push the candidate to dismiss the offer.
+  // Distinct from per-criterion coaching: those target ONE undiscovered
+  // expectation, this is for a candidate who has stalled on the design as a
+  // whole and needs the problem itself to push back.
+  const reveals = scope?.narrative?.progressiveReveals;
+  const stallLadderBlock = reveals
+    ? [
+        "",
+        "STALL LADDER FOR THIS PROBLEM (private). Use ONLY when the candidate is stuck on the design as a whole — not to chase a single missing expectation, which the coaching rule above already covers:",
+        `  1. (scale) ${reveals[0]}`,
+        `  2. (failure) ${reveals[1]}`,
+        `  3. (debug/ops) ${reveals[2]}`,
+        "Rules: at most ONE rung per turn; always in order; never skip ahead. Rung 3 assumes the design already survived rungs 1 and 2, so using it early wastes it. If the candidate is making progress, do not use the ladder at all."
+      ].join("\n")
+    : "";
+  const transitionBlock = scope?.pendingPhaseTransition
+    ? `\n\nThe candidate is currently being offered the move to "${scope.pendingPhaseTransition.toLabel}". Close out the thread you are on: summarise what you have from it in a sentence, then hand over with a natural transition ("that covers X — want to move on to ${scope.pendingPhaseTransition.toLabel}?"). Do NOT open a new line of questioning this turn, and do not advance the phase yourself — the candidate decides.`
+    : "";
 
   return `You are a system design interviewer running a live mock interview. You play TWO roles in the same voice:
 1. The **product owner / hiring manager** who owns the spec. When the candidate asks clarifying questions about scope, users, features, scale, latency, consistency, or any product behavior, you have the answer and you give it. Pick a reasonable v1 grounded in the problem statement, constraints, and difficulty, and state it as a decision.
@@ -797,7 +1405,7 @@ Formatting rule:
 
 ${STYLE_BY_LEVEL[level]}
 
-${COACHING_RULES_BY_LEVEL[level]}${undiscoveredBlock}${playbookBlock}
+${COACHING_RULES_BY_LEVEL[level]}${undiscoveredBlock}${playbookBlock}${stallLadderBlock}${timelineBlock}${transitionBlock}
 
 The candidate already received an opening message explaining this problem's **custom phase list**, tabs, phase bar, and board. Do not repeat the full UI tour unless they clearly lost track; a one-line reminder is enough.
 Each problem has its own interview phases (labels and durations), not a fixed template. Use workspace context currentPhase to align questions; if they're in the wrong stage for what they're doing, redirect gently.

@@ -33,6 +33,21 @@ export class ProblemsController {
     return this.problemsService.backfillEstimationSpecs({ force: force === "true" });
   }
 
+  /** Adds the interviewer-facing narrative (framing script, signature
+   * challenge, stall ladder) to problems generated before it existed.
+   * `?force=true` also refreshes problems that already have one. */
+  /** Infers the role archetype for problems generated before tracks existed.
+   * Problems the classifier is unsure about stay unspecified. */
+  @Post("backfill-tracks")
+  backfillTracks() {
+    return this.problemsService.backfillTracks();
+  }
+
+  @Post("backfill-narrative")
+  backfillNarrative(@Query("force") force?: string) {
+    return this.problemsService.backfillNarrative({ force: force === "true" });
+  }
+
   @Post("backfill-interview-plans")
   backfillInterviewPlans() {
     return this.problemsService.backfillInterviewPlans();
@@ -44,9 +59,12 @@ export class ProblemsController {
   }
 
   /* Static paths after list(); dynamic :id routes — put more specific :id/... first */
+  /** `?interviewId=` builds the answer from that interview's live scope and
+   * rubric, so it cannot contradict the grade. Without it, behaviour is the
+   * generic per-problem reference. */
   @Get(":id/reference")
-  async reference(@Param("id") id: string) {
-    return this.problemsService.getReference(id);
+  async reference(@Param("id") id: string, @Query("interviewId") interviewId?: string) {
+    return this.problemsService.getReference(id, interviewId);
   }
 
   @Get(":id")

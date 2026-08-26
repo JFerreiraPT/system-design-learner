@@ -36,6 +36,69 @@
       "when": 1777980800000,
       "tag": "0004_solutions_input_hash",
       "breakpoints": false
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1777980900000,
+      "tag": "0005_interview_phase_events",
+      "breakpoints": false
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1777981000000,
+      "tag": "0006_interview_debrief",
+      "breakpoints": false
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1777981100000,
+      "tag": "0007_phase_transition_proposal",
+      "breakpoints": false
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1777981200000,
+      "tag": "0008_problem_narrative",
+      "breakpoints": false
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1777981300000,
+      "tag": "0009_interview_reference",
+      "breakpoints": false
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1777981400000,
+      "tag": "0010_problem_track",
+      "breakpoints": false
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1777981500000,
+      "tag": "0011_interview_criteria_level",
+      "breakpoints": false
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1777981600000,
+      "tag": "0012_tutor_interview_link",
+      "breakpoints": false
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1777981700000,
+      "tag": "0013_problem_seeded_rubric",
+      "breakpoints": false
     }
   ]
 }

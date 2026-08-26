@@ -3,6 +3,9 @@
 **Area:** Flow · **Priority:** P1 · **Size:** S · **Depends on:** 08
 **Labels:** `agent-ready`, `flow`, `api`, `web`
 
+> **Status: DONE.** `evaluatePhaseTransition` in `@sdl/shared` — deterministic, **no extra LLM call** (asserted in `interview.service.test.ts`). Stored in `interviews.pending_phase_proposal_json` with the resolved-phase set, surfaced as a keyboard-accessible banner in `PhaseRibbon`. Never auto-advances. Timer now starts with the interview.
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 The kit is explicit about pacing ownership:

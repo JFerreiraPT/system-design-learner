@@ -3,6 +3,10 @@
 **Area:** Exercises · **Priority:** P2 · **Size:** S · **Depends on:** —
 **Labels:** `agent-ready`, `exercises`, `api`, `config`
 
+> **Status: DONE.** `apps/api/src/ai/ai.models.ts` owns every model id; no literal remains (`grep 'openai("'` is empty). `problemGeneration` and `criteriaGeneration` moved to `gpt-4o`; everything else keeps its previous effective model. `.env.example` documents all ten keys; garbage values fall back rather than throwing.
+> Cost: `generateProblem` runs once per problem and `generateCriteria` once per interview start, both then cached — a few calls per practice session against a per-turn chat volume already on `gpt-4o`.
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 The model assignment is inverted relative to leverage. Current state

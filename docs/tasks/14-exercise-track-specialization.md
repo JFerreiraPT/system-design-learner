@@ -3,6 +3,9 @@
 **Area:** Exercises · **Priority:** P2 · **Size:** L · **Depends on:** 11
 **Labels:** `agent-ready`, `exercises`, `api`, `web`, `shared`
 
+> **Status: DONE.** `TrackSchema` + `problems.track` (nullable); `TRACK_CONTEXT_SNIPPETS` with the four-slot structure and a non-empty *avoid* list per track. Difficulty owns breadth, track owns subject, and the tie-break is stated in the prompt. Omitting the track leaves the prompt byte-identical (asserted). Selector + filter + badges on the dashboard and the Problem rail; `POST /problems/backfill-tracks` leaves unsure problems `NULL`. No new score dimensions.
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 Problems vary along **one** axis: `difficulty`

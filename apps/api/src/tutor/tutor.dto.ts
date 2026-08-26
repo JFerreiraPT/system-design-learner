@@ -5,6 +5,7 @@ import { ValidatedDto } from "../common/validated.dto.js";
 export class StartTutorSessionDto extends ValidatedDto<typeof TutorStartSchema> {
   static schema = TutorStartSchema;
   declare title?: string;
+  declare interviewId?: string;
 }
 
 export class TutorMessageDto extends ValidatedDto<typeof TutorMessageSchema> {

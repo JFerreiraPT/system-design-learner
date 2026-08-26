@@ -7,12 +7,91 @@ export type Difficulty = z.infer<typeof DifficultySchema>;
 export const InterviewerLevelSchema = z.enum(["guided", "standard", "hard", "staff"]);
 export type InterviewerLevel = z.infer<typeof InterviewerLevelSchema>;
 
+/** Role archetype a problem is written for.
+ *
+ * Difficulty says how hard; track says what KIND of design. The two compose:
+ * difficulty owns breadth, track owns subject. Entirely optional — `null`
+ * means "unspecified" and reproduces the pre-track behaviour exactly. */
+export const TrackSchema = z.enum([
+  "backend",
+  "frontend",
+  "fullstack",
+  "devops",
+  "ai-engineering"
+]);
+export type Track = z.infer<typeof TrackSchema>;
+
+/** Stable UI wording per track. Never model-generated. */
+export const TRACK_LABELS: Record<Track, string> = {
+  backend: "Backend",
+  frontend: "Frontend",
+  fullstack: "Fullstack",
+  devops: "DevOps",
+  "ai-engineering": "AI engineering"
+};
+
+/** Tolerant read of `problems.track`. Anything unrecognised (including the
+ * `NULL` on every problem that predates the column) is "unspecified". */
+export function getTrack(value: unknown): Track | null {
+  const parsed = TrackSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+/** Interviewer-facing narrative layer for a problem.
+ *
+ * `statement` is the terse written spec on the Problem rail and serves that
+ * role well; it makes a poor opening line and says nothing about where the
+ * problem is actually hard. These three fields split those jobs apart.
+ *
+ * Persisted whole in `problems.narrative_json` rather than as three scalar
+ * columns, matching `reference_json` / `estimation_spec_json`. */
+export const ProblemNarrativeSchema = z.object({
+  /** Verbatim framing the interviewer opens with — conversational, second
+   *  person, ends by handing control to the candidate. Distinct from
+   *  `statement`, which stays the terse written spec on the Problem rail. */
+  framingScript: z.string().min(80).max(900).optional(),
+  /** The one thing that makes THIS problem hard — the place a strong candidate
+   *  visibly separates. One or two sentences, names a concrete mechanism.
+   *
+   *  INTERVIEWER-PRIVATE. It is the answer to "what is this problem really
+   *  testing", so showing it to the candidate would defeat the hidden-criteria
+   *  loop the same way pasting the playbook would. */
+  signatureChallenge: z.string().min(40).max(400).optional(),
+  /** Problem-level escalation ladder, always in this order:
+   *  [0] scale nudge, [1] failure-mode nudge, [2] debug/operational nudge. */
+  progressiveReveals: z
+    .tuple([
+      z.string().min(20).max(300),
+      z.string().min(20).max(300),
+      z.string().min(20).max(300)
+    ])
+    .optional()
+});
+export type ProblemNarrative = z.infer<typeof ProblemNarrativeSchema>;
+
+/** Tolerant read of `problems.narrative_json`. Null / malformed / legacy rows
+ * all yield `null`, and every consumer treats that as "behave as before". */
+export function getProblemNarrative(value: unknown): ProblemNarrative | null {
+  if (value === null || value === undefined) return null;
+  const parsed = ProblemNarrativeSchema.safeParse(value);
+  if (!parsed.success) return null;
+  const narrative = parsed.data;
+  const empty =
+    !narrative.framingScript && !narrative.signatureChallenge && !narrative.progressiveReveals;
+  return empty ? null : narrative;
+}
+
 export const ProblemSchema = z.object({
   id: z.string().uuid().optional(),
   title: z.string(),
   statement: z.string(),
   difficulty: DifficultySchema,
   constraints: z.array(z.string()),
+  /** Optional role archetype. Absent means unspecified. */
+  track: TrackSchema.optional(),
+  /** Interviewer-facing framing / difficulty core / stall ladder. Optional:
+   * every problem generated before this existed has none. */
+  narrative: ProblemNarrativeSchema.optional(),
   /** Free-text rubric kept only for legacy rows. New problems persist
    * structured criteria on the *interview* row instead (see
    * RubricCriterionSchema + interviews.criteria_json); the validator
@@ -24,6 +103,8 @@ export const ProblemSchema = z.object({
 
 export const GenerateProblemInputSchema = z.object({
   difficulty: DifficultySchema,
+  /** Optional role archetype. Omitting it generates exactly as before. */
+  track: TrackSchema.optional(),
   topic: z
     .string()
     .trim()
@@ -86,6 +167,17 @@ export const ValidationDimensionsSchema = z.object({
 });
 export type ValidationDimensions = z.infer<typeof ValidationDimensionsSchema>;
 
+/** How the reference answer addresses one rubric criterion.
+ *
+ * This is what turns the reference from "a model answer" into "here is what
+ * covering the thing you missed looks like". Optional so references cached
+ * before it existed keep parsing. */
+export const ReferenceCriterionCoverageSchema = z.object({
+  criterionId: z.string().max(80),
+  howAddressed: z.string().max(300)
+});
+export type ReferenceCriterionCoverage = z.infer<typeof ReferenceCriterionCoverageSchema>;
+
 export const ReferenceSolutionSchema = z.object({
   summary: z.string(),
   components: z.array(
@@ -97,7 +189,11 @@ export const ReferenceSolutionSchema = z.object({
   ),
   dataFlow: z.string(),
   keyTradeoffs: z.array(z.string()),
-  deepDives: z.array(z.string())
+  deepDives: z.array(z.string()),
+  /** Present only on interview-scoped references (`?interviewId=`), where a
+   * rubric exists to map against. Ids are resolved server-side; anything
+   * unresolvable is dropped rather than rendered. */
+  criterionCoverage: z.array(ReferenceCriterionCoverageSchema).max(40).optional()
 });
 export type ReferenceSolution = z.infer<typeof ReferenceSolutionSchema>;
 
@@ -189,6 +285,86 @@ export const FlagObservationSchema = z.object({
 });
 export type FlagObservation = z.infer<typeof FlagObservationSchema>;
 
+/** How the candidate WORKED, judged from the transcript alone.
+ *
+ * The eight design dimensions are all properties of the artefact, so two
+ * candidates who produce an identical diagram score identically — even if one
+ * clarified scope for four minutes and named their own design's weak point
+ * unprompted, and the other silently drew boxes and answered when spoken to.
+ * The playbook is explicit that proactiveness is the strongest seniority
+ * signal, and the transcript to judge it from is already in hand.
+ *
+ * Reported, never scored. It is a new, uncalibrated signal, and folding it
+ * into `score` before its distribution is visible would silently re-baseline
+ * every past attempt. It does feed the debrief narrative, where a qualitative
+ * signal belongs. */
+export const ProcessAssessmentSchema = z.object({
+  /** Did they clarify before designing, or draw first and ask later? */
+  clarifiedBeforeDesigning: z.enum(["yes", "partially", "no"]),
+  /** Decided and justified, vs. listed options and moved on. The playbook's
+   *  named red flag: "we could use SQL or NoSQL, each has pros and cons…" */
+  decisiveness: z.enum([
+    "decides_and_justifies",
+    "lists_without_choosing",
+    "avoids_committing"
+  ]),
+  /** Named a weakness of their OWN design without being asked. */
+  surfacedOwnLimitations: z.boolean(),
+  /** Adjusted the design when challenged, vs. defended or ignored.
+   *  `not_tested` is the honest answer when the interviewer never challenged
+   *  an assumption — silence is not evidence of rigidity. */
+  adaptedWhenChallenged: z.enum(["yes", "partially", "not_tested", "no"]),
+  /** Who set the agenda across the session. */
+  drove: z.enum(["candidate_led", "balanced", "interviewer_led"]),
+  /** 2-4 short observations, each grounded in a quoted or paraphrased line. */
+  observations: z
+    .array(
+      z.object({
+        signal: z.string().max(240),
+        evidence: z.string().max(400)
+      })
+    )
+    .min(1)
+    .max(4)
+});
+export type ProcessAssessment = z.infer<typeof ProcessAssessmentSchema>;
+
+/** Plain-English reading of each enum value. Stable UI wording, written to the
+ * candidate in the second person — never model-generated. */
+export const PROCESS_READINGS = {
+  clarifiedBeforeDesigning: {
+    yes: "You clarified scope before designing",
+    partially: "You clarified some scope, but started designing early",
+    no: "You started designing before clarifying scope"
+  },
+  decisiveness: {
+    decides_and_justifies: "You made calls and justified them",
+    lists_without_choosing: "You listed options without choosing",
+    avoids_committing: "You avoided committing to decisions"
+  },
+  adaptedWhenChallenged: {
+    yes: "You adjusted the design when challenged",
+    partially: "You partly adjusted when challenged",
+    not_tested: "Your assumptions were never challenged",
+    no: "You defended rather than adjusted when challenged"
+  },
+  drove: {
+    candidate_led: "You drove the conversation",
+    balanced: "You and the interviewer shared the lead",
+    interviewer_led: "The interviewer led the conversation"
+  }
+} as const satisfies {
+  [K in Exclude<keyof ProcessAssessment, "surfacedOwnLimitations" | "observations">]: Record<
+    ProcessAssessment[K] & string,
+    string
+  >;
+};
+
+export const SURFACED_OWN_LIMITATIONS_READING = {
+  true: "You named a weakness of your own design unprompted",
+  false: "You did not surface limitations of your own design"
+} as const;
+
 /** Full model output stored in solutions.feedback_json after A1 */
 export const ValidationFeedbackSchema = z.object({
   /** Blended overall = designScore × w_design + discoveryScore × w_discovery. */
@@ -239,11 +415,73 @@ export const ValidationFeedbackSchema = z.object({
    * flags overlap the criteria they were written alongside, so counting both
    * would double-penalise. Absent when the interview has no playbook. */
   flagObservations: z.array(FlagObservationSchema).max(60).optional(),
+  /** How the candidate worked, from the transcript. Present only when this
+   * attempt had an interview transcript to read; never folded into any score. */
+  processAssessment: ProcessAssessmentSchema.optional(),
   strengths: z.array(z.string()).optional(),
   gaps: z.array(z.string()).optional(),
   nextSteps: z.array(z.string()).optional()
 });
 export type ValidationFeedback = z.infer<typeof ValidationFeedbackSchema>;
+
+/** Hire-style recommendation on the attempt. Mirrors the interview kit's
+ * four-way call rather than a numeric verdict, because a narrative debrief
+ * that ends in a number is just the score again. */
+export const DebriefRecommendationSchema = z.enum([
+  "strong_yes",
+  "yes",
+  "no",
+  "strong_no"
+]);
+export type DebriefRecommendation = z.infer<typeof DebriefRecommendationSchema>;
+
+/** Stable UI wording per recommendation. Never model-generated. */
+export const DEBRIEF_RECOMMENDATION_LABELS: Record<DebriefRecommendation, string> = {
+  strong_yes: "Strong pass",
+  yes: "Pass",
+  no: "Not yet",
+  strong_no: "Well below bar"
+};
+
+/** One thing to go practise, and why. */
+export const DebriefStudyItemSchema = z.object({
+  topic: z.string().max(120),
+  why: z.string().max(300),
+  suggestedNextProblem: z.string().max(160).optional()
+});
+export type DebriefStudyItem = z.infer<typeof DebriefStudyItemSchema>;
+
+/** The written close-out for a finished interview.
+ *
+ * Shaped like a real interviewer's written debrief — one headline signal, then
+ * narrative, then what to do about it. Every bullet is required by the prompt
+ * to be traceable to something observable (a diagram element, a quoted line, a
+ * criterion id), which is the whole difference between a debrief and a vibe.
+ *
+ * Persisted once on `interviews.debrief_json`; ending an already-completed
+ * interview returns the stored copy rather than paying for a new one. */
+export const InterviewDebriefSchema = z.object({
+  /** The kit's "STRONGEST SIGNAL (one sentence)". */
+  strongestSignal: z.string().max(300),
+  recommendation: DebriefRecommendationSchema,
+  whatWentWell: z.array(z.string().max(400)).min(1).max(6),
+  whereTheyStruggled: z.array(z.string().max(400)).max(6),
+  riskAreas: z.array(z.string().max(400)).max(4),
+  /** Ordered, concrete practice suggestions — this is a learning tool, so the
+   *  debrief ends with what to do next, not with a verdict. */
+  studyPlan: z.array(DebriefStudyItemSchema).max(5),
+  generatedAt: z.string()
+});
+export type InterviewDebrief = z.infer<typeof InterviewDebriefSchema>;
+
+/** Tolerant read of `interviews.debrief_json`. Returns null for legacy rows
+ * and for anything that no longer matches the schema, so a shape change can
+ * never break the Validate tab. */
+export function getInterviewDebrief(value: unknown): InterviewDebrief | null {
+  if (value === null || value === undefined) return null;
+  const parsed = InterviewDebriefSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
 
 /** Timer strip: phase order and suggested duration (from problem-specific interview plan). */
 export const PhaseDefinitionSchema = z.object({
@@ -313,12 +551,276 @@ export const DEFAULT_INTERVIEW_PLAN: InterviewPlan = {
       durationSec: 5 * 60,
       candidateGuide:
         "Stress-test decisions. **Interact with:** **Board** — mark alternatives or limits (e.g. consistency vs latency). **Interviewer** tab — compare options and failure modes. When you want structured feedback on the full attempt, use **Validate** (separate from this chat)."
+    },
+    {
+      id: "wrap_up",
+      label: "Wrap-up",
+      durationSec: 4 * 60,
+      candidateGuide:
+        "Close the loop yourself. **Interact with:** **Interviewer** tab — summarise your design in a few sentences, then answer two questions unprompted: what would you change at **10× scale**, and what would you **tackle next** if this were the real system? **Validate** for the score, then **End interview** to get your written debrief."
     }
   ]
 };
 
 /** @deprecated use `timerPhasesFromPlan(DEFAULT_INTERVIEW_PLAN)` or the problem's plan */
 export const WORKSPACE_PHASES: PhaseDefinition[] = timerPhasesFromPlan(DEFAULT_INTERVIEW_PLAN);
+
+/** Fraction of a phase's suggested budget after which the interviewer offers
+ * to move on. Deliberately below 1: the useful moment to ask "ready?" is
+ * shortly BEFORE the budget runs out, not after it already has. */
+export const PHASE_TRANSITION_BUDGET_RATIO = 0.8;
+
+/** A candidate-confirmed offer to advance to the next phase.
+ *
+ * Modelled on `ConstraintProposalSchema`: the system proposes, the candidate
+ * decides. Phase order is the candidate's to own — auto-advancing would take
+ * away the one pacing decision the exercise is trying to teach. */
+export const PhaseTransitionProposalSchema = z.object({
+  id: z.string().min(1).max(120),
+  fromPhaseId: z.string().min(1).max(40),
+  fromPhaseIndex: z.number().int().nonnegative(),
+  toPhaseId: z.string().min(1).max(40),
+  toPhaseIndex: z.number().int().nonnegative(),
+  /** Label of the phase being offered, so the banner needs no plan lookup. */
+  toLabel: z.string().min(1).max(80),
+  /** Which rule fired. `time` = past `PHASE_TRANSITION_BUDGET_RATIO` of the
+   * suggested budget; `coverage` = everything this phase probes has already
+   * been surfaced. */
+  reason: z.enum(["time", "coverage"]),
+  createdAt: z.string()
+});
+export type PhaseTransitionProposal = z.infer<typeof PhaseTransitionProposalSchema>;
+
+/** Contents of `interviews.pending_phase_proposal_json`.
+ *
+ * Holds the single live proposal plus the phases the candidate has already
+ * answered for. Both belong together: without the resolved set, "Stay here"
+ * would be re-asked on the very next turn, which is exactly the nagging the
+ * one-per-phase rule exists to prevent. */
+export const PhaseProposalStateSchema = z.object({
+  /** At most one live proposal — the candidate can only advance one phase at a
+   * time, and two competing banners would just be noise. */
+  pending: PhaseTransitionProposalSchema.nullable(),
+  resolvedPhaseIds: z.array(z.string().min(1).max(40)).max(64)
+});
+export type PhaseProposalState = z.infer<typeof PhaseProposalStateSchema>;
+
+export const EMPTY_PHASE_PROPOSAL_STATE: PhaseProposalState = {
+  pending: null,
+  resolvedPhaseIds: []
+};
+
+/** Tolerant read of the column. Legacy rows are `null`; anything unparseable
+ * degrades to "no proposal, nothing resolved" rather than throwing. */
+export function getPhaseProposalState(value: unknown): PhaseProposalState {
+  if (value === null || value === undefined) return EMPTY_PHASE_PROPOSAL_STATE;
+  const parsed = PhaseProposalStateSchema.safeParse(value);
+  return parsed.success ? parsed.data : EMPTY_PHASE_PROPOSAL_STATE;
+}
+
+/**
+ * Decide whether to offer a phase transition. Deterministic and LLM-free —
+ * this runs after every interviewer turn, and paying for a model call to
+ * answer "has the clock passed 80%?" would be absurd.
+ *
+ * Returns `null` (no proposal) unless ALL of these hold:
+ *   1. the candidate is past `PHASE_TRANSITION_BUDGET_RATIO` of this phase's
+ *      suggested budget, OR every non-stretch criterion this phase probes has
+ *      already been surfaced;
+ *   2. the current phase is not the last one;
+ *   3. nothing is pending, and this phase has not already been answered for.
+ *
+ * The coverage arm needs at least one matching criterion to fire, so a legacy
+ * interview with no rubric falls back to the time rule instead of proposing on
+ * the first turn.
+ */
+export function evaluatePhaseTransition(input: {
+  plan: InterviewPlan;
+  phase: { id: string; index: number; elapsedSec: number; durationSec: number };
+  state: PhaseProposalState;
+  criteria?: RubricCriterion[] | null;
+  playbook?: InterviewerPlaybook | null;
+  /** ISO timestamp for the created proposal. */
+  now: string;
+  /** Stable id for the created proposal. */
+  id: string;
+}): PhaseTransitionProposal | null {
+  const { plan, phase, state } = input;
+
+  if (state.pending) return null;
+  if (state.resolvedPhaseIds.includes(phase.id)) return null;
+
+  const next = plan.phases[phase.index + 1];
+  if (!next) return null;
+  // A stale client index pointing at a different phase means we cannot trust
+  // the pacing numbers either — say nothing rather than offer the wrong move.
+  const current = plan.phases[phase.index];
+  if (!current || current.id !== phase.id) return null;
+
+  const budget = phase.durationSec > 0 ? phase.durationSec : current.durationSec;
+  const pastBudget =
+    budget > 0 && phase.elapsedSec >= Math.floor(budget * PHASE_TRANSITION_BUDGET_RATIO);
+
+  const reason: PhaseTransitionProposal["reason"] | null = pastBudget
+    ? "time"
+    : phaseCoverageComplete(phase.id, input.criteria, input.playbook)
+      ? "coverage"
+      : null;
+  if (!reason) return null;
+
+  return {
+    id: input.id,
+    fromPhaseId: phase.id,
+    fromPhaseIndex: phase.index,
+    toPhaseId: next.id,
+    toPhaseIndex: phase.index + 1,
+    toLabel: next.label,
+    reason,
+    createdAt: input.now
+  };
+}
+
+/** True when every non-stretch criterion the playbook maps to this phase has
+ * been surfaced. False when the mapping yields nothing — "no expectations" is
+ * not the same as "all expectations met". */
+function phaseCoverageComplete(
+  phaseId: string,
+  criteria: RubricCriterion[] | null | undefined,
+  playbook: InterviewerPlaybook | null | undefined
+): boolean {
+  if (!criteria?.length || !playbook) return false;
+
+  const wanted = new Set<string>();
+  for (const area of playbook.areasToProbe) {
+    if (!area.phaseRefs.includes(phaseId)) continue;
+    for (const id of area.criterionRefs) wanted.add(id);
+  }
+  if (wanted.size === 0) return false;
+
+  const relevant = criteria.filter((c) => wanted.has(c.id) && c.importance !== "stretch");
+  if (relevant.length === 0) return false;
+
+  return relevant.every((c) => Boolean(c.discoveredVia));
+}
+
+/** Kind of a recorded phase transition.
+ *
+ * `enter` / `exit` bracket the time spent in a phase; `reset` marks the point
+ * where the candidate cleared the timer, so anything recorded before it is no
+ * longer part of the live timeline. */
+export const PhaseEventKindSchema = z.enum(["enter", "exit", "reset"]);
+export type PhaseEventKind = z.infer<typeof PhaseEventKindSchema>;
+
+/** Upper bound the server clamps a client-reported `elapsedSec` to (24h).
+ * The timer is pausable and lives in the browser, so the value is advisory
+ * telemetry — clamping keeps one absurd report from distorting the timeline. */
+export const MAX_PHASE_ELAPSED_SEC = 86_400;
+
+/** Body of `POST /interviews/:id/phase-events`.
+ *
+ * `elapsedSec` is deliberately unbounded here: the server clamps it (see
+ * `clampPhaseElapsedSec`) rather than rejecting the request, because dropping
+ * telemetry is worse than storing a capped number. */
+export const PhaseEventInputSchema = z.object({
+  phaseId: z.string().min(1).max(40),
+  phaseIndex: z.number().int().nonnegative().max(1000),
+  kind: PhaseEventKindSchema,
+  elapsedSec: z.number().default(0)
+});
+export type PhaseEventInput = z.infer<typeof PhaseEventInputSchema>;
+
+/** Clamp a client-reported elapsed value into `[0, MAX_PHASE_ELAPSED_SEC]`.
+ * Non-finite input becomes 0 so a corrupt payload can never poison the sum. */
+export function clampPhaseElapsedSec(value: unknown): number {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(MAX_PHASE_ELAPSED_SEC, Math.max(0, Math.round(n)));
+}
+
+export const PhaseTimelineEntrySchema = z.object({
+  phaseId: z.string().min(1).max(40),
+  label: z.string().min(1).max(80),
+  /** Suggested budget from the interview plan. 0 for a phase that appears in
+   * the event log but not in the plan (the plan changed since the session). */
+  budgetSec: z.number().int().nonnegative(),
+  actualSec: z.number().int().nonnegative(),
+  overBudget: z.boolean()
+});
+export type PhaseTimelineEntry = z.infer<typeof PhaseTimelineEntrySchema>;
+
+export const PhaseTimelineSchema = z.object({
+  phases: z.array(PhaseTimelineEntrySchema),
+  totalSec: z.number().int().nonnegative(),
+  completed: z.boolean()
+});
+export type PhaseTimeline = z.infer<typeof PhaseTimelineSchema>;
+
+/**
+ * Reduce an append-only phase-event log into per-phase actual vs budget.
+ *
+ * Every event carries the client's accumulated seconds for that phase at the
+ * moment it fired, so the time actually spent in a phase is the LARGEST value
+ * ever reported for it — `enter` reports 0, `exit` reports the total. Taking
+ * the max (rather than differencing timestamps) is what makes a pausable,
+ * browser-owned timer reducible at all.
+ *
+ * A `reset` discards everything recorded before it: the candidate explicitly
+ * cleared the clock, so pre-reset numbers no longer describe the session.
+ *
+ * Pure and plan-driven: every plan phase is emitted, so an interview with zero
+ * events yields the full phase list at `actualSec: 0`.
+ */
+export function buildPhaseTimeline(input: {
+  plan: InterviewPlan;
+  /** Chronological (oldest first). */
+  events: Array<{ phaseId: string; kind: PhaseEventKind; elapsedSec: number }>;
+  completed: boolean;
+}): PhaseTimeline {
+  const lastReset = input.events.reduce(
+    (acc, event, index) => (event.kind === "reset" ? index : acc),
+    -1
+  );
+  const live = input.events.slice(lastReset + 1);
+
+  const maxByPhase = new Map<string, number>();
+  for (const event of live) {
+    const seconds = clampPhaseElapsedSec(event.elapsedSec);
+    const previous = maxByPhase.get(event.phaseId) ?? 0;
+    if (seconds > previous) maxByPhase.set(event.phaseId, seconds);
+    else if (!maxByPhase.has(event.phaseId)) maxByPhase.set(event.phaseId, previous);
+  }
+
+  const planIds = new Set(input.plan.phases.map((p) => p.id));
+  const entries: PhaseTimelineEntry[] = input.plan.phases.map((phase) => {
+    const actualSec = maxByPhase.get(phase.id) ?? 0;
+    return {
+      phaseId: phase.id,
+      label: phase.label,
+      budgetSec: phase.durationSec,
+      actualSec,
+      overBudget: actualSec > phase.durationSec
+    };
+  });
+
+  // Phases recorded against a plan that has since changed still happened, so
+  // they stay in the timeline (budget unknown -> 0, never "over budget").
+  for (const [phaseId, actualSec] of maxByPhase) {
+    if (planIds.has(phaseId)) continue;
+    entries.push({
+      phaseId,
+      label: phaseId,
+      budgetSec: 0,
+      actualSec,
+      overBudget: false
+    });
+  }
+
+  return {
+    phases: entries,
+    totalSec: entries.reduce((sum, entry) => sum + entry.actualSec, 0),
+    completed: input.completed
+  };
+}
 
 /** AI-generated estimation checklist for a specific problem */
 /** Unit family for a numeric estimation field. Values are ALWAYS stored in the
@@ -725,6 +1227,97 @@ export function getRubricPlaybook(value: unknown): InterviewerPlaybook | null {
   return null;
 }
 
+/** Interviewer levels from most forgiving to most demanding.
+ *
+ * The order is load-bearing for rubric projection: a criterion hidden at one
+ * level must stay hidden at every level above it, so hidden counts grow
+ * monotonically with level. */
+export const INTERVIEWER_LEVEL_ORDER = ["guided", "standard", "hard", "staff"] as const;
+
+function levelRank(level: InterviewerLevel): number {
+  return INTERVIEWER_LEVEL_ORDER.indexOf(level);
+}
+
+/**
+ * One criterion in a hand-authored rubric, before it is bound to a level.
+ *
+ * Identical to `RubricCriterionSchema` except that `visibility` is replaced by
+ * `hiddenFrom`. That swap is the whole idea: interviewer level changes exactly
+ * one thing about a rubric — which expectations the candidate must DISCOVER
+ * rather than read off the Problem rail (see `LEVEL_HIDDEN_GUIDANCE` in
+ * @sdl/ai-prompts, the only place level enters rubric generation). So instead
+ * of storing four near-duplicate rubrics per problem and letting them drift, we
+ * store one and record, per criterion, the level at which it goes hidden.
+ */
+export const SeededRubricCriterionSchema = RubricCriterionSchema.omit({
+  visibility: true,
+  discoveredVia: true
+}).extend({
+  /** Earliest level at which this criterion is hidden; it stays hidden at every
+   * level above. Omitted means always visible — appropriate when a seed
+   * constraint already spells the expectation out, so there is nothing to
+   * discover at any level. */
+  hiddenFrom: InterviewerLevelSchema.optional()
+});
+export type SeededRubricCriterion = z.infer<typeof SeededRubricCriterionSchema>;
+
+/** A hand-authored rubric: one canonical criteria set plus the playbook,
+ * projected to a concrete `InterviewRubric` per level at interview start. */
+export const SeededRubricSchema = z.object({
+  criteria: z.array(SeededRubricCriterionSchema).min(1).max(40),
+  playbook: InterviewerPlaybookSchema
+});
+export type SeededRubric = z.infer<typeof SeededRubricSchema>;
+
+/** Tolerant read of `problems.seeded_rubric_json`. Null / malformed / absent
+ * all yield `null`, and callers fall back to generating a rubric — so a shape
+ * change can never block an interview from starting. */
+export function getSeededRubric(value: unknown): SeededRubric | null {
+  if (value === null || value === undefined) return null;
+  const parsed = SeededRubricSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+/** Whether a canonical criterion is hidden at `level`. */
+export function isHiddenAtLevel(criterion: SeededRubricCriterion, level: InterviewerLevel): boolean {
+  return criterion.hiddenFrom !== undefined && levelRank(level) >= levelRank(criterion.hiddenFrom);
+}
+
+/**
+ * Bind a hand-authored rubric to one interviewer level.
+ *
+ * Produces exactly what `AiService.generateCriteria` would have, so every
+ * downstream consumer — validator, interviewer prompt, discovery matcher,
+ * the Problem rail indicator — cannot tell the difference. That includes
+ * pre-marking `visible` criteria as discovered via `seed`, which is what stops
+ * the rail claiming the candidate must "find" a bullet they can already read.
+ *
+ * `now` is passed in rather than read from the clock so callers stay testable.
+ */
+export function projectRubricForLevel(
+  rubric: SeededRubric,
+  level: InterviewerLevel,
+  now: string
+): InterviewRubric {
+  return {
+    playbook: rubric.playbook,
+    criteria: rubric.criteria.map(({ hiddenFrom: _hiddenFrom, ...rest }) => {
+      const hidden = isHiddenAtLevel({ ...rest, hiddenFrom: _hiddenFrom }, level);
+      return {
+        ...rest,
+        visibility: hidden ? ("hidden" as const) : ("visible" as const),
+        ...(hidden ? {} : { discoveredVia: { kind: "seed" as const, at: now } })
+      };
+    })
+  };
+}
+
+/** Hidden-criteria count a projection yields at `level`. Used by seed
+ * validation to check every level against the difficulty's discovery floor. */
+export function hiddenCountAtLevel(rubric: SeededRubric, level: InterviewerLevel): number {
+  return rubric.criteria.filter((c) => isHiddenAtLevel(c, level)).length;
+}
+
 /** Live pacing info for the current interview phase so AI assistants can
  * gauge how the candidate is doing against the suggested budget. */
 export const PhaseRuntimeInfoSchema = z.object({
@@ -778,7 +1371,14 @@ export const InterviewStartSchema = z.object({
 });
 
 export const InterviewPatchSchema = z.object({
-  interviewerLevel: InterviewerLevelSchema
+  interviewerLevel: InterviewerLevelSchema,
+  /** Regenerate the rubric for the new level in the same request.
+   *
+   * The level determines the hidden/visible split, so changing it without
+   * regenerating leaves the interviewer coaching at one level against a rubric
+   * built for another. Absent / false keeps today's behaviour — the candidate
+   * decides, because regenerating resets discovery progress. */
+  regenerateCriteria: z.boolean().optional()
 });
 
 export const InterviewMessageSchema = z.object({
@@ -796,8 +1396,38 @@ export const ApplyProposalInputSchema = z.object({
 });
 
 export const TutorStartSchema = z.object({
-  title: z.string().min(1).max(100).optional()
+  title: z.string().min(1).max(100).optional(),
+  /** Interview this tutor session belongs to, when it was opened from a
+   * workspace with a live interview. Absent for standalone tutor use from the
+   * Tutor page, which is unrelated to any interview. */
+  interviewId: z.string().uuid().optional()
 });
+
+/** Factual record of tutor consultation during one interview.
+ *
+ * Using the tutor is often the RIGHT move — it is why the tutor exists — so
+ * this is never a penalty and never gates anything. The problem it solves is
+ * that a high score with heavy tutor use means something different from a high
+ * score without it, and reviewing your own progress weeks later you cannot
+ * currently tell those apart. */
+export const TutorUsageSchema = z.object({
+  sessions: z.number().int().nonnegative(),
+  /** Candidate turns only — the tutor's own replies are not "usage". */
+  candidateTurns: z.number().int().nonnegative(),
+  /** Phase label the tutor was first opened in, resolved from the phase-event
+   * log. Null when the timer was never running, or on legacy interviews. */
+  firstUsedAtPhase: z.string().max(80).nullable(),
+  /** Up to five short topic labels, summarised once per session and cached. */
+  topics: z.array(z.string().max(60)).max(5)
+});
+export type TutorUsage = z.infer<typeof TutorUsageSchema>;
+
+export const EMPTY_TUTOR_USAGE: TutorUsage = {
+  sessions: 0,
+  candidateTurns: 0,
+  firstUsedAtPhase: null,
+  topics: []
+};
 
 export const TutorMessageSchema = z.object({
   content: z.string().min(1),

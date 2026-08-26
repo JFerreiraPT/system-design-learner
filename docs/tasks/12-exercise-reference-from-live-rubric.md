@@ -3,6 +3,9 @@
 **Area:** Exercises · **Priority:** P2 · **Size:** S · **Depends on:** 10 (soft)
 **Labels:** `agent-ready`, `exercises`, `api`
 
+> **Status: DONE.** `GET /problems/:id/reference?interviewId=` builds from live constraints + the full rubric + `signatureChallenge`, cached on the new `interviews.reference_json`; without the parameter the prompt is byte-identical to before (asserted). `criterionCoverage` ids are resolved server-side and unresolvable ones dropped; the Validate tab pairs each missed criterion with its coverage line.
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 The reference solution and the grade disagree, and the candidate sees both.

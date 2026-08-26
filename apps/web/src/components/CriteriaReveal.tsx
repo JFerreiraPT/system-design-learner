@@ -22,6 +22,10 @@ type Props = {
    * outcomes to each criterion row. Optional — without it the reveal still
    * shows the rubric, just with no per-criterion verdict. */
   feedback?: ValidationFeedback | null;
+  /** From the interview-scoped reference answer. Shown ONLY under criteria the
+   * candidate missed: "here is what you missed" next to "here is what covering
+   * it looks like" is the highest-value pairing in the whole panel. */
+  criterionCoverage?: Array<{ criterionId: string; howAddressed: string }>;
 };
 
 /** Post-validate reveal of the per-interview rubric.
@@ -35,7 +39,7 @@ type Props = {
  * Hidden criteria the candidate never surfaced are flagged with a "never
  * asked" pill — the reveal is the moment the candidate sees what they
  * didn't think to ask about, which is the whole point of the hidden tier. */
-export function CriteriaReveal({ criteria, feedback }: Props) {
+export function CriteriaReveal({ criteria, feedback, criterionCoverage }: Props) {
   const [showStretch, setShowStretch] = useState(false);
 
   const rows = useMemo(() => {
@@ -43,6 +47,11 @@ export function CriteriaReveal({ criteria, feedback }: Props) {
       compareCriterionRows
     );
   }, [criteria, feedback?.criteriaEvaluations]);
+
+  const coverageById = useMemo(
+    () => new Map((criterionCoverage ?? []).map((c) => [c.criterionId, c.howAddressed] as const)),
+    [criterionCoverage]
+  );
 
   if (rows.length === 0) {
     return (
@@ -76,7 +85,11 @@ export function CriteriaReveal({ criteria, feedback }: Props) {
 
       <ul className="space-y-1.5">
         {visibleRows.map((row) => (
-          <CriterionItem key={row.criterion.id} row={row} />
+          <CriterionItem
+            key={row.criterion.id}
+            row={row}
+            coverage={coverageById.get(row.criterion.id)}
+          />
         ))}
       </ul>
 
@@ -93,9 +106,12 @@ export function CriteriaReveal({ criteria, feedback }: Props) {
   );
 }
 
-function CriterionItem({ row }: { row: CriterionRow }) {
+function CriterionItem({ row, coverage }: { row: CriterionRow; coverage?: string }) {
   const { criterion: c, evaluation: ev, neverDiscovered } = row;
   const covered = ev?.covered ?? false;
+  // The gentle nudge is written as an opening question, so it reads better as a
+  // study prompt than a bare discovery hint. Hints stay the fallback.
+  const studyPrompt = c.progressiveNudges?.[0] ?? c.discoveryHints?.[0];
   const isMissedCore = c.importance === "core" && !covered;
   const containerClass = isMissedCore
     ? "border-rose-400/40 bg-rose-400/5"
@@ -150,10 +166,16 @@ function CriterionItem({ row }: { row: CriterionRow }) {
       {ev?.evidence ? (
         <p className="mt-1 text-[11px] text-fg-faint">{ev.evidence}</p>
       ) : null}
-      {!covered && c.discoveryHints && c.discoveryHints.length > 0 ? (
-        <p className="mt-1 text-[11px] italic text-fg-faint">
-          Try asking: {c.discoveryHints[0]}
+      {!covered && coverage ? (
+        <p className="mt-1 rounded border border-emerald-400/30 bg-emerald-400/[0.06] px-1.5 py-1 text-[11px] text-fg-muted">
+          <span className="font-medium text-emerald-700 dark:text-emerald-300">
+            What covering this looks like:
+          </span>{" "}
+          {coverage}
         </p>
+      ) : null}
+      {!covered && studyPrompt ? (
+        <p className="mt-1 text-[11px] italic text-fg-faint">Try asking: {studyPrompt}</p>
       ) : null}
     </li>
   );

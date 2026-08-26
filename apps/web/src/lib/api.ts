@@ -5,26 +5,92 @@ import type {
   Difficulty,
   FlagObservation,
   Importance,
+  InterviewDebrief,
+  InterviewerLevel,
   LiveConstraint,
+  PhaseProposalState,
+  PhaseTimeline,
+  ProcessAssessment,
   RubricCriterion,
   ScoreBand,
-  ScoreDimension
+  ScoreDimension,
+  Track,
+  TutorUsage
 } from "@sdl/shared";
 
 export type {
   ConstraintProposal,
   CriterionEvaluation,
+  DebriefRecommendation,
+  DebriefStudyItem,
   FlagObservation,
   Importance,
+  InterviewDebrief,
+  InterviewerLevel,
   LiveConstraint,
+  PhaseEventKind,
+  PhaseProposalState,
+  PhaseTimeline,
+  PhaseTimelineEntry,
+  PhaseTransitionProposal,
+  ProcessAssessment,
   RubricCriterion,
   ScoreBand,
-  ScoreDimension
+  ScoreDimension,
+  Track,
+  TutorUsage
 } from "@sdl/shared";
 
 export type InterviewConstraintState = {
   constraints: LiveConstraint[];
   proposals: ConstraintProposal[];
+};
+
+/** Per-phase actual vs budget, reduced server-side from the append-only phase
+ * event log. Returned by `GET /interviews/:id/phase-timeline`. */
+export type InterviewPhaseTimeline = PhaseTimeline;
+
+/** Live phase-transition offer plus the phases already answered for. Returned
+ * by `GET /interviews/:id/phase-proposal`. */
+export type InterviewPhaseProposalState = PhaseProposalState;
+
+/** Lifecycle snapshot from `GET /interviews/:id/status`. `status` is `active`
+ * until the candidate ends the interview; `debrief` is null until then (and on
+ * every legacy row). */
+export type InterviewStatus = {
+  id: string;
+  status: "active" | "completed" | string;
+  interviewerLevel: InterviewerLevel;
+  /** Level the stored rubric was generated FOR. Null on legacy rows. */
+  criteriaLevel: InterviewerLevel | null;
+  /** True only when the rubric is known to have been built for a different
+   * level. Legacy rows (`criteriaLevel: null`) always report false. */
+  rubricStale: boolean;
+  startedAt: string;
+  endedAt: string | null;
+  debrief: InterviewDebrief | null;
+};
+
+/** Factual tutor consultation record. Returned by
+ * `GET /interviews/:id/tutor-usage`; zeros when the tutor was never used. */
+export type InterviewTutorUsage = TutorUsage;
+
+/** `PATCH /interviews/:id` response. */
+export type PatchInterviewResponse = {
+  id: string;
+  interviewerLevel: InterviewerLevel;
+  criteriaLevel: InterviewerLevel | null;
+  rubricStale: boolean;
+};
+
+/** `POST /interviews/:id/end`. Idempotent — `alreadyEnded` is true when the
+ * stored debrief was returned rather than a freshly generated one. */
+export type EndInterviewResponse = {
+  id: string;
+  status: string;
+  endedAt: string | null;
+  debrief: InterviewDebrief;
+  alreadyEnded: boolean;
 };
 
 /** Progress-only view of the per-interview criteria. Returned by
@@ -91,6 +157,9 @@ export type ValidationFeedback = {
   /** Playbook green/red flags judged against this attempt. Reported only —
    * these never move the score. Absent when the interview has no playbook. */
   flagObservations?: FlagObservation[];
+  /** How the candidate worked, from the transcript. Present only on attempts
+   * that had an interview; reported, never scored. */
+  processAssessment?: ProcessAssessment;
   strengths?: string[];
   gaps?: string[];
   nextSteps?: string[];
@@ -104,7 +173,11 @@ export type Problem = {
   constraintsJson: string[];
   evaluationRubricJson: string[];
   tagsJson?: string[] | null;
+  /** Role archetype, or null for "unspecified" (every problem generated
+   * before tracks existed). */
+  track?: Track | null;
   referenceJson?: unknown;
+  narrativeJson?: unknown;
   estimationSpecJson?: unknown;
   interviewPlanJson?: unknown;
   createdAt: string;
@@ -116,6 +189,9 @@ export type ReferenceSolution = {
   dataFlow: string;
   keyTradeoffs: string[];
   deepDives: string[];
+  /** Present only on interview-scoped references. Ids are already resolved
+   * server-side against that interview's rubric. */
+  criterionCoverage?: Array<{ criterionId: string; howAddressed: string }>;
 };
 
 export type ChatMessage = {
@@ -149,41 +225,120 @@ export type ValidationRecord = {
   createdAt: string;
 };
 
+/** Thrown when a streaming endpoint fails. `status` is 0 when the request
+ * never reached the server (network/CORS). */
+export class StreamError extends Error {
+  constructor(
+    message: string,
+    readonly status: number
+  ) {
+    super(message);
+    this.name = "StreamError";
+  }
+}
+
+type StreamOptions = {
+  /** Aborts the request. The partial text already delivered via `onToken` is
+   * kept by the caller — aborting resolves normally rather than throwing. */
+  signal?: AbortSignal;
+};
+
+/** Reads a `text/event-stream` response, forwarding `{ token }` payloads.
+ *
+ * Parses SSE properly (per-line `field: value`, blank line terminates the
+ * event) instead of assuming every frame is a single `data:` line — the
+ * server also emits a terminating `event: done` frame, and a naive
+ * `startsWith("data:")` check silently swallows anything else.
+ */
 export async function streamEndpoint(
   url: string,
   payload: Record<string, unknown>,
-  onToken: (token: string) => void
+  onToken: (token: string) => void,
+  options: StreamOptions = {}
 ) {
-  const response = await fetch(`${API_BASE}${url}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${url}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: options.signal
+    });
+  } catch (err) {
+    if (options.signal?.aborted) return;
+    throw new StreamError(
+      err instanceof Error ? err.message : "Could not reach the server",
+      0
+    );
+  }
 
   if (!response.ok || !response.body) {
-    throw new Error("Failed to stream response");
+    // Error responses are plain JSON, not SSE — surface the server's message
+    // so the UI can show something better than "failed".
+    let detail = `Request failed (${response.status})`;
+    try {
+      const text = await response.text();
+      const parsed: unknown = text ? JSON.parse(text) : null;
+      const message =
+        parsed && typeof parsed === "object" && "message" in parsed
+          ? (parsed as { message: unknown }).message
+          : null;
+      if (typeof message === "string" && message) detail = message;
+      else if (Array.isArray(message) && typeof message[0] === "string") detail = message[0];
+      else if (text && !parsed) detail = text.slice(0, 200);
+    } catch {
+      // keep the status-code fallback
+    }
+    throw new StreamError(detail, response.status);
   }
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split("\n\n");
-    buffer = parts.pop() ?? "";
-
-    for (const part of parts) {
-      if (!part.startsWith("data:")) continue;
-      const raw = part.replace("data:", "").trim();
-      try {
-        const parsed = JSON.parse(raw);
-        if (parsed.token) onToken(parsed.token);
-      } catch {
-        // ignore malformed chunks
-      }
+  /** Handles one complete SSE event (the text between blank lines). */
+  const handleEvent = (raw: string) => {
+    let event = "message";
+    const dataLines: string[] = [];
+    for (const line of raw.split("\n")) {
+      if (!line || line.startsWith(":")) continue;
+      const sep = line.indexOf(":");
+      const field = sep === -1 ? line : line.slice(0, sep);
+      const value = sep === -1 ? "" : line.slice(sep + 1).replace(/^ /, "");
+      if (field === "event") event = value;
+      else if (field === "data") dataLines.push(value);
     }
+    if (event === "done" || dataLines.length === 0) return;
+    const data = dataLines.join("\n");
+    if (data === "done" || data === "[DONE]") return;
+    try {
+      const parsed = JSON.parse(data);
+      if (typeof parsed?.error === "string") throw new StreamError(parsed.error, 500);
+      // Empty-string tokens are legitimate no-ops; `typeof` avoids dropping "0".
+      if (typeof parsed?.token === "string" && parsed.token) onToken(parsed.token);
+    } catch (err) {
+      if (err instanceof StreamError) throw err;
+      // Ignore malformed chunks — a truncated frame is not worth failing over.
+    }
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      // Normalise CRLF so the frame split below works against either encoding.
+      buffer = buffer.replace(/\r\n/g, "\n");
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() ?? "";
+      for (const part of parts) handleEvent(part);
+    }
+    if (buffer.trim()) handleEvent(buffer);
+  } catch (err) {
+    // An abort mid-stream is a user action, not a failure: keep what arrived.
+    if (options.signal?.aborted) return;
+    throw err;
+  } finally {
+    void reader.cancel().catch(() => {});
   }
 }

@@ -2,9 +2,15 @@ import {
   AddConstraintInputSchema,
   InterviewMessageSchema,
   InterviewPatchSchema,
-  InterviewStartSchema
+  InterviewStartSchema,
+  PhaseEventInputSchema
 } from "@sdl/shared";
-import type { InterviewerLevel, PhaseRuntimeInfo, SceneSummary } from "@sdl/shared";
+import type {
+  InterviewerLevel,
+  PhaseEventKind,
+  PhaseRuntimeInfo,
+  SceneSummary
+} from "@sdl/shared";
 import { ValidatedDto } from "../common/validated.dto.js";
 
 export class StartInterviewDto extends ValidatedDto<typeof InterviewStartSchema> {
@@ -16,6 +22,7 @@ export class StartInterviewDto extends ValidatedDto<typeof InterviewStartSchema>
 export class PatchInterviewDto extends ValidatedDto<typeof InterviewPatchSchema> {
   static schema = InterviewPatchSchema;
   declare interviewerLevel: InterviewerLevel;
+  declare regenerateCriteria?: boolean;
 }
 
 export class InterviewMessageDto extends ValidatedDto<typeof InterviewMessageSchema> {
@@ -41,4 +48,12 @@ export class InterviewMessageDto extends ValidatedDto<typeof InterviewMessageSch
 export class AddConstraintDto extends ValidatedDto<typeof AddConstraintInputSchema> {
   static schema = AddConstraintInputSchema;
   declare text: string;
+}
+
+export class PhaseEventDto extends ValidatedDto<typeof PhaseEventInputSchema> {
+  static schema = PhaseEventInputSchema;
+  declare phaseId: string;
+  declare phaseIndex: number;
+  declare kind: PhaseEventKind;
+  declare elapsedSec: number;
 }

@@ -3,6 +3,9 @@
 **Area:** Evaluation · **Priority:** P2 · **Size:** M · **Depends on:** 01
 **Labels:** `agent-ready`, `evaluation`, `api`, `web`
 
+> **Status: DONE.** `ProcessAssessmentSchema` on `ValidationFeedbackSchema`; the prompt block is emitted **only** with a transcript (asserted byte-identical without one) and `interviewerLevel` calibrates `drove`. `sanitizeProcessAssessment` drops it entirely when there was no transcript. Scores are provably unaffected (`scoring.test.ts`). Rendered by `ProcessPanel.tsx` and fed to the debrief.
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 The playbook is unambiguous about what separates levels:

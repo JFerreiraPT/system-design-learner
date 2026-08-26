@@ -57,10 +57,22 @@ Turbo orchestrates `dev`, `build`, `lint`, and Drizzle DB tasks (`db:generate`, 
 ### Key components
 
 - `Board.tsx` — Excalidraw scene
-- `ChatPanel.tsx` — interviewer/tutor streaming chat
-- `PhaseRibbon.tsx` — interview phase progress
+- `ChatPanel.tsx` — interviewer/tutor streaming chat (read-only once the interview ends)
+- `PhaseRibbon.tsx` — phase progress + the candidate-confirmed "ready to move on?" banner
 - `EstimationPanel.tsx`, `DimensionBreakdown.tsx`
-- `WorkspaceProblemRail.tsx`, `ConfirmDialog.tsx`
+- `CriteriaReveal.tsx` — post-validate rubric reveal, paired with the reference's coverage lines
+- `FlagsPanel.tsx`, `ProcessPanel.tsx` — observed signals and how the candidate worked (reported, never scored)
+- `InterviewDebrief.tsx` — the written close-out for a completed interview
+- `WorkspaceProblemRail.tsx`, `TrackBadge.tsx`, `ConfirmDialog.tsx`
+
+### Key client libs
+
+- `lib/exportReport.ts` — the exported debrief, one formatter per section; every optional
+  section returns `null` and is dropped, so an attempt with no interview still yields a
+  valid document
+- `lib/phaseEvents.ts` — fire-and-forget pacing telemetry (never surfaces an error)
+- `lib/constraintPills.ts` — tolerates a `discoveredFromCriterionId` left dangling by a
+  rubric regeneration
 
 ## Backend (`apps/api`)
 
@@ -81,42 +93,80 @@ NestJS 11 application. `src/main.ts` bootstraps with CORS enabled, listens on po
 ### REST surface
 
 ```text
-GET  /health
-POST /problems/generate
-POST /problems/backfill-tags
-POST /problems/backfill-estimation-specs
-POST /problems/backfill-interview-plans
-GET  /problems
-GET  /problems/:id
-GET  /problems/:id/reference
-POST /solutions
-GET  /solutions
-POST /interview
-PATCH /interview/:id
-POST /interview/:id/messages         (SSE stream)
-GET  /interview/:id/messages
-POST /tutor/sessions
-GET  /tutor/sessions
-GET  /tutor/sessions/:id/messages
-POST /tutor/sessions/:id/messages    (SSE stream)
+GET   /health
+
+POST  /problems/generate                        { difficulty, topic?, track? }
+POST  /problems/backfill-tags
+POST  /problems/backfill-tracks
+POST  /problems/backfill-narrative              ?force=true
+POST  /problems/backfill-estimation-specs       ?force=true
+POST  /problems/backfill-interview-plans
+GET   /problems
+GET   /problems/:id
+GET   /problems/:id/reference                   ?interviewId=  (interview-scoped answer)
+
+POST  /solutions
+GET   /solutions
+
+POST  /interviews
+POST  /interviews/backfill-criteria
+PATCH /interviews/:id                           { interviewerLevel, regenerateCriteria? }
+POST  /interviews/:id/messages                  (SSE stream; 409 once completed)
+GET   /interviews/:id/messages
+GET   /interviews/:id/status                    lifecycle + stored debrief + rubricStale
+POST  /interviews/:id/end                       completes + persists the debrief (idempotent)
+GET   /interviews/:id/constraints
+POST  /interviews/:id/constraints
+DELETE /interviews/:id/constraints/:constraintId
+POST  /interviews/:id/proposals/:proposalId/apply
+POST  /interviews/:id/proposals/:proposalId/dismiss
+GET   /interviews/:id/tutor-usage
+GET   /interviews/:id/phase-proposal
+POST  /interviews/:id/phase-proposal/apply
+POST  /interviews/:id/phase-proposal/dismiss
+POST  /interviews/:id/phase-events              fire-and-forget pacing telemetry
+GET   /interviews/:id/phase-timeline            per-phase actual vs budget
+GET   /interviews/:id/criteria                  progress only (no hidden text)
+GET   /interviews/:id/criteria/reveal           gated on >= 1 validation
+POST  /interviews/:id/criteria/regenerate
+
+POST  /tutor/sessions                           { title?, interviewId? }
+GET   /tutor/sessions
+GET   /tutor/sessions/:id/messages
+POST  /tutor/sessions/:id/messages              (SSE stream)
 ```
 
 ### AI integration (`apps/api/src/ai/ai.service.ts`)
 
 Single integration point with OpenAI; all prompts live in `@sdl/ai-prompts`.
 
-| Method | Model | Purpose |
+Model ids are **never** literals in the service. `apps/api/src/ai/ai.models.ts` owns the
+purpose → model map, with an env override per purpose; the table below references the
+config key so it cannot drift from the code. Defaults and the reasoning behind the tiering
+live in that file.
+
+| Method | Model config key | Purpose |
 |---|---|---|
-| `generateProblem` | `gpt-4o-mini` | Full problem (title, statement, constraints, rubric, tags, estimation spec, interview plan) |
-| `validateSolution` | `gpt-4o` (multimodal) | Score scene JSON + notes + optional board PNG across 8 dimensions |
-| `generateReference` | `gpt-4o` | Reference architecture for a problem |
-| `inferTags` | `gpt-4o-mini` | Backfill 2–5 tags |
-| `inferEstimationSpec` | `gpt-4o-mini` | Per-problem estimation field spec |
-| `inferInterviewPlan` | `gpt-4o-mini` | Per-problem interview phase plan |
-| `streamInterviewer` | `gpt-4o` (multimodal) | Streamed interviewer chat (SSE) with optional board PNG + scene projection |
-| `streamTutor` | `gpt-4o-mini` (multimodal) | Streamed tutor chat (SSE) with optional board PNG + scene projection |
+| `generateProblem` | `problemGeneration` (`AI_MODEL_PROBLEM`) | Full problem: statement, constraints, tags, narrative (framing / signature challenge / stall ladder), estimation spec, interview plan |
+| `generateCriteria` | `criteriaGeneration` (`AI_MODEL_CRITERIA`) | Per-interview rubric + private interviewer playbook |
+| `validateSolution` | `validation` (`AI_MODEL_VALIDATION`) | Per-criterion judgement, dimension bars, flag observations, process assessment (multimodal) |
+| `generateReference` | `reference` (`AI_MODEL_REFERENCE`) | Reference answer; interview-scoped when given the rubric |
+| `generateDebrief` | `debrief` (`AI_MODEL_DEBRIEF`) | End-of-interview written debrief |
+| `streamInterviewer` | `interviewerChat` (`AI_MODEL_INTERVIEWER`) | Streamed interviewer chat (SSE), multimodal |
+| `streamTutor` | `tutorChat` (`AI_MODEL_TUTOR`) | Streamed tutor chat (SSE), multimodal |
+| `matchCriteriaDiscovery` | `discoveryMatch` (`AI_MODEL_DISCOVERY`) | Per-turn conservative discovery matcher |
+| `extractConstraintProposals` | `proposals` (`AI_MODEL_PROPOSALS`) | Per-turn conservative scope-change extraction |
+| `inferTags` / `inferTrack` / `inferEstimationSpec` / `inferInterviewPlan` / `inferProblemNarrative` / `summariseTutorTopics` | `backfill` (`AI_MODEL_BACKFILL`) | One-off column backfills and cached summaries |
+
+Generation quality is the highest-leverage spend: the problem and the rubric are what the
+interviewer's coaching, the discovery loop, validation and the debrief are all built on, so
+they default to the stronger tier while the per-turn matchers stay cheap.
 
 `generateObject` is used with Zod schemas to guarantee structured output; `streamText` powers the chat endpoints.
+
+Phase-transition detection is deliberately **not** an AI call — `evaluatePhaseTransition`
+(`packages/shared`) is a pure rule over data already in hand, and it runs on every
+interviewer turn.
 
 ## Data layer
 
@@ -131,9 +181,12 @@ Schema lives in `apps/api/src/db/schema.ts`. Migrations are tracked in `apps/api
 - `constraints_json` (jsonb, `string[]`)
 - `evaluation_rubric_json` (jsonb, `string[]`)
 - `tags_json` (jsonb, `string[] | null`)
-- `reference_json` (jsonb) — lazily filled with the AI reference solution
+- `track` (text, nullable) — role archetype (`TrackSchema`); `NULL` = unspecified
+- `reference_json` (jsonb) — lazily filled generic reference solution
 - `estimation_spec_json` (jsonb) — per-problem back-of-envelope field spec
 - `interview_plan_json` (jsonb) — per-problem ordered interview phases
+- `narrative_json` (jsonb) — `{ framingScript?, signatureChallenge?, progressiveReveals? }`.
+  `signatureChallenge` is **interviewer-private** and must never reach the candidate UI.
 - `generated_by_ai` (bool), `created_at` (timestamptz)
 
 **`solutions`**
@@ -146,15 +199,42 @@ Schema lives in `apps/api/src/db/schema.ts`. Migrations are tracked in `apps/api
 
 **`interviews`**
 - `id` (uuid, pk), `problem_id` → `problems.id`
-- `interviewer_level`, `status` (default `active`)
+- `interviewer_level`, `status` (`active` → `completed` via `POST /interviews/:id/end`)
+- `live_constraints_json` (jsonb) — evolving scope; soft-removals preserved
+- `pending_proposals_json` (jsonb) — AI scope-change proposals awaiting Apply / Dismiss
+- `criteria_json` (jsonb) — `{ criteria, playbook }` for this interview
+- `criteria_level` (text, nullable) — level the rubric was generated FOR; `NULL` = unknown,
+  which reports `rubricStale: false`
+- `pending_phase_proposal_json` (jsonb) — `{ pending, resolvedPhaseIds }` for the single
+  live "ready to move on?" offer
+- `reference_json` (jsonb) — interview-scoped reference answer (kept separate from the
+  per-problem cache, since rubrics differ per level)
+- `debrief_json` (jsonb) — written close-out, generated once
 - `started_at`, `ended_at`
+
+**`interview_phase_events`** (append-only pacing telemetry)
+- `id` (uuid, pk), `interview_id` → `interviews.id`
+- `phase_id`, `phase_index`, `kind` (`enter` | `exit` | `reset`)
+- `elapsed_sec` (int) — client-reported, clamped server-side to `[0, 86400]`
+- `at` (timestamptz); index on `(interview_id, at)`
+
+> The live timer stays in the browser (`localStorage`) — it is pausable and client-owned.
+> This table exists so pacing is *observable* afterwards; reduce it with
+> `buildPhaseTimeline` from `@sdl/shared`.
 
 **`interview_messages`**
 - `id` (uuid, pk), `interview_id` → `interviews.id`
 - `role`, `content`, `created_at`
 
 **`tutor_sessions`**
-- `id` (uuid, pk), `title` (default `"Tutor Session"`), `created_at`
+- `id` (uuid, pk), `title` (default `"Tutor Session"`)
+- `interview_id` (uuid, nullable) → `interviews.id` — set when the session was opened from
+  a workspace with a live interview; `NULL` for standalone tutor use
+- `topics_json` (jsonb, nullable) — cached topic labels, summarised at most once per session
+- `created_at`
+
+> Tutor usage is **reported, never penalised**: no score reads it, and the tutor is never
+> gated during an interview.
 
 **`tutor_messages`**
 - `id` (uuid, pk), `session_id` → `tutor_sessions.id`
@@ -165,6 +245,8 @@ Schema lives in `apps/api/src/db/schema.ts`. Migrations are tracked in `apps/api
 ```text
 problems 1───* solutions
 problems 1───* interviews 1───* interview_messages
+                         1───* interview_phase_events
+                         1───* tutor_sessions (nullable link)
 tutor_sessions 1───* tutor_messages
 ```
 
@@ -175,6 +257,12 @@ Managed by `drizzle-kit`:
 - `pnpm db:generate` — diff schema → SQL
 - `pnpm db:push` — apply schema directly (dev)
 - `pnpm db:migrate` — apply tracked migrations
+
+Migrations from `0001` onward are **hand-written idempotent SQL** (`ADD COLUMN IF NOT
+EXISTS`, `CREATE TABLE IF NOT EXISTS`) with a manual `meta/_journal.json` entry, because
+only `0000` has a drizzle snapshot — running `db:generate` would diff against that and
+re-emit everything since. Follow the existing files rather than generating, and never
+backfill destructively: legacy rows stay `NULL` and services must tolerate it.
 
 ### Redis 7
 
@@ -273,9 +361,9 @@ The `Cache-Control: no-cache` headers on the SSE endpoints are about HTTP interm
 
 | Surface | PNG sent to OpenAI? | Scene representation in prompt | Model |
 |---|---|---|---|
-| Validation (`POST /solutions`) | Yes (always when scene non-empty) | Raw `scene_json` + notes + estimation | `gpt-4o` |
-| Interviewer chat | Yes (when scene changed since last turn) | Compact `sceneSummary` (nodes / edges / summaryText) | `gpt-4o` |
-| Tutor chat | Yes (when scene changed since last turn) | Compact `sceneSummary` | `gpt-4o-mini` |
+| Validation (`POST /solutions`) | Yes (always when scene non-empty) | Compact `sceneSummary` + notes + estimation digest | `validation` |
+| Interviewer chat | Yes (when scene changed since last turn) | Compact `sceneSummary` (nodes / edges / summaryText) | `interviewerChat` |
+| Tutor chat | Yes (when scene changed since last turn) | Compact `sceneSummary` | `tutorChat` |
 
 The PNG is captured lazily by `Board.tsx` via `captureSceneImage()` on demand, scaled to a max of 1280px on the longest side before base64-encoding.
 

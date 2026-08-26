@@ -3,6 +3,9 @@
 **Area:** Evaluation · **Priority:** P2 · **Size:** M · **Depends on:** 02, 03, 07, 15
 **Labels:** `agent-ready`, `evaluation`, `web`
 
+> **Status: DONE.** `exportReport.ts` is now fifteen section formatters returning `string | null`, covered by `exportReport.test.ts` (minimal and full fixtures). Live constraints replace the seed list and are annotated by origin/status; the rubric table reuses `criterionRowToMarkdown` so screen and export cannot drift; estimation renders in display units with calibration verdicts; `dimensionNotes` are included; the transcript sits in a `<details>` block. Filename is `sdl-<slug>-<yyyy-mm-dd>.md`.
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 `buildAttemptMarkdownReport` (`apps/web/src/lib/exportReport.ts:44-118`) emits:

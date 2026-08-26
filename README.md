@@ -29,7 +29,8 @@ If ports are already used locally, keep defaults `POSTGRES_PORT=5433` and `REDIS
 2. `cp .env.example .env` — use `DATABASE_URL` and `REDIS_URL` pointing at localhost (`REDIS_PORT` controls host mapping). The API and Drizzle load this file from the **repo root** (not `apps/api/.env`).
 3. `pnpm install`
 4. `pnpm db:push` (or `pnpm db:migrate` after generate)
-5. `pnpm dev`
+5. `pnpm db:seed` — load the curated problem catalogue (optional, but it gives you something to work with without spending model calls)
+6. `pnpm dev`
 
 If `db:push` reports **password authentication failed for user "sdl"**, you are usually connecting to the wrong Postgres (for example port **5432** on the host while Compose maps **5433**) or an old volume still has a different password. Fix `DATABASE_URL` to match `.env.example`, or reset the DB volume: `docker compose down -v` (destructive) then bring Postgres up again.
 
@@ -42,6 +43,7 @@ If `db:push` reports **password authentication failed for user "sdl"**, you are 
 | `pnpm db:generate` | Drizzle generate migrations |
 | `pnpm db:push` | Push schema to DB (dev) |
 | `pnpm db:migrate` | Run migrations |
+| `pnpm db:seed` | Upsert the curated problem catalogue (`--dry-run` validates only) |
 | `pnpm task:start` | Pick `agent-ready` issues and run them autonomously in parallel |
 | `pnpm task:run <N>` | Run a single issue by number (add `--bg` to background it) |
 | `pnpm task:status` | Show running task slots, branches, and last log line |
@@ -84,6 +86,23 @@ The runner picks each issue, creates `feat/issue-<N>` worktree, spins up a per-t
 - `packages/ai-prompts` — Prompt templates
 - `infra/` — Docker Compose and Dockerfiles
 
+## Curated problem catalogue
+
+`POST /problems/generate` invents a problem per request, which is novel but unvetted and costs a model call. Alongside it, `apps/api/src/db/seeds/` holds hand-authored versions of the classic interview questions — Netflix, YouTube, the Twitter timeline, WhatsApp, Uber, Google Docs, Ticketmaster, Stripe, Slack, a URL shortener, a rate limiter, a RAG assistant, and a canary deployment platform — spanning `easy` to `expert` across all five tracks.
+
+```bash
+pnpm db:seed --dry-run   # validate the catalogue, write nothing
+pnpm db:seed             # upsert every seed
+```
+
+Seeds carry the same payload the generator produces (`narrative_json`, `estimation_spec_json`, `interview_plan_json`), so framing scripts, stall ladders, per-problem phases, and magnitude calibration all behave identically on them.
+
+Rubric criteria are deliberately **not** seeded: `interviews.criteria_json` is generated per interview because it depends on the interviewer level, so one stored rubric could not serve all four. Starting an interview on a seeded problem still makes that one model call.
+
+Adding a problem: drop a file in `seeds/catalog/`, export it from `seeds/index.ts`, then run `pnpm db:seed --dry-run`. Validation is stricter than the DB schema — it rejects magnitude bands narrower than 10x and derived formulas that would be silently discarded at runtime. `pnpm --filter @sdl/api test` covers the whole catalogue.
+
+The runner matches on `title` and updates in place, so re-seeding never duplicates rows or orphans a running interview, and it only ever touches rows whose title matches a seed.
+
 ## Schema changes (Drizzle)
 
 After pulling updates, apply DB schema changes:
@@ -92,14 +111,39 @@ After pulling updates, apply DB schema changes:
 pnpm db:push
 ```
 
-New columns include `problems.tags_json`, `problems.reference_json`, `solutions.estimation_json`, and **`interviews.criteria_json`** (per-interview rubric — see "Hidden criteria & discovery scoring" below). Existing rows get `NULL` until you run the matching backfill:
+New columns include `problems.tags_json`, `problems.track`, `problems.narrative_json`,
+`problems.reference_json`, `solutions.estimation_json`, **`interviews.criteria_json`**
+(per-interview rubric — see "Hidden criteria & discovery scoring" below),
+`interviews.criteria_level`, `interviews.debrief_json`,
+`interviews.pending_phase_proposal_json`, `interviews.reference_json`, the
+`interview_phase_events` table, and `tutor_sessions.interview_id` / `topics_json`.
+
+Existing rows get `NULL` until you run the matching backfill. All of these are **optional** —
+newly generated problems and newly started interviews already include the data, and every
+consumer treats `NULL` as "behave as before":
 
 ```bash
+# problems generated before a column existed
 curl -X POST http://localhost:3001/problems/backfill-tags
+curl -X POST http://localhost:3001/problems/backfill-tracks
+curl -X POST http://localhost:3001/problems/backfill-narrative
+curl -X POST http://localhost:3001/problems/backfill-estimation-specs
+curl -X POST http://localhost:3001/problems/backfill-interview-plans
+
+# interviews started before per-interview rubrics existed
 curl -X POST http://localhost:3001/interviews/backfill-criteria
 ```
 
-Both are optional — new problems and new interviews already include the data from generation.
+`backfill-narrative` and `backfill-estimation-specs` also accept `?force=true` to refresh
+problems that already have the column filled (needed when the shape gains fields).
+
+### Model selection
+
+Every OpenAI model id is resolved from one map (`apps/api/src/ai/ai.models.ts`) with an env
+override per purpose — see the commented `AI_MODEL_*` block in `.env.example`. Problem and
+rubric generation default to the stronger tier because everything downstream (interviewer
+coaching, the discovery loop, validation, the debrief) is built on those two artefacts;
+per-turn matchers stay on the cheap tier.
 
 ## Hidden criteria & discovery scoring
 
@@ -111,3 +155,31 @@ Each interview now generates a structured rubric of evaluation criteria scoped t
 - **Reveal**: after the candidate submits at least one validation, the full rubric (including hidden bodies) is shown in the Validate panel, with covered / missed / never-asked status per criterion.
 
 Out-of-scope dimensions return `null` instead of a fake middling 60 — the UI hides those bars rather than misleading the candidate into thinking they were graded on something irrelevant to the rubric.
+
+## Ending an interview
+
+Interviews now finish. **End interview** in the Validate tab (enabled once you have
+validated at least once) completes the session and writes a **debrief**: strongest signal,
+recommendation, what went well, where you struggled, risk areas, and an ordered study plan —
+every bullet grounded in a diagram element, a quoted line, or a criterion id. It is
+generated once and stored, so re-opening it never regenerates. After that the interviewer
+composer closes; the board, Tutor and Export stay available, and **Replay** starts fresh.
+
+Two things feed the debrief and are also reported on their own, but **never scored**:
+
+- **How you worked** — clarified before designing, decisiveness, whether you surfaced your
+  own design's limitations, whether you adapted when challenged, and who drove. Judged from
+  the transcript only, and calibrated to the interviewer level (at Guided, being led is
+  expected).
+- **Tutor usage** — how often you consulted the tutor and about what. Using the tutor is
+  often the right move; this exists so that when you re-read the attempt in a month you can
+  tell a score reached with help apart from one reached without it.
+
+Pacing is recorded server-side as an append-only phase-event log, so the interviewer can
+offer a transition ("Ready to move to Deep dive?") when you pass ~80% of a phase's budget or
+have surfaced everything that phase probes. It **never** auto-advances — you always decide.
+
+**Export report** produces the whole thing as markdown: verdict, debrief, live scope
+annotated by origin, the full rubric table with missed cores first, flags, process, an
+estimation table in the units you typed, pacing, dimension notes, the reference answer and
+the transcript in a collapsible block. Sections with no data are omitted entirely.

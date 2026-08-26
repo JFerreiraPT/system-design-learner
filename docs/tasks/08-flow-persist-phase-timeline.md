@@ -3,6 +3,9 @@
 **Area:** Flow · **Priority:** P1 · **Size:** M · **Depends on:** —
 **Labels:** `agent-ready`, `flow`, `api`, `web`
 
+> **Status: DONE.** `interview_phase_events` table + `(interview_id, at)` index; `POST /interviews/:id/phase-events` (clamped, fire-and-forget) and `GET /interviews/:id/phase-timeline`. Reducer is `buildPhaseTimeline` in `@sdl/shared` (pure, `reset`-aware). `localStorage` still drives the live ribbon; a failing POST is swallowed by `postPhaseEvent`. The interviewer prompt gained a private cross-phase pacing block.
+> Verified with `pnpm -w turbo run typecheck` and `pnpm -w turbo run test`.
+
 ## Problem
 
 Phase state lives **only in `localStorage`**. `WorkspacePage` persists

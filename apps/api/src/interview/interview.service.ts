@@ -1,5 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import { ForbiddenException, Inject, Injectable, NotFoundException } from "@nestjs/common";
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  Inject,
+  Injectable,
+  NotFoundException
+} from "@nestjs/common";
 import { and, asc, desc, eq, isNotNull, isNull } from "drizzle-orm";
 import {
   buildInterviewerWelcome,
@@ -7,25 +14,53 @@ import {
   hasEstimationPhase
 } from "@sdl/ai-prompts";
 import {
+  buildPhaseTimeline,
+  clampPhaseElapsedSec,
   DEFAULT_INTERVIEW_PLAN,
+  evaluatePhaseTransition,
+  getInterviewDebrief,
+  getPhaseProposalState,
+  getProblemNarrative,
   getRubricCriteria,
   getRubricPlaybook,
+  getSeededRubric,
+  projectRubricForLevel,
+  getTrack,
+  EMPTY_TUTOR_USAGE,
   InterviewPlanSchema,
   LiveConstraintSchema
 } from "@sdl/shared";
 import type {
   ConstraintProposal,
   Difficulty,
+  InterviewDebrief,
+  InterviewPlan,
   InterviewRubric,
   InterviewerLevel,
   LiveConstraint,
+  PhaseEventInput,
+  PhaseProposalState,
   PhaseRuntimeInfo,
+  PhaseTimeline,
+  PhaseTransitionProposal,
   RubricCriterion,
-  SceneSummary
+  SceneSummary,
+  Track,
+  TutorUsage,
+  ValidationFeedback
 } from "@sdl/shared";
 import { AiService } from "../ai/ai.service.js";
+import { buildInterviewTranscript } from "../common/transcript.js";
 import { DB } from "../db/db.module.js";
-import { interviewMessages, interviews, problems, solutions } from "../db/schema.js";
+import {
+  interviewMessages,
+  interviewPhaseEvents,
+  interviews,
+  problems,
+  solutions,
+  tutorMessages,
+  tutorSessions
+} from "../db/schema.js";
 import { REDIS } from "../redis/redis.module.js";
 
 type WorkspaceContext = {
@@ -86,6 +121,8 @@ export class InterviewService {
       })
     );
 
+    const narrative = getProblemNarrative(problem.narrativeJson);
+
     // Generate the per-interview rubric synchronously. Worst case ~1-3s
     // extra latency; if the LLM call fails we degrade gracefully and keep
     // criteria=null (legacy interviews already work that way).
@@ -96,7 +133,10 @@ export class InterviewService {
       difficulty: problem.difficulty as Difficulty,
       interviewerLevel: input.interviewerLevel,
       seedConstraints: problem.constraintsJson ?? [],
-      phases: plan.phases.map((p) => ({ id: p.id, label: p.label }))
+      phases: plan.phases.map((p) => ({ id: p.id, label: p.label })),
+      signatureChallenge: narrative?.signatureChallenge,
+      track: getTrack(problem.track) ?? undefined,
+      seededRubric: problem.seededRubricJson
     });
 
     const inserted = await this.db
@@ -107,12 +147,14 @@ export class InterviewService {
         status: "active",
         liveConstraintsJson: seedConstraints,
         pendingProposalsJson: [],
-        criteriaJson: criteria
+        criteriaJson: criteria,
+        // Recorded so a later level change can be detected as a desync.
+        criteriaLevel: criteria ? input.interviewerLevel : null
       })
       .returning();
 
     const session = inserted[0];
-    const welcome = buildInterviewerWelcome(problem.title, plan);
+    const welcome = buildInterviewerWelcome(problem.title, plan, narrative);
     await this.db.insert(interviewMessages).values({
       interviewId: session.id,
       role: "assistant",
@@ -133,7 +175,20 @@ export class InterviewService {
     interviewerLevel: InterviewerLevel;
     seedConstraints: string[];
     phases: Array<{ id: string; label: string }>;
+    signatureChallenge?: string;
+    track?: Track;
+    /** Raw `problems.seeded_rubric_json`. Present only on curated problems. */
+    seededRubric?: unknown;
   }): Promise<InterviewRubric | null> {
+    // A curated problem ships its own rubric, so there is nothing to generate:
+    // projecting it for this level is deterministic, costs no model call, and
+    // produces the same shape the generator would. Every retry and safety net
+    // below exists to correct model output, so none of it applies here.
+    const seeded = getSeededRubric(input.seededRubric);
+    if (seeded) {
+      return projectRubricForLevel(seeded, input.interviewerLevel, new Date().toISOString());
+    }
+
     try {
       const existingCriteria = await this.collectExistingCriteriaForProblem(input.problemId);
       const baseInput = {
@@ -143,7 +198,9 @@ export class InterviewService {
         interviewerLevel: input.interviewerLevel,
         seedConstraints: input.seedConstraints,
         phases: input.phases,
-        existingCriteria: existingCriteria.length > 0 ? existingCriteria : undefined
+        existingCriteria: existingCriteria.length > 0 ? existingCriteria : undefined,
+        signatureChallenge: input.signatureChallenge,
+        track: input.track
       };
 
       const hiddenMin = getCriteriaHiddenMin(input.difficulty);
@@ -261,7 +318,25 @@ export class InterviewService {
     return [...hidden, ...visible].slice(0, 50);
   }
 
-  async updateLevel(interviewId: string, interviewerLevel: InterviewerLevel) {
+  /**
+   * Change the interviewer level, optionally resyncing the rubric.
+   *
+   * The level decides the hidden/visible split, so changing it alone leaves
+   * `staff`-level coaching ("do not coach toward hidden criteria") running
+   * against a rubric where almost everything is already visible and pre-marked
+   * discovered — a hard interview against an easy rubric, with a near-free
+   * discovery score. The reverse is worse.
+   *
+   * Regeneration is opt-in rather than automatic because it discards every
+   * `discoveredVia` mark: the candidate has to be the one to accept losing
+   * their discovery progress. `rubricStale` is what lets the UI keep offering
+   * the fix afterwards.
+   */
+  async updateLevel(
+    interviewId: string,
+    interviewerLevel: InterviewerLevel,
+    regenerateCriteria = false
+  ) {
     const sessionRows = await this.db.select().from(interviews).where(eq(interviews.id, interviewId));
     if (!sessionRows[0]) throw new NotFoundException("Interview not found");
 
@@ -271,13 +346,33 @@ export class InterviewService {
       .where(eq(interviews.id, interviewId))
       .returning();
 
-    return updated[0];
+    if (regenerateCriteria) {
+      // Regenerates against the level we just wrote, and stamps
+      // `criteriaLevel` with it — so the row lands in sync.
+      await this.regenerateCriteria(interviewId);
+    }
+
+    const after = await this.requireInterview(interviewId);
+    return {
+      ...(updated[0] ?? after),
+      interviewerLevel,
+      rubricStale: isRubricStale(after.criteriaLevel, interviewerLevel),
+      criteriaLevel: after.criteriaLevel ?? null
+    };
   }
 
   async sendMessage(interviewId: string, content: string, workspaceContext?: WorkspaceContext) {
     const sessionRows = await this.db.select().from(interviews).where(eq(interviews.id, interviewId));
     const session = sessionRows[0];
     if (!session) throw new NotFoundException("Interview not found");
+    // Guard BEFORE the user row is inserted: a completed interview has a
+    // debrief written against a fixed transcript, so accepting one more
+    // message would silently invalidate it.
+    if (session.status !== "active") {
+      throw new ConflictException(
+        "This interview is completed. Start a new interview (or Replay) to keep practising."
+      );
+    }
 
     const problemRows = await this.db.select().from(problems).where(eq(problems.id, session.problemId));
     const problem = problemRows[0];
@@ -319,6 +414,12 @@ export class InterviewService {
       ? criteria.filter((c) => c.discoveredVia).map((c) => c.id)
       : undefined;
 
+    // Pacing history is telemetry, so a failure to read it must never break
+    // the turn — the prompt simply loses the cross-phase block.
+    const phaseTimeline = await this.loadPhaseTimeline(session).catch(() => undefined);
+
+    const pendingTransition = getPhaseProposalState(session.pendingPhaseProposalJson).pending;
+
     const stream = this.aiService.streamInterviewer({
       interviewerLevel: session.interviewerLevel,
       problemStatement: problem.statement,
@@ -329,10 +430,324 @@ export class InterviewService {
       criteria,
       playbook,
       currentPhaseId: workspaceContext?.phase?.id,
-      discoveredCriterionIds
+      discoveredCriterionIds,
+      phaseTimeline,
+      pendingPhaseTransition: pendingTransition
+        ? { toLabel: pendingTransition.toLabel }
+        : undefined,
+      narrative: getProblemNarrative(problem.narrativeJson)
     });
 
     return stream;
+  }
+
+  /**
+   * Close out an interview: flip the lifecycle, stamp `endedAt`, and persist a
+   * written debrief.
+   *
+   * Idempotent by design. A second call returns the stored debrief instead of
+   * regenerating, because a debrief that changes each time you open it is not a
+   * record of anything — and regenerating would also cost another `gpt-4o`
+   * call for no new information.
+   */
+  async end(interviewId: string): Promise<{
+    id: string;
+    status: string;
+    endedAt: Date | string | null;
+    debrief: InterviewDebrief;
+    /** True when this call returned the previously stored debrief. */
+    alreadyEnded: boolean;
+  }> {
+    const session = await this.requireInterview(interviewId);
+
+    if (session.status !== "active") {
+      const stored = getInterviewDebrief(session.debriefJson);
+      if (stored) {
+        return {
+          id: session.id,
+          status: session.status,
+          endedAt: session.endedAt,
+          debrief: stored,
+          alreadyEnded: true
+        };
+      }
+      // Completed with no readable debrief (an older shape, or a crash between
+      // the LLM call and the write). Fall through and generate one rather than
+      // leaving the candidate with a dead end.
+    }
+
+    const problemRows = await this.db.select().from(problems).where(eq(problems.id, session.problemId));
+    const problem = problemRows[0];
+    if (!problem) throw new NotFoundException("Problem not found");
+
+    const attemptRows = await this.db
+      .select()
+      .from(solutions)
+      .where(eq(solutions.problemId, session.problemId))
+      .orderBy(desc(solutions.createdAt))
+      .limit(1);
+    const latestAttempt = attemptRows[0];
+    if (!latestAttempt) {
+      throw new BadRequestException(
+        "Validate your solution at least once before ending the interview — the debrief is written against a graded attempt."
+      );
+    }
+
+    const messageRows = await this.db
+      .select({ role: interviewMessages.role, content: interviewMessages.content })
+      .from(interviewMessages)
+      .where(eq(interviewMessages.interviewId, interviewId))
+      .orderBy(asc(interviewMessages.createdAt));
+
+    const liveConstraints: LiveConstraint[] =
+      (session.liveConstraintsJson as LiveConstraint[] | null) ?? [];
+    const feedback = (latestAttempt.feedbackJson ?? undefined) as ValidationFeedback | undefined;
+    const phaseTimeline = await this.loadPhaseTimeline(session).catch(() => undefined);
+    // Context for the narrative, never a deduction — see `getTutorUsage`.
+    const tutorUsage = await this.getTutorUsage(interviewId).catch(() => undefined);
+
+    const debrief = await this.aiService.generateDebrief({
+      problemTitle: problem.title,
+      problemStatement: problem.statement,
+      difficulty: problem.difficulty as Difficulty,
+      interviewerLevel: session.interviewerLevel as InterviewerLevel,
+      activeConstraints: liveConstraints.filter((c) => c.status === "active").map((c) => c.text),
+      criteria: getRubricCriteria(session.criteriaJson) ?? undefined,
+      playbook: getRubricPlaybook(session.criteriaJson) ?? undefined,
+      scoring: feedback
+        ? {
+            score: feedback.score ?? latestAttempt.score ?? undefined,
+            designScore: feedback.designScore,
+            discoveryScore: feedback.discoveryScore,
+            scoringMode: feedback.scoringMode,
+            scoreBand: feedback.scoreBand,
+            criteriaEvaluations: feedback.criteriaEvaluations,
+            coreMissed: feedback.coreMissed,
+            coreCovered: feedback.coreCovered,
+            flagObservations: feedback.flagObservations,
+            strengths: feedback.strengths,
+            gaps: feedback.gaps,
+            processAssessment: feedback.processAssessment
+          }
+        : undefined,
+      transcript: buildInterviewTranscript(messageRows) ?? undefined,
+      phaseTimeline,
+      tutorUsage: tutorUsage && tutorUsage.candidateTurns > 0 ? tutorUsage : undefined
+    });
+
+    const endedAt = new Date();
+    await this.db
+      .update(interviews)
+      .set({ status: "completed", endedAt, debriefJson: debrief })
+      .where(eq(interviews.id, interviewId));
+
+    return {
+      id: session.id,
+      status: "completed",
+      endedAt,
+      debrief,
+      alreadyEnded: false
+    };
+  }
+
+  /**
+   * Factual tutor-usage record for this interview.
+   *
+   * Deliberately not a penalty and deliberately not a gate: consulting the
+   * tutor is frequently the right move, and it is why the tutor exists. What
+   * this fixes is that a high score with heavy tutor use means something
+   * different from a high score without it, and reviewing your own session
+   * weeks later you could not previously tell those apart.
+   *
+   * Returns zeros (never a 404) for an interview with no tutor session.
+   * Topic labels are summarised at most ONCE per session and cached on the
+   * row, so re-reading this costs no model calls.
+   */
+  async getTutorUsage(interviewId: string): Promise<TutorUsage> {
+    const session = await this.requireInterview(interviewId);
+
+    const sessionRows = await this.db
+      .select()
+      .from(tutorSessions)
+      .where(eq(tutorSessions.interviewId, interviewId))
+      .orderBy(asc(tutorSessions.createdAt));
+    if (sessionRows.length === 0) return { ...EMPTY_TUTOR_USAGE };
+
+    let candidateTurns = 0;
+    let firstTurnAt: Date | null = null;
+    const topics = new Set<string>();
+
+    for (const row of sessionRows) {
+      const messageRows = await this.db
+        .select()
+        .from(tutorMessages)
+        .where(eq(tutorMessages.sessionId, row.id))
+        .orderBy(asc(tutorMessages.createdAt));
+
+      const asked = messageRows.filter(
+        (m: { role: string }) => m.role === "user"
+      ) as Array<{ content: string; createdAt: Date | string }>;
+      candidateTurns += asked.length;
+
+      const firstAsk = asked[0]?.createdAt;
+      if (firstAsk) {
+        const at = firstAsk instanceof Date ? firstAsk : new Date(firstAsk);
+        if (!firstTurnAt || at < firstTurnAt) firstTurnAt = at;
+      }
+
+      const cached = Array.isArray(row.topicsJson) ? (row.topicsJson as string[]) : null;
+      if (cached) {
+        for (const topic of cached) topics.add(topic);
+        continue;
+      }
+      if (asked.length === 0) continue;
+
+      const summarised = await this.aiService.summariseTutorTopics({
+        candidateTurns: asked.map((m) => m.content)
+      });
+      // Cache even an empty result: the point is that a second read never
+      // pays for another model call.
+      await this.db
+        .update(tutorSessions)
+        .set({ topicsJson: summarised })
+        .where(eq(tutorSessions.id, row.id));
+      for (const topic of summarised) topics.add(topic);
+    }
+
+    return {
+      sessions: sessionRows.length,
+      candidateTurns,
+      firstUsedAtPhase: firstTurnAt
+        ? await this.resolvePhaseLabelAt(session, firstTurnAt)
+        : null,
+      topics: [...topics].slice(0, 5)
+    };
+  }
+
+  /** Which phase was active at `at`, from the phase-event log: the most recent
+   * `enter` at or before that moment. Null when the timer was never running,
+   * which is every legacy interview. */
+  private async resolvePhaseLabelAt(
+    session: { id: string; problemId: string },
+    at: Date
+  ): Promise<string | null> {
+    const events = await this.db
+      .select({
+        phaseId: interviewPhaseEvents.phaseId,
+        kind: interviewPhaseEvents.kind,
+        at: interviewPhaseEvents.at
+      })
+      .from(interviewPhaseEvents)
+      .where(eq(interviewPhaseEvents.interviewId, session.id))
+      .orderBy(asc(interviewPhaseEvents.at));
+
+    let phaseId: string | null = null;
+    for (const event of events as Array<{ phaseId: string; kind: string; at: Date | string }>) {
+      const eventAt = event.at instanceof Date ? event.at : new Date(event.at);
+      if (eventAt > at) break;
+      if (event.kind === "enter") phaseId = event.phaseId;
+      else if (event.kind === "reset") phaseId = null;
+    }
+    if (!phaseId) return null;
+
+    const plan = await this.loadPlanForProblem(session.problemId);
+    return plan.phases.find((p) => p.id === phaseId)?.label ?? phaseId;
+  }
+
+  /** Read-only lifecycle view. The workspace polls this so a session restored
+   * from `localStorage` knows whether it is still accepting messages. */
+  async getStatus(interviewId: string) {
+    const session = await this.requireInterview(interviewId);
+    return {
+      id: session.id,
+      status: session.status,
+      interviewerLevel: session.interviewerLevel,
+      criteriaLevel: session.criteriaLevel ?? null,
+      rubricStale: isRubricStale(
+        session.criteriaLevel,
+        session.interviewerLevel as InterviewerLevel
+      ),
+      startedAt: session.startedAt,
+      endedAt: session.endedAt,
+      debrief: getInterviewDebrief(session.debriefJson)
+    };
+  }
+
+  /** Append one phase transition to the interview's event log.
+   *
+   * Fire-and-forget from the client's point of view, so this must be cheap and
+   * forgiving: `elapsedSec` is clamped rather than rejected, because losing a
+   * pacing sample is worse than storing a capped one. */
+  async recordPhaseEvent(interviewId: string, input: PhaseEventInput) {
+    const session = await this.requireInterview(interviewId);
+    if (session.status !== "active") {
+      throw new ConflictException("This interview is completed and no longer records phase events.");
+    }
+
+    await this.db.insert(interviewPhaseEvents).values({
+      interviewId,
+      phaseId: input.phaseId,
+      phaseIndex: input.phaseIndex,
+      kind: input.kind,
+      elapsedSec: clampPhaseElapsedSec(input.elapsedSec)
+    });
+
+    return { recorded: true };
+  }
+
+  /** Per-phase actual vs budget for this interview.
+   *
+   * Labels and budgets come from the problem's `interview_plan_json`, falling
+   * back to `DEFAULT_INTERVIEW_PLAN`, so an interview with no recorded events
+   * (every legacy session) still returns the full phase list at zero. */
+  async getPhaseTimeline(interviewId: string): Promise<PhaseTimeline> {
+    const session = await this.requireInterview(interviewId);
+    return this.loadPhaseTimeline(session);
+  }
+
+  private async loadPhaseTimeline(session: {
+    id: string;
+    problemId: string;
+    status: string;
+  }): Promise<PhaseTimeline> {
+    const [plan, events] = await Promise.all([
+      this.loadPlanForProblem(session.problemId),
+      this.db
+        .select({
+          phaseId: interviewPhaseEvents.phaseId,
+          kind: interviewPhaseEvents.kind,
+          elapsedSec: interviewPhaseEvents.elapsedSec
+        })
+        .from(interviewPhaseEvents)
+        .where(eq(interviewPhaseEvents.interviewId, session.id))
+        .orderBy(asc(interviewPhaseEvents.at))
+    ]);
+
+    return buildPhaseTimeline({
+      plan,
+      events: events.map((row: { phaseId: string; kind: string; elapsedSec: number }) => ({
+        phaseId: row.phaseId,
+        kind: row.kind === "exit" || row.kind === "reset" ? row.kind : ("enter" as const),
+        elapsedSec: row.elapsedSec
+      })),
+      completed: session.status === "completed"
+    });
+  }
+
+  private async loadPlanForProblem(problemId: string): Promise<InterviewPlan> {
+    const rows = await this.db
+      .select({ interviewPlanJson: problems.interviewPlanJson })
+      .from(problems)
+      .where(eq(problems.id, problemId));
+    const parsed = InterviewPlanSchema.safeParse(rows[0]?.interviewPlanJson);
+    return parsed.success ? parsed.data : DEFAULT_INTERVIEW_PLAN;
+  }
+
+  private async requireInterview(interviewId: string) {
+    const rows = await this.db.select().from(interviews).where(eq(interviews.id, interviewId));
+    const session = rows[0];
+    if (!session) throw new NotFoundException("Interview not found");
+    return session;
   }
 
   async listMessages(interviewId: string) {
@@ -458,7 +873,13 @@ export class InterviewService {
     return { constraints, proposals: nextProposals };
   }
 
-  async saveAssistantMessage(interviewId: string, content: string) {
+  async saveAssistantMessage(
+    interviewId: string,
+    content: string,
+    /** Phase snapshot from the turn that produced this reply. The timer is
+     * client-owned, so pacing has to come in with the message. */
+    phase?: PhaseRuntimeInfo
+  ) {
     await this.db.insert(interviewMessages).values({
       interviewId,
       role: "assistant",
@@ -468,13 +889,87 @@ export class InterviewService {
     //  1. Discovery promotes criteria → live constraints before proposals run.
     //  2. The interview SSE finishes only after DB reflects discoveries, so a
     //     client refetch right after streaming sees new constraints immediately.
+    //  3. The transition rule reads `discoveredVia`, so it must run last —
+    //     otherwise a phase whose expectations were just surfaced would take an
+    //     extra turn to be offered.
     try {
       await this.detectDiscoveries(interviewId, content);
       await this.deriveConstraintProposals(interviewId, content);
+      await this.detectPhaseTransition(interviewId, phase);
     } catch (err) {
       const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
       console.error("[saveAssistantMessage] post-turn jobs:", msg);
     }
+  }
+
+  /** Read the live transition offer (and what has already been answered for). */
+  async getPhaseProposal(interviewId: string): Promise<PhaseProposalState> {
+    const session = await this.requireInterview(interviewId);
+    return getPhaseProposalState(session.pendingPhaseProposalJson);
+  }
+
+  /**
+   * Clear the live offer and stop asking about that phase.
+   *
+   * Advance and "Stay here" do the same thing here on purpose: the server's
+   * only job either way is to close the question. Advancing the phase itself
+   * stays on the client, because the timer lives there and the server must
+   * never move the candidate — the whole point of the mechanism is that the
+   * candidate owns pacing.
+   */
+  async resolvePhaseProposal(interviewId: string): Promise<PhaseProposalState> {
+    const session = await this.requireInterview(interviewId);
+    const state = getPhaseProposalState(session.pendingPhaseProposalJson);
+    if (!state.pending) return state;
+
+    const next: PhaseProposalState = {
+      pending: null,
+      resolvedPhaseIds: state.resolvedPhaseIds.includes(state.pending.fromPhaseId)
+        ? state.resolvedPhaseIds
+        : [...state.resolvedPhaseIds, state.pending.fromPhaseId].slice(-64)
+    };
+
+    await this.db
+      .update(interviews)
+      .set({ pendingPhaseProposalJson: next })
+      .where(eq(interviews.id, interviewId));
+    return next;
+  }
+
+  /** Deterministic, LLM-free transition detection. Runs on every interviewer
+   * turn, so it must stay cheap: one row read, one conditional write. */
+  private async detectPhaseTransition(interviewId: string, phase?: PhaseRuntimeInfo) {
+    if (!phase) return;
+
+    const rows = await this.db.select().from(interviews).where(eq(interviews.id, interviewId));
+    const session = rows[0];
+    if (!session || session.status !== "active") return;
+
+    const state = getPhaseProposalState(session.pendingPhaseProposalJson);
+    const plan = await this.loadPlanForProblem(session.problemId);
+
+    const proposal: PhaseTransitionProposal | null = evaluatePhaseTransition({
+      plan,
+      phase: {
+        id: phase.id ?? plan.phases[phase.index]?.id ?? "",
+        index: phase.index,
+        elapsedSec: clampPhaseElapsedSec(phase.elapsedSec),
+        durationSec: phase.durationSec
+      },
+      state,
+      criteria: getRubricCriteria(session.criteriaJson),
+      playbook: getRubricPlaybook(session.criteriaJson),
+      now: new Date().toISOString(),
+      id: randomUUID()
+    });
+    if (!proposal) return;
+
+    await this.db
+      .update(interviews)
+      .set({
+        pendingPhaseProposalJson: { pending: proposal, resolvedPhaseIds: state.resolvedPhaseIds }
+      })
+      .where(eq(interviews.id, interviewId));
   }
 
   /** Progress-only view of the per-interview rubric — mostly counts.
@@ -578,7 +1073,9 @@ export class InterviewService {
         difficulty: problem.difficulty as Difficulty,
         interviewerLevel: row.interviewerLevel as InterviewerLevel,
         seedConstraints: problem.constraintsJson ?? [],
-        phases: plan.phases.map((p) => ({ id: p.id, label: p.label }))
+        phases: plan.phases.map((p) => ({ id: p.id, label: p.label })),
+        signatureChallenge: getProblemNarrative(problem.narrativeJson)?.signatureChallenge,
+        track: getTrack(problem.track) ?? undefined
       });
       if (!criteria) {
         skipped += 1;
@@ -586,7 +1083,10 @@ export class InterviewService {
       }
       await this.db
         .update(interviews)
-        .set({ criteriaJson: criteria })
+        .set({
+          criteriaJson: criteria,
+          criteriaLevel: row.interviewerLevel as InterviewerLevel
+        })
         .where(eq(interviews.id, row.id));
       updated += 1;
     }
@@ -616,15 +1116,23 @@ export class InterviewService {
       difficulty: problem.difficulty as Difficulty,
       interviewerLevel: session.interviewerLevel as InterviewerLevel,
       seedConstraints: problem.constraintsJson ?? [],
-      phases: plan.phases.map((p) => ({ id: p.id, label: p.label }))
+      phases: plan.phases.map((p) => ({ id: p.id, label: p.label })),
+      signatureChallenge: getProblemNarrative(problem.narrativeJson)?.signatureChallenge,
+      track: getTrack(problem.track) ?? undefined,
+      seededRubric: problem.seededRubricJson
     });
 
+    const level = session.interviewerLevel as InterviewerLevel;
     await this.db
       .update(interviews)
-      .set({ criteriaJson: criteria })
+      .set({ criteriaJson: criteria, criteriaLevel: criteria ? level : null })
       .where(eq(interviews.id, interviewId));
 
-    return { criteria: criteria?.criteria ?? null };
+    return {
+      criteria: criteria?.criteria ?? null,
+      criteriaLevel: criteria ? level : null,
+      rubricStale: false
+    };
   }
 
   private async detectDiscoveries(interviewId: string, lastAssistantMessage: string) {
@@ -820,6 +1328,20 @@ function hashSceneSummary(summary: SceneSummary): string {
     edges: summary.edges.map((e) => [e.from, e.to, e.label ?? ""])
   });
   return createHash("sha1").update(canonical).digest("hex");
+}
+
+/** True only when we KNOW the rubric was built for a different level.
+ *
+ * A null `criteriaLevel` means "unknown" — every interview started before the
+ * column existed — and must report false. Nagging about a desync we cannot
+ * verify would send candidates to regenerate (and lose discovery progress) for
+ * no reason. */
+export function isRubricStale(
+  criteriaLevel: unknown,
+  currentLevel: InterviewerLevel
+): boolean {
+  if (typeof criteriaLevel !== "string" || criteriaLevel.length === 0) return false;
+  return criteriaLevel !== currentLevel;
 }
 
 function withUpdatedRubricCriteria(raw: unknown, criteria: RubricCriterion[]) {

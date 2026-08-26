@@ -8,6 +8,8 @@ import { ChatPanel } from "../components/ChatPanel";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { CriteriaReveal } from "../components/CriteriaReveal";
 import { FlagsPanel } from "../components/FlagsPanel";
+import { InterviewDebriefPanel } from "../components/InterviewDebrief";
+import { ProcessPanel } from "../components/ProcessPanel";
 import {
   DesignDiscoverySubscores,
   DimensionBreakdown,
@@ -33,14 +35,21 @@ import {
   type CriteriaProgress,
   type CriteriaProgressResponse,
   type CriteriaRevealResponse,
+  type EndInterviewResponse,
   type InterviewConstraintState,
+  type InterviewPhaseProposalState,
+  type InterviewPhaseTimeline,
+  type InterviewStatus,
+  type InterviewTutorUsage,
+  type PatchInterviewResponse,
   type Problem,
   type ReferenceSolution,
   type ValidationRecord,
   type WorkspaceEstimation
 } from "../lib/api";
 import { migrateEstimationFromStorage } from "../lib/estimationMigrate";
-import { buildAttemptMarkdownReport, downloadMarkdown } from "../lib/exportReport";
+import { buildAttemptMarkdownReport, downloadMarkdown, reportFilename } from "../lib/exportReport";
+import { advanceEvents, postPhaseEvent, type PhaseEventBody } from "../lib/phaseEvents";
 import type { PhasePersistState } from "../lib/phases";
 import { projectSceneJson } from "../lib/sceneProjection";
 import { clearWorkspaceLocalState, useWorkspaceStore } from "../lib/store";
@@ -94,6 +103,13 @@ export function WorkspacePage() {
   const [restoredPhaseId, setRestoredPhaseId] = useState<string | null>(null);
   const [boardKey, setBoardKey] = useState(0);
   const [replayOpen, setReplayOpen] = useState(false);
+  const [endOpen, setEndOpen] = useState(false);
+  const [endError, setEndError] = useState<string | null>(null);
+  /** Level the candidate picked mid-interview, held until they choose whether
+   * to regenerate the rubric for it. */
+  const [pendingLevel, setPendingLevel] = useState<
+    "guided" | "standard" | "hard" | "staff" | null
+  >(null);
   const [loadedHint, setLoadedHint] = useState<string | null>(null);
   const [estimation, setEstimation] = useState<WorkspaceEstimation>({});
   const [phaseIndex, setPhaseIndex] = useState(0);
@@ -145,28 +161,129 @@ export function WorkspacePage() {
 
   const hasValidationAttempt = (validationsQuery.data?.length ?? 0) > 0;
 
+  // Keyed on the interview too: an interview-scoped reference is built against
+  // that interview's rubric, so it must not be served from the generic cache.
   const referenceQuery = useQuery({
-    queryKey: ["reference", id],
-    queryFn: async () => (await api.get<ReferenceSolution>(`/problems/${id}/reference`)).data,
+    queryKey: ["reference", id, interviewId],
+    queryFn: async () =>
+      (
+        await api.get<ReferenceSolution>(`/problems/${id}/reference`, {
+          params: interviewId ? { interviewId } : undefined
+        })
+      ).data,
     enabled: Boolean(id) && hasValidationAttempt,
     retry: false
   });
 
+  /** Append-only pacing telemetry. Deliberately fire-and-forget: the live
+   * timer is client-owned, so a failed POST must never block a button or
+   * surface an error. Takes the interview id explicitly because the very first
+   * event fires from `startInterview`'s `onSuccess`, before state has settled. */
+  const emitPhaseEvents = (targetInterviewId: string | null, events: PhaseEventBody[]) => {
+    if (!targetInterviewId) return;
+    for (const body of events) {
+      void postPhaseEvent(
+        (payload) => api.post(`/interviews/${targetInterviewId}/phase-events`, payload),
+        body
+      );
+    }
+  };
+
+  /** The one place a phase actually advances. Both the ribbon's Next button and
+   * the interviewer's transition banner route through here so they cannot drift
+   * on which events get recorded. */
+  const advancePhase = () => {
+    if (phaseIndex >= planPhases.length - 1) return;
+    const next = planPhases[phaseIndex + 1]!;
+    emitPhaseEvents(
+      interviewId,
+      advanceEvents({
+        fromPhaseId: currentPhaseDef.id,
+        fromPhaseIndex: phaseIndex,
+        fromElapsedSec: elapsedInPhase,
+        toPhaseId: next.id,
+        toPhaseIndex: phaseIndex + 1
+      })
+    );
+    setPhaseIndex((i) => i + 1);
+    setElapsedInPhase(0);
+  };
+
   const startInterviewMutation = useMutation({
     mutationFn: async () =>
       (await api.post<{ id: string }>("/interviews", { problemId: id, interviewerLevel })).data,
-    onSuccess: (data) => setInterviewId(data.id)
+    onSuccess: (data) => {
+      setInterviewId(data.id);
+      // Start the clock with the interview. Without this the timer defaults to
+      // stopped, elapsed stays 0 for the whole session, and every piece of
+      // pacing guidance downstream (transition offers, the debrief's pacing
+      // block) is silently inert. Pause and Reset stay manual.
+      setPhaseRunning(true);
+      emitPhaseEvents(data.id, [
+        {
+          phaseId: currentPhaseDef.id,
+          phaseIndex,
+          kind: "enter",
+          elapsedSec: elapsedInPhase
+        }
+      ]);
+    }
   });
 
   const patchInterviewMutation = useMutation({
-    mutationFn: async (level: typeof interviewerLevel) =>
-      api.patch(`/interviews/${interviewId}`, { interviewerLevel: level }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["interview-messages", interviewId] })
+    mutationFn: async (input: {
+      level: typeof interviewerLevel;
+      regenerateCriteria: boolean;
+    }) =>
+      (
+        await api.patch<PatchInterviewResponse>(`/interviews/${interviewId}`, {
+          interviewerLevel: input.level,
+          regenerateCriteria: input.regenerateCriteria
+        })
+      ).data,
+    onSuccess: (data) => {
+      setInterviewerLevel(data.interviewerLevel);
+      setPendingLevel(null);
+      queryClient.invalidateQueries({ queryKey: ["interview-messages", interviewId] });
+      // Regeneration replaces the rubric wholesale, so every criteria-derived
+      // view has to be refetched — including the constraint rail, whose
+      // discovery pills may now point at criteria that no longer exist.
+      queryClient.invalidateQueries({ queryKey: ["interview-status", interviewId] });
+      queryClient.invalidateQueries({
+        queryKey: ["interview-criteria-progress", interviewId]
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["interview-criteria-reveal", interviewId]
+      });
+      queryClient.invalidateQueries({ queryKey: ["interview-constraints", interviewId] });
+    },
+    onError: () => setPendingLevel(null)
+  });
+
+  const regenerateCriteriaMutation = useMutation({
+    mutationFn: async () => api.post(`/interviews/${interviewId}/criteria/regenerate`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["interview-status", interviewId] });
+      queryClient.invalidateQueries({
+        queryKey: ["interview-criteria-progress", interviewId]
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["interview-criteria-reveal", interviewId]
+      });
+      queryClient.invalidateQueries({ queryKey: ["interview-constraints", interviewId] });
+    }
   });
 
   const startTutorMutation = useMutation({
     mutationFn: async () =>
-      (await api.post<{ id: string }>("/tutor/sessions", { title: "Workspace Tutor" })).data,
+      (
+        await api.post<{ id: string }>("/tutor/sessions", {
+          title: "Workspace Tutor",
+          // Linked so the debrief can report tutor usage. Never gates or
+          // changes anything about the tutor itself.
+          ...(interviewId ? { interviewId } : {})
+        })
+      ).data,
     onSuccess: (data) => setTutorSessionId(data.id)
   });
 
@@ -220,11 +337,14 @@ export function WorkspacePage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["validations", id] });
       queryClient.invalidateQueries({ queryKey: ["reference", id] });
+      queryClient.invalidateQueries({ queryKey: ["reference", id, interviewId] });
       // First validation unlocks the criteria reveal endpoint. Force a refetch
       // so the Validate panel's reveal block populates without a manual reload.
       queryClient.invalidateQueries({
         queryKey: ["interview-criteria-reveal", interviewId]
       });
+      queryClient.invalidateQueries({ queryKey: ["interview-tutor-usage", interviewId] });
+      queryClient.invalidateQueries({ queryKey: ["interview-phase-timeline", interviewId] });
     }
   });
 
@@ -259,6 +379,86 @@ export function WorkspacePage() {
       (await api.get<CriteriaRevealResponse>(`/interviews/${interviewId}/criteria/reveal`)).data,
     enabled: Boolean(interviewId) && (validationsQuery.data?.length ?? 0) > 0,
     retry: false
+  });
+
+  /** Lifecycle of the active interview. A workspace restored from
+   * `localStorage` has no idea whether its interview is still open, so the
+   * composer's enabled state has to come from the server. */
+  const interviewStatusQuery = useQuery({
+    queryKey: ["interview-status", interviewId],
+    queryFn: async () =>
+      (await api.get<InterviewStatus>(`/interviews/${interviewId}/status`)).data,
+    enabled: Boolean(interviewId)
+  });
+
+  const interviewCompleted = interviewStatusQuery.data?.status === "completed";
+  const debrief = interviewStatusQuery.data?.debrief ?? null;
+
+  /** Live transition offer. Polled after each interviewer turn, since the
+   * deterministic rule runs server-side once the assistant reply is persisted. */
+  const phaseProposalQuery = useQuery({
+    queryKey: ["interview-phase-proposal", interviewId],
+    queryFn: async () =>
+      (await api.get<InterviewPhaseProposalState>(`/interviews/${interviewId}/phase-proposal`))
+        .data,
+    enabled: Boolean(interviewId)
+  });
+
+  const transitionProposal =
+    interviewCompleted ? null : (phaseProposalQuery.data?.pending ?? null);
+
+  const resolvePhaseProposalMutation = useMutation({
+    mutationFn: async (outcome: "apply" | "dismiss") =>
+      (
+        await api.post<InterviewPhaseProposalState>(
+          `/interviews/${interviewId}/phase-proposal/${outcome}`
+        )
+      ).data,
+    onSuccess: (data) => {
+      queryClient.setQueryData(["interview-phase-proposal", interviewId], data);
+    }
+  });
+
+  /** Per-phase actual vs budget. Read for the exported report's pacing
+   * section — the live ribbon still renders from `localStorage`. */
+  const phaseTimelineQuery = useQuery({
+    queryKey: ["interview-phase-timeline", interviewId],
+    queryFn: async () =>
+      (await api.get<InterviewPhaseTimeline>(`/interviews/${interviewId}/phase-timeline`)).data,
+    enabled: Boolean(interviewId)
+  });
+
+  /** Factual tutor consultation record. Refetched after a validation so the
+   * chip is current when the candidate reads their score. */
+  const tutorUsageQuery = useQuery({
+    queryKey: ["interview-tutor-usage", interviewId],
+    queryFn: async () =>
+      (await api.get<InterviewTutorUsage>(`/interviews/${interviewId}/tutor-usage`)).data,
+    enabled: Boolean(interviewId)
+  });
+
+  const endInterviewMutation = useMutation({
+    mutationFn: async () =>
+      (await api.post<EndInterviewResponse>(`/interviews/${interviewId}/end`)).data,
+    onSuccess: (data) => {
+      setEndError(null);
+      setEndOpen(false);
+      queryClient.setQueryData<InterviewStatus | undefined>(
+        ["interview-status", interviewId],
+        (previous) =>
+          previous
+            ? { ...previous, status: data.status, endedAt: data.endedAt, debrief: data.debrief }
+            : previous
+      );
+      void interviewStatusQuery.refetch();
+    },
+    onError: (error: unknown) => {
+      setEndOpen(false);
+      const message =
+        (error as { response?: { data?: { message?: string } } })?.response?.data?.message ??
+        "Could not end the interview. Try again in a moment.";
+      setEndError(message);
+    }
   });
 
   const addConstraintMutation = useMutation({
@@ -509,13 +709,33 @@ export function WorkspacePage() {
     if (!p) return;
     const imageBase64 =
       !sceneIsEmpty && captureSceneImage ? await captureSceneImage() : undefined;
-    const name = `attempt-${p.title.slice(0, 40).replace(/[^\w\d-]+/g, "-")}-${Date.now()}.md`;
+
+    // Every optional input is passed as-is; the report omits whatever section
+    // has no data rather than printing an empty heading.
+    const status = interviewStatusQuery.data;
     downloadMarkdown(
-      name,
+      reportFilename(p.title),
       buildAttemptMarkdownReport({
         problem: p,
-        estimation: estimationPayload as WorkspaceEstimation,
         validations: validationsQuery.data ?? [],
+        liveConstraints: interviewId ? constraintsQuery.data?.constraints : undefined,
+        interview:
+          interviewId && status
+            ? {
+                interviewerLevel: status.interviewerLevel,
+                startedAt: status.startedAt,
+                endedAt: status.endedAt,
+                status: status.status
+              }
+            : undefined,
+        debrief,
+        criteria: criteriaRevealQuery.data?.criteria ?? undefined,
+        estimationSpec,
+        estimation: estimationPayload as WorkspaceEstimation,
+        phaseTimeline: interviewId ? phaseTimelineQuery.data : undefined,
+        reference: referenceQuery.data,
+        transcript: interviewId ? interviewMessagesQuery.data : undefined,
+        tutorUsage: interviewId ? tutorUsageQuery.data : undefined,
         imageBase64
       })
     );
@@ -530,6 +750,31 @@ export function WorkspacePage() {
         confirmLabel="Replay"
         onCancel={() => setReplayOpen(false)}
         onConfirm={doReplay}
+      />
+
+      <LevelChangeDialog
+        open={pendingLevel !== null}
+        fromLevel={interviewerLevel}
+        toLevel={pendingLevel}
+        busy={patchInterviewMutation.isPending}
+        onCancel={() => setPendingLevel(null)}
+        onChangeOnly={() =>
+          pendingLevel &&
+          patchInterviewMutation.mutate({ level: pendingLevel, regenerateCriteria: false })
+        }
+        onChangeAndRegenerate={() =>
+          pendingLevel &&
+          patchInterviewMutation.mutate({ level: pendingLevel, regenerateCriteria: true })
+        }
+      />
+
+      <ConfirmDialog
+        open={endOpen}
+        title="End this interview?"
+        description="This closes the conversation for good — the interviewer stops accepting messages — and writes your debrief from the transcript, the rubric and your latest validation. The board, Tutor and Export stay available."
+        confirmLabel="End interview"
+        onCancel={() => setEndOpen(false)}
+        onConfirm={() => endInterviewMutation.mutate()}
       />
 
       {restoredSceneProblemId === id ? (
@@ -554,13 +799,22 @@ export function WorkspacePage() {
             elapsedInPhase={elapsedInPhase}
             phaseRunning={phaseRunning}
             setPhaseRunning={setPhaseRunning}
-            onNextPhase={() => {
-              if (phaseIndex < planPhases.length - 1) {
-                setPhaseIndex((i) => i + 1);
-                setElapsedInPhase(0);
-              }
+            onNextPhase={advancePhase}
+            transitionProposal={transitionProposal}
+            onAcceptTransition={() => {
+              advancePhase();
+              resolvePhaseProposalMutation.mutate("apply");
             }}
+            onDismissTransition={() => resolvePhaseProposalMutation.mutate("dismiss")}
             onResetPhases={() => {
+              emitPhaseEvents(interviewId, [
+                {
+                  phaseId: currentPhaseDef.id,
+                  phaseIndex,
+                  kind: "reset",
+                  elapsedSec: elapsedInPhase
+                }
+              ]);
               setPhaseIndex(0);
               setElapsedInPhase(0);
               setPhaseRunning(false);
@@ -572,6 +826,7 @@ export function WorkspacePage() {
           problemId={id}
           title={problemQuery.data?.title}
           difficulty={problemQuery.data?.difficulty}
+          track={problemQuery.data?.track}
           statement={problemQuery.data?.statement}
           constraints={problemQuery.data?.constraintsJson ?? []}
           liveConstraints={
@@ -692,11 +947,12 @@ export function WorkspacePage() {
                     <span className="shrink-0">Level (next message)</span>
                     <select
                       value={interviewerLevel}
-                      disabled={patchInterviewMutation.isPending}
+                      disabled={patchInterviewMutation.isPending || interviewCompleted}
                       onChange={(e) => {
-                        const v = e.target.value as typeof interviewerLevel;
-                        setInterviewerLevel(v);
-                        patchInterviewMutation.mutate(v);
+                        // Never applied silently: the level sets the
+                        // hidden/visible split, so the candidate has to choose
+                        // whether the rubric follows it.
+                        setPendingLevel(e.target.value as typeof interviewerLevel);
                       }}
                       className="field min-w-[140px] !py-1.5 !text-xs"
                     >
@@ -706,9 +962,29 @@ export function WorkspacePage() {
                       <option value="staff">Staff</option>
                     </select>
                   </label>
+                  {interviewStatusQuery.data?.rubricStale ? (
+                    <p className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-400/40 bg-amber-400/[0.07] px-2 py-1.5 text-[11px] text-amber-700 dark:text-amber-300">
+                      <span>
+                        Grading still uses the rubric built for{" "}
+                        <strong>{interviewStatusQuery.data.criteriaLevel}</strong>.
+                      </span>
+                      <button
+                        type="button"
+                        className="btn-secondary !px-2 !py-0.5 !text-[10px]"
+                        onClick={() => regenerateCriteriaMutation.mutate()}
+                        disabled={regenerateCriteriaMutation.isPending}
+                      >
+                        {regenerateCriteriaMutation.isPending
+                          ? "Regenerating…"
+                          : "Regenerate rubric"}
+                      </button>
+                    </p>
+                  ) : null}
                   <div className="min-h-0 flex-1">
                     <ChatPanel
                       endpoint={`/interviews/${interviewId}/messages`}
+                      disabled={interviewCompleted}
+                      disabledNotice="This interview is finished. Your debrief is on the Validate tab; the board and Tutor stay open, and Replay starts a fresh session."
                       buildPayload={buildWorkspaceContext}
                       onMessageComplete={async () => {
                         // Refetch chat history first so the user sees the
@@ -718,7 +994,8 @@ export function WorkspacePage() {
                         await interviewMessagesQuery.refetch();
                         await Promise.all([
                           constraintsQuery.refetch(),
-                          criteriaProgressQuery.refetch()
+                          criteriaProgressQuery.refetch(),
+                          phaseProposalQuery.refetch()
                         ]);
                       }}
                       initialMessages={(interviewMessagesQuery.data ?? [])
@@ -820,7 +1097,31 @@ export function WorkspacePage() {
                 >
                   Export report
                 </button>
+                {interviewId && !interviewCompleted ? (
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => setEndOpen(true)}
+                    disabled={!hasValidationAttempt || endInterviewMutation.isPending}
+                    title={
+                      hasValidationAttempt
+                        ? "Close the interview and generate your debrief"
+                        : "Validate at least once — the debrief is written against a graded attempt."
+                    }
+                  >
+                    {endInterviewMutation.isPending ? (
+                      <>
+                        <Spinner /> Writing debrief
+                      </>
+                    ) : (
+                      "End interview"
+                    )}
+                  </button>
+                ) : null}
               </div>
+              {endError ? (
+                <p className="text-xs text-orange-600 dark:text-orange-400">{endError}</p>
+              ) : null}
               {sceneUnchangedSinceValidation ? (
                 <p className="text-xs text-fg-faint">
                   Diagram unchanged since last validation — edit the board to re-validate.
@@ -831,6 +1132,15 @@ export function WorkspacePage() {
               ) : null}
 
               <div className="flex-1 space-y-3 overflow-auto pr-1">
+                {debrief ? (
+                  <div className="surface-inset p-4">
+                    <p className="mb-3 text-[10px] uppercase tracking-[0.18em] text-fg-faint">
+                      Interview debrief
+                    </p>
+                    <InterviewDebriefPanel debrief={debrief} />
+                  </div>
+                ) : null}
+
                 {weakDims.length > 0 ? (
                   <div className="surface-inset p-3">
                     <p className="mb-2 text-[10px] uppercase tracking-[0.18em] text-fg-faint">
@@ -861,6 +1171,7 @@ export function WorkspacePage() {
                       feedback={latestValidation.feedbackJson}
                       className="mb-3"
                     />
+                    <TutorUsageChip usage={tutorUsageQuery.data} className="mb-3" />
                     <DesignDiscoverySubscores
                       feedback={latestValidation.feedbackJson}
                       className="mb-3"
@@ -879,6 +1190,7 @@ export function WorkspacePage() {
                         <CriteriaReveal
                           criteria={criteriaRevealQuery.data.criteria}
                           feedback={latestValidation.feedbackJson}
+                          criterionCoverage={referenceQuery.data?.criterionCoverage}
                         />
                       </div>
                     ) : null}
@@ -888,6 +1200,14 @@ export function WorkspacePage() {
                           Observed signals
                         </p>
                         <FlagsPanel feedback={latestValidation.feedbackJson} />
+                      </div>
+                    ) : null}
+                    {latestValidation.feedbackJson?.processAssessment ? (
+                      <div className="mt-4 border-t border-line/60 pt-3">
+                        <p className="mb-2 text-[10px] uppercase tracking-[0.18em] text-fg-faint">
+                          How you worked
+                        </p>
+                        <ProcessPanel feedback={latestValidation.feedbackJson} />
                       </div>
                     ) : null}
                   </div>
@@ -963,6 +1283,127 @@ export function WorkspacePage() {
         </div>
       </section>
     </main>
+  );
+}
+
+/**
+ * Three-way choice for a mid-interview level change.
+ *
+ * Not a plain confirm, because there are two legitimate outcomes and both have
+ * a real cost. Regenerating resyncs grading but discards every hidden
+ * expectation the candidate already surfaced; changing only the level keeps
+ * that progress but grades against a rubric written for the old level. The
+ * copy has to say so plainly — this is exactly the trade-off the candidate is
+ * being asked to make.
+ */
+function LevelChangeDialog({
+  open,
+  fromLevel,
+  toLevel,
+  busy,
+  onCancel,
+  onChangeOnly,
+  onChangeAndRegenerate
+}: {
+  open: boolean;
+  fromLevel: string;
+  toLevel: string | null;
+  busy: boolean;
+  onCancel: () => void;
+  onChangeOnly: () => void;
+  onChangeAndRegenerate: () => void;
+}) {
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onCancel();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onCancel]);
+
+  if (!open || !toLevel) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="level-change-title"
+    >
+      <button
+        type="button"
+        className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+        aria-label="Close"
+        onClick={onCancel}
+      />
+      <div className="relative z-10 w-full max-w-lg rounded-2xl border border-line bg-surface-strong p-6 shadow-2xl">
+        <h2 id="level-change-title" className="text-lg font-semibold text-fg">
+          Switch from {fromLevel} to {toLevel}?
+        </h2>
+        <p className="mt-2 text-sm text-fg-muted">
+          The level decides how much of the rubric is hidden from you. Your current rubric
+          was built for <strong>{fromLevel}</strong>, so you can either rebuild it for{" "}
+          <strong>{toLevel}</strong> or keep it as it is.
+        </p>
+        <ul className="mt-3 space-y-2 text-xs text-fg-muted">
+          <li>
+            <strong className="text-fg">Regenerate</strong> — grading matches the new level, but{" "}
+            <strong>your discovery progress resets</strong>: every hidden expectation you already
+            surfaced goes back to hidden, and constraints you earned lose their discovery pill.
+          </li>
+          <li>
+            <strong className="text-fg">Change level only</strong> — the interviewer behaves at the
+            new level, but grading still uses the rubric built for {fromLevel}.
+          </li>
+        </ul>
+        <div className="mt-6 flex flex-wrap justify-end gap-2">
+          <button type="button" className="btn-secondary" onClick={onCancel} disabled={busy}>
+            Cancel
+          </button>
+          <button type="button" className="btn-secondary" onClick={onChangeOnly} disabled={busy}>
+            Change level only
+          </button>
+          <button
+            type="button"
+            className="btn-primary"
+            onClick={onChangeAndRegenerate}
+            disabled={busy}
+          >
+            {busy ? "Working…" : "Change and regenerate"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Factual one-liner on tutor consultation.
+ *
+ * Neutral by design: no warning colour, no comparison, no advice. It exists so
+ * that when you re-read this attempt in a month you can tell a score reached
+ * with help apart from one reached without it. Renders nothing when the tutor
+ * was never used. */
+function TutorUsageChip({
+  usage,
+  className = ""
+}: {
+  usage?: InterviewTutorUsage;
+  className?: string;
+}) {
+  if (!usage || usage.candidateTurns === 0) return null;
+  const topics = usage.topics.length > 0 ? ` · ${usage.topics.join(", ")}` : "";
+  const phase = usage.firstUsedAtPhase ? ` · from ${usage.firstUsedAtPhase}` : "";
+  return (
+    <p
+      className={`rounded-lg border border-line bg-surface px-2 py-1 text-[11px] text-fg-muted ${className}`}
+      title="Recorded for your own reference — it does not affect your score."
+    >
+      Tutor consulted {usage.candidateTurns}{" "}
+      {usage.candidateTurns === 1 ? "time" : "times"}
+      {phase}
+      {topics}
+    </p>
   );
 }
 

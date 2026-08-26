@@ -468,6 +468,15 @@ textarea {
     box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset;
   }
 
+  /* Blinking caret on the answer currently being streamed. Attached to the
+     last rendered block via ::after so it trails the final word inline
+     instead of dropping onto a line of its own below the paragraph. */
+  .prose-chat-streaming > *:last-child::after {
+    content: "";
+    @apply ml-0.5 inline-block h-[0.95em] w-[2px] translate-y-[2px] rounded-sm animate-caret-blink;
+    background: linear-gradient(180deg, #a78bfa, #e879f9);
+  }
+
   /* Text utilities ------------------------------------------------------- */
   .text-gradient {
     background: linear-gradient(135deg, #a78bfa 0%, #e879f9 60%, #f472b6 100%);

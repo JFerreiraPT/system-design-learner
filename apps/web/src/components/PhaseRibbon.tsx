@@ -1,3 +1,4 @@
+import type { PhaseTransitionProposal } from "@sdl/shared";
 import type { InterviewPlanPhase } from "../lib/phases";
 
 export function formatPhaseClock(sec: number) {
@@ -15,7 +16,64 @@ type Props = {
   setPhaseRunning: (r: boolean | ((p: boolean) => boolean)) => void;
   onNextPhase: () => void;
   onResetPhases: () => void;
+  /** Live offer to advance, from the server's deterministic pacing rule.
+   * Absent for legacy interviews and whenever nothing is pending. */
+  transitionProposal?: PhaseTransitionProposal | null;
+  onAcceptTransition?: () => void;
+  onDismissTransition?: () => void;
 };
+
+const TRANSITION_REASON_HINT: Record<PhaseTransitionProposal["reason"], string> = {
+  time: "You're near the suggested budget for this phase.",
+  coverage: "Everything this phase was meant to surface has come up."
+};
+
+/**
+ * "Ready to move on?" — asked, never enforced.
+ *
+ * The kit's rule is that the interviewer checks in at each transition, so the
+ * candidate keeps ownership of pacing. That means this is a question with two
+ * real answers: **Stay here** is not a delay, it is a valid choice, and it
+ * silences the question for this phase.
+ */
+function TransitionBanner({
+  proposal,
+  onAccept,
+  onDismiss
+}: {
+  proposal: PhaseTransitionProposal;
+  onAccept?: () => void;
+  onDismiss?: () => void;
+}) {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-violet-400/40 bg-violet-400/[0.08] px-2 py-1.5"
+    >
+      <span className="font-medium text-fg">Ready to move to {proposal.toLabel}?</span>
+      <span className="text-[10px] text-fg-faint">
+        {TRANSITION_REASON_HINT[proposal.reason]}
+      </span>
+      <div className="ml-auto flex items-center gap-1.5">
+        <button
+          type="button"
+          className="btn-primary !px-2 !py-1 !text-[11px]"
+          onClick={onAccept}
+        >
+          Advance
+        </button>
+        <button
+          type="button"
+          className="btn-ghost !px-2 !py-1 !text-[11px]"
+          onClick={onDismiss}
+        >
+          Stay here
+        </button>
+      </div>
+    </div>
+  );
+}
 
 function PhaseRoadmap({
   phases,
@@ -64,7 +122,10 @@ export function PhaseRibbon({
   phaseRunning,
   setPhaseRunning,
   onNextPhase,
-  onResetPhases
+  onResetPhases,
+  transitionProposal,
+  onAcceptTransition,
+  onDismissTransition
 }: Props) {
   const current = phases[phaseIndex] ?? phases[0];
   if (!current) return null;
@@ -104,6 +165,16 @@ export function PhaseRibbon({
           Reset
         </button>
       </div>
+
+      {/* Lives inside the ribbon, which sits in the side panel — the board is a
+          separate grid column at a fixed height, so this can never reflow it. */}
+      {transitionProposal ? (
+        <TransitionBanner
+          proposal={transitionProposal}
+          onAccept={onAcceptTransition}
+          onDismiss={onDismissTransition}
+        />
+      ) : null}
 
       <details className="group mt-1.5 border-t border-line/60 pt-1.5">
         <summary className="cursor-pointer list-none text-[10px] font-medium uppercase tracking-[0.16em] text-fg-faint marker:content-none [&::-webkit-details-marker]:hidden">

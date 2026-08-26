@@ -33,10 +33,16 @@ export class TutorService {
     @Inject(AiService) private readonly aiService: AiService
   ) {}
 
-  async createSession(input: { title?: string }) {
+  /** `interviewId` is recorded when the session is opened from a workspace with
+   * a live interview, so the debrief can report tutor usage. It never gates or
+   * changes tutor behaviour — using the tutor is often the right move. */
+  async createSession(input: { title?: string; interviewId?: string }) {
     const inserted = await this.db
       .insert(tutorSessions)
-      .values({ title: input.title ?? "Tutor Session" })
+      .values({
+        title: input.title ?? "Tutor Session",
+        interviewId: input.interviewId ?? null
+      })
       .returning();
     return inserted[0];
   }

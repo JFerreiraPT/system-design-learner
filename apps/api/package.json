@@ -8,10 +8,11 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/main.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx --test src/ai/ai.service.test.ts src/solutions/scoring.test.ts src/solutions/flagObservations.test.ts src/solutions/estimationDigest.test.ts",
+    "test": "tsx --test src/ai/ai.service.test.ts src/solutions/scoring.test.ts src/solutions/flagObservations.test.ts src/solutions/estimationDigest.test.ts src/interview/interview.service.test.ts src/db/seeds/seeds.test.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "db:push": "drizzle-kit push"
+    "db:push": "drizzle-kit push",
+    "db:seed": "tsx src/db/seed.ts"
   },
   "dependencies": {
     "@ai-sdk/openai": "^2.0.0",

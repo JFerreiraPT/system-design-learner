@@ -450,3 +450,43 @@ test("flag observations never influence any score", () => {
     overall
   );
 });
+
+test("the process assessment never influences any score", () => {
+  // Same contract as the flags: reported, not scored. The scoring functions
+  // take no process input at all, so a fixture must score identically whether
+  // or not the validator returned an assessment alongside it. Folding this in
+  // before its distribution is visible would silently re-baseline every past
+  // attempt.
+  const criteria = [criterion("a", "core"), criterion("b", "expected")];
+  const evaluations = [covered("a"), missed("b", "medium")];
+
+  const design = computeDesignScore({ criteria, evaluations, dimensionEstimate: 0 });
+  const discovery = computeDiscoveryScore(criteria);
+  const overall = blendScore(design.designScore, discovery, 0.7);
+
+  const withProcess = {
+    criteriaEvaluations: evaluations,
+    processAssessment: {
+      clarifiedBeforeDesigning: "no" as const,
+      decisiveness: "avoids_committing" as const,
+      surfacedOwnLimitations: false,
+      adaptedWhenChallenged: "no" as const,
+      drove: "interviewer_led" as const,
+      observations: [{ signal: "Waited to be asked", evidence: '"what should I do next?"' }]
+    }
+  };
+
+  const designAgain = computeDesignScore({
+    criteria,
+    evaluations: withProcess.criteriaEvaluations,
+    dimensionEstimate: 0
+  });
+
+  // The worst possible process assessment moves nothing.
+  assert.equal(designAgain.designScore, design.designScore);
+  assert.equal(computeDiscoveryScore(criteria), discovery);
+  assert.equal(
+    blendScore(designAgain.designScore, computeDiscoveryScore(criteria), 0.7),
+    overall
+  );
+});
